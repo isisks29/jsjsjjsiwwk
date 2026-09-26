@@ -10,7 +10,7 @@ jobs:
       - name: 编译 iOS dylib
         run: |
           xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 -fobjc-arc \
-            -mios-version-min=13.0 bypass.c -o bypass.dylib
+            -mios-version-min=13.0 bypass.m -o bypass.dylib
           codesign -s - bypass.dylib
       - uses: actions/upload-artifact@v4
         with:
