@@ -18,6 +18,7 @@
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <dispatch/dispatch.h>
+#include <objc/message.h>
 
 static void try_install_menu(void) {
     Class cls = NSClassFromString(@"CK_R_aX1ny_FloatBall");
