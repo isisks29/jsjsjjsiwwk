@@ -1,0 +1,17 @@
+name: build-bypass
+on:
+  workflow_dispatch:
+  push:
+    paths: ['bypass.c']
+
+jobs:
+  build:
+    runs-on: macos-14          # arm64 原生机器
+    steps:
+      - uses: actions/checkout@v4
+      - name: 编译
+        run: clang -arch arm64 -dynamiclib -O2 -fobjc-arc bypass.c -o bypass.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bypass.dylib
+          path: bypass.dylib
