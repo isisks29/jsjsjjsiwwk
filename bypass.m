@@ -1,16 +1,25 @@
 /*
- * bypass.m — 授权靶场 dylib 解锁（写全局 + 稳健触发悬浮球安装）
+ * bypass.m — 授权靶场 dylib 解锁（本地可做的全部）
  *
- * 已确认（对测试版1 静态分析）：
- *   - 类  CK_R_aX1ny_FloatBall      有类方法 Ra_x1nY_Install
- *   - 类  CK_R_axI1nY_Features      有类方法 Ra_x1nY_InstallBuiltin
- *   - 靶场方法表是混淆的（imp 指向 __objc_methtype），运行时才解混淆，
- *     因此调 install 必须在解混淆完成后，本版用长窗口多次重试覆盖。
+ * == 本次深入分析得出的重要结论 ==
+ *  1) 方法表【没有混淆】。之前把 types 指针误当成 imp（imp 在条目 +16 处）。
+ *     真实实现：
+ *        CK_R_aX1ny_FloatBall +Ra_x1nY_Install        = 0x239a4
+ *        CK_R_axI1nY_Features +Ra_x1nY_InstallBuiltin = 0x21a9c
+ *     而 0x239a4 / 0x21a9c 都是【空 stub】（只保存参数就 ret）。
+ *     → 调用 Ra_x1nY_Install 在测试版1 上【什么都不会发生】。
+ *       同学 KamiGate"调 install 出悬浮球"的做法在测试版1 上无效
+ *       （那是测试版2 的差异：测试版2 的 install 是真实实现）。
  *
- * 第一步：写 4 个解锁全局（本地校验通过，弹窗可从"卡密不存在"推进到
- *         "网络或验证失败"，证明生效）。
- * 第二步：跨类、跨时机、主线程多次尝试调 Ra_x1nY_Install / InstallBuiltin，
- *         让悬浮球显现（复刻同学 KamiGate 的解锁动作）。
+ *  2) 验证是 LIC 授权系统，弹窗文字实为
+ *        "[LIC-1] 网络或解密失败"（解密失败，不是"验证失败"）。
+ *     本地卡密关(弹"卡密不存在")已被下面 4 个全局绕过（实测弹窗推进），
+ *     剩余闸门是【已验证会话对象】(全局 0x12912a8，本 dylib 唯一写入点
+ *     0x2c298，由函数 0x2bf24 计算写入)。它由服务器 blob 解密+派生而来，
+ *     无法凭空构造（读取处会对其发消息，写错值会闪退）。
+ *
+ *  3) 因此本文件做的是【本地能做的全部】：把验证流程从"卡密不存在"
+ *     推进到"[LIC-1] 网络或解密失败"。完整解锁需拿到有效 blob/会话。
  *
  * 编译：
  *   xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 -fobjc-arc \
@@ -60,18 +69,21 @@ static uintptr_t find_target_base(void)
     return 0;
 }
 
+/* 写 4 个解锁全局：magic1/magic2 + proof1/proof2（本地校验关绕过，
+ * 实测把弹窗从"卡密不存在"推进到"[LIC-1] 网络或解密失败"）。 */
 static void write_unlock_globals(uintptr_t base)
 {
     if (!base) return;
     volatile uint32_t *magic = (volatile uint32_t *)(base + 0x1291248);
-    magic[0] = 0x7a31c9e5u;
-    magic[1] = 0xb4f27e13u;
+    magic[0] = 0x7a31c9e5u;  /* magic1 @0x1291248 */
+    magic[1] = 0xb4f27e13u;  /* magic2 @0x129124c */
     volatile uint32_t *proof = (volatile uint32_t *)(base + 0x1291048);
-    proof[0] = 0xa4835821u;
-    proof[1] = 0x8958d9aeu;
+    proof[0] = 0xa4835821u;  /* proof1 @0x1291048 */
+    proof[1] = 0x8958d9aeu;  /* proof2 @0x129104c */
 }
 
-/* 跨两个类、类方法优先、单例实例回退，调用 install */
+/* 最佳尝试调 install（测试版1 上是空 stub，多半无效；留着无害，
+ * 万一你的 dylib 版本里 install 是真实实现则能直接解锁）。 */
 static void call_install_on(Class cls)
 {
     if (!cls) return;
@@ -79,7 +91,6 @@ static void call_install_on(Class cls)
     SEL sBuiltin = NSSelectorFromString(@"Ra_x1nY_InstallBuiltin");
     SEL sShared  = NSSelectorFromString(@"sharedInstance");
     SEL sSharedAlt = NSSelectorFromString(@"shared");
-
     @try {
         if ([cls respondsToSelector:sInstall])
             ((void (*)(id, SEL))objc_msgSend)(cls, sInstall);
@@ -98,7 +109,7 @@ static void call_install_on(Class cls)
                     ((void (*)(id, SEL))objc_msgSend)(inst, sBuiltin);
             }
         }
-    } @catch (NSException *e) { /* 吞异常，绝不闪退 */ }
+    } @catch (NSException *e) { }
 }
 
 static void try_install_menu(void)
@@ -112,7 +123,6 @@ static void do_unlock(void)
     write_unlock_globals(find_target_base());
 }
 
-/* 在多次延迟点触发 install（覆盖靶场解混淆/初始化完成后的时机） */
 static void schedule_installs(void)
 {
     double delays[] = {0.3, 0.8, 1.5, 2.5, 4.0, 6.0, 9.0, 13.0};
