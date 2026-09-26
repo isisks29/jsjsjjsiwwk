@@ -1,5 +1,5 @@
 /*
- * bypass.m v4 — 弹窗 verify 全链 inline hook（修复版）
+ * bypass.m v4 — 弹窗 verify 全链 inline hook（修复版2）
  *
  * 反编译结论（Ghidra，可信）：
  *   弹窗【无条件显示】，输入卡密后走 ck_lic::R_axIny_Verify(0xa944) 的完成块
@@ -103,10 +103,9 @@ static void do_unlock(void)
     patch_ret(base, 0xc904, 0);   /* HasSuspiciousExpire -> 0 */
     patch_ret(base, 0xcbc8, 1);   /* MaterializeFields -> 1 */
 
-    /* DeriveSessionKey(0xcd28):直接补丁mov x0,#固定session地址;ret，不能b跳外部C函数 */
+    /* DeriveSessionKey(0xcd28):直接补丁mov x0,#固定session地址;ret */
     uint64_t sessPtr = (uint64_t)(__bridge void*)sSession;
     uint8_t ds_patch[8];
-    // mov x0, #sessPtr低16位 ; movk x0,#sessPtr高48位 ; ret
     uint32_t mov0 = 0x52800000 | ((sessPtr & 0xFFFF) <<5);
     uint32_t movk1 = 0xf2a00000 | (((sessPtr >>16) &0xFFFF) <<5);
     memcpy(ds_patch+0, &mov0,4);
@@ -117,8 +116,10 @@ static void do_unlock(void)
     patch_ret(base, 0x1648c, 1);  /* r_aXiNy_VerifySeal ->1 */
     patch_ret(base, 0x1666c, 1);  /* r_aXiNy_CanarySeal ->1 */
 
-    /* ----4.全局BSS状态，去掉CFBridgingRetain，避免内存泄漏---- */
-    *(__unsafe_unretained NSData **)(base + 0x12a00b0) = sSession; /* gMenuUnlockKey */
+    /* ----4.BSS全局内存，使用void**原始指针绕过ARC类型检查---- */
+    void **gMenuUnlockKeyPtr = (void **)(base + 0x12a00b0);
+    *gMenuUnlockKeyPtr = (__bridge void*)sSession;
+
     *(uint64_t *)(base + 0x12a00c0) = 0;                           /* expireTS=0 */
     *(volatile uint8_t *)(base + 0x12a01d2) = 0x00;
     *(volatile uint8_t *)(base + 0x1eba70)  = 0x01;
@@ -135,7 +136,7 @@ static void do_unlock(void)
 __attribute__((constructor))
 static void bypass_init(void)
 {
-    //延迟0.4秒执行，等待目标镜像所有ctor(优先级101)初始化完成
+    //延迟0.4秒执行，等待目标镜像所有ctor初始化完成
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(),^{
         do_unlock();
