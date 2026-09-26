@@ -1,61 +1,38 @@
 /*
- * bypass.m — 授权靶场 dylib 解锁（本地可做的全部）
+ * bypass.m v4 — 弹窗 verify 全链 inline hook（最终方案）
  *
- * == 本次深入分析得出的重要结论 ==
- *  1) 方法表【没有混淆】。之前把 types 指针误当成 imp（imp 在条目 +16 处）。
- *     真实实现：
- *        CK_R_aX1ny_FloatBall +Ra_x1nY_Install        = 0x239a4
- *        CK_R_axI1nY_Features +Ra_x1nY_InstallBuiltin = 0x21a9c
- *     而 0x239a4 / 0x21a9c 都是【空 stub】（只保存参数就 ret）。
- *     → 调用 Ra_x1nY_Install 在测试版1 上【什么都不会发生】。
- *       同学 KamiGate"调 install 出悬浮球"的做法在测试版1 上无效
- *       （那是测试版2 的差异：测试版2 的 install 是真实实现）。
+ * 反编译结论（Ghidra，可信）：
+ *   弹窗【无条件显示】，输入卡密后走 ck_lic::R_axIny_Verify(0xa944) 的完成块
+ *   (block_invoke @0xbcd8)：
+ *     ParsePlaintext(0xc5a8) -> IsSuccess(0xc704) -> HasSuspiciousExpire(0xc904)
+ *     -> MaterializeFields(0xcbc8) -> DeriveSessionKey(0xcd28) -> 成功:
+ *        PersistActivation + LoadSession + MarkVerified(0xcfd0) + DispatchUnlock(0xd1d8)
+ *   失败路径打 [LIC-1] 网络或解密失败。
+ *   由于没有服务器，fetch 必失败，所以一直卡 "[LIC-1] 网络或解密失败"。
  *
- *  2) 验证是 LIC 授权系统，弹窗文字实为
- *        "[LIC-1] 网络或解密失败"（解密失败，不是"验证失败"）。
- *     本地卡密关(弹"卡密不存在")已被下面 4 个全局绕过（实测弹窗推进），
- *     剩余闸门是【已验证会话对象】(全局 0x12912a8，本 dylib 唯一写入点
- *     0x2c298，由函数 0x2bf24 计算写入)。它由服务器 blob 解密+派生而来，
- *     无法凭空构造（读取处会对其发消息，写错值会闪退）。
+ *   MarkVerified 会对会话调用 r_aXiNy_VerifySeal(0x1648c) + r_aXiNy_CanarySeal(0x1666c)
+ *   做签名校验，任一返回 0 就 ClearVerified()（打掉也白搭）。
  *
- *  3) 因此本文件做的是【本地能做的全部】：把验证流程从"卡密不存在"
- *     推进到"[LIC-1] 网络或解密失败"。完整解锁需拿到有效 blob/会话。
+ * 本文件对上述所有判定函数做 inline hook，让 verify 无论服务器返回什么
+ * 都直接走成功路径（用本地造的 32 字节会话密钥），从而：
+ *   - 弹窗关闭（verify 成功）
+ *   - 会话标记已验证、解锁菜单/悬浮球
  *
  * 编译：
  *   xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 -fobjc-arc \
  *         -framework Foundation -o bypass.dylib bypass.m
  */
-
 #import <Foundation/Foundation.h>
-#import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
-#import <dlfcn.h>
+#import <mach/mach.h>
 #import <string.h>
 
-static uintptr_t image_base_of(const void *ptr)
-{
-    uintptr_t p = (uintptr_t)ptr;
-    uint32_t cnt = _dyld_image_count();
-    for (uint32_t i = 0; i < cnt; i++) {
-        const struct mach_header *h = _dyld_get_image_header(i);
-        uintptr_t base = (uintptr_t)h;
-        if (p < base) continue;
-        uintptr_t vmsize = 0;
-        const uint8_t *cur = (const uint8_t *)(base + sizeof(struct mach_header_64));
-        for (uint32_t j = 0; j < h->ncmds; j++) {
-            const struct load_command *c = (const struct load_command *)cur;
-            if (c->cmd == LC_SEGMENT_64)
-                vmsize += ((const struct segment_command_64 *)c)->vmsize;
-            cur += c->cmdsize;
-        }
-        if (p >= base && p < base + vmsize) return base;
-    }
-    return 0;
-}
+static uintptr_t sBase = 0;
+static NSData *sSession = nil;   /* 固定 32 字节会话密钥，交给 verify 成功路径 */
 
-static uintptr_t find_target_base(void)
+static uintptr_t find_base(void)
 {
     uint32_t cnt = _dyld_image_count();
     for (uint32_t i = 0; i < cnt; i++) {
@@ -63,77 +40,94 @@ static uintptr_t find_target_base(void)
         if (nm && strstr(nm, "Zhuanz"))
             return (uintptr_t)_dyld_get_image_header(i);
     }
-    void *sym = dlsym(RTLD_DEFAULT, "_JH_OnLicenseChange");
-    if (!sym) sym = dlsym(RTLD_DEFAULT, "_JH_OnHeartbeat");
-    if (sym) return image_base_of(sym);
     return 0;
 }
 
-/* 写 4 个解锁全局：magic1/magic2 + proof1/proof2（本地校验关绕过，
- * 实测把弹窗从"卡密不存在"推进到"[LIC-1] 网络或解密失败"）。 */
-static void write_unlock_globals(uintptr_t base)
+/* 内存写 8 字节（mov w0,#imm; ret 或自定义），返回前临时加写权限 */
+static void patch8(uintptr_t base, uint32_t off, const uint8_t patch[8])
 {
-    if (!base) return;
-    volatile uint32_t *magic = (volatile uint32_t *)(base + 0x1291248);
-    magic[0] = 0x7a31c9e5u;  /* magic1 @0x1291248 */
-    magic[1] = 0xb4f27e13u;  /* magic2 @0x129124c */
-    volatile uint32_t *proof = (volatile uint32_t *)(base + 0x1291048);
-    proof[0] = 0xa4835821u;  /* proof1 @0x1291048 */
-    proof[1] = 0x8958d9aeu;  /* proof2 @0x129104c */
+    uintptr_t va = base + off;
+    vm_address_t page = va & ~(vm_address_t)0x3fff;
+    vm_size_t size = (vm_size_t)(((va & 0x3fff)+8+0x3fff) & ~0x3fff);
+    if (mach_vm_protect(mach_task_self(), page, size, 0,
+            VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE|VM_PROT_COPY) != KERN_SUCCESS) return;
+    memcpy((void*)va, patch, 8);
+    mach_vm_protect(mach_task_self(), page, size, 0, VM_PROT_READ|VM_PROT_EXECUTE);
 }
 
-/* 最佳尝试调 install（测试版1 上是空 stub，多半无效；留着无害，
- * 万一你的 dylib 版本里 install 是真实实现则能直接解锁）。 */
-static void call_install_on(Class cls)
+/* mov w0,#imm ; ret */
+static void patch_ret(uintptr_t base, uint32_t off, uint32_t imm)
 {
-    if (!cls) return;
-    SEL sInstall = NSSelectorFromString(@"Ra_x1nY_Install");
-    SEL sBuiltin = NSSelectorFromString(@"Ra_x1nY_InstallBuiltin");
-    SEL sShared  = NSSelectorFromString(@"sharedInstance");
-    SEL sSharedAlt = NSSelectorFromString(@"shared");
-    @try {
-        if ([cls respondsToSelector:sInstall])
-            ((void (*)(id, SEL))objc_msgSend)(cls, sInstall);
-        else if ([cls respondsToSelector:sBuiltin])
-            ((void (*)(id, SEL))objc_msgSend)(cls, sBuiltin);
-        else {
-            id inst = nil;
-            if ([cls respondsToSelector:sShared])
-                inst = ((id (*)(id, SEL))objc_msgSend)(cls, sShared);
-            else if ([cls respondsToSelector:sSharedAlt])
-                inst = ((id (*)(id, SEL))objc_msgSend)(cls, sSharedAlt);
-            if (inst) {
-                if ([inst respondsToSelector:sInstall])
-                    ((void (*)(id, SEL))objc_msgSend)(inst, sInstall);
-                else if ([inst respondsToSelector:sBuiltin])
-                    ((void (*)(id, SEL))objc_msgSend)(inst, sBuiltin);
-            }
-        }
-    } @catch (NSException *e) { }
+    uint8_t p[8];
+    uint32_t enc = 0x52800000u | ((imm & 0xffff) << 5);
+    memcpy(p, &enc, 4);
+    p[4]=0xc0; p[5]=0x03; p[6]=0x5f; p[7]=0xd6;
+    patch8(base, off, p);
 }
 
-static void try_install_menu(void)
+/* b target  (PC-relative 无条件跳转，±128MB) */
+static void patch_branch(uintptr_t base, uint32_t off, void *target)
 {
-    call_install_on(NSClassFromString(@"CK_R_aX1ny_FloatBall"));
-    call_install_on(NSClassFromString(@"CK_R_axI1nY_Features"));
+    uintptr_t pc = base + off;
+    int64_t delta = (int64_t)((uintptr_t)target - pc);
+    int32_t imm26 = (int32_t)(delta >> 2);
+    uint32_t insn = 0x14000000u | ((uint32_t)imm26 & 0x03ffffffu);
+    uint8_t p[8];
+    memcpy(p, &insn, 4);
+    p[4]=0xc0; p[5]=0x03; p[6]=0x5f; p[7]=0xd6; /* ret 兜底(不会到) */
+    patch8(base, off, p);
+}
+
+/* DeriveSessionKey 的 hook：无视参数，返回固定 32 字节会话（autoreleased +0，
+ * 与正常 DeriveSessionKey 语义一致，避免调用方 release 过度释放） */
+static NSData *hook_derive_session(void)
+{
+    static const unsigned char keyb[32] = {
+        0x58,0xfd,0x32,0xab,0xb3,0x93,0x07,0x5c,0x60,0x6a,0x24,0xb1,0xc9,0xc1,0x00,0x71,
+        0x49,0x2b,0x42,0xc7,0x93,0xe8,0x16,0x1f,0xab,0xe5,0x16,0xe0,0xca,0xe1,0xcf,0xe7
+    };
+    return [NSData dataWithBytes:keyb length:32];
 }
 
 static void do_unlock(void)
 {
-    write_unlock_globals(find_target_base());
-}
+    uintptr_t base = find_base();
+    if (!base) return;
+    sBase = base;
 
-static void schedule_installs(void)
-{
-    double delays[] = {0.3, 0.8, 1.5, 2.5, 4.0, 6.0, 9.0, 13.0};
-    for (unsigned i = 0; i < sizeof(delays)/sizeof(delays[0]); i++) {
-        double d = delays[i];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            do_unlock();
-            try_install_menu();
-        });
-    }
+    /* ---- 0) 固定 32 字节会话密钥（用 __ckmask 的 AES 密钥 32 字节）---- */
+    static const unsigned char keyb[32] = {
+        0x58,0xfd,0x32,0xab,0xb3,0x93,0x07,0x5c,0x60,0x6a,0x24,0xb1,0xc9,0xc1,0x00,0x71,
+        0x49,0x2b,0x42,0xc7,0x93,0xe8,0x16,0x1f,0xab,0xe5,0x16,0xe0,0xca,0xe1,0xcf,0xe7
+    };
+    if (!sSession)
+        sSession = [NSData dataWithBytes:keyb length:32];
+
+    /* ---- 1) 弹窗 verify 判定函数全过 ----
+     * 关键：网络失败时完成块收到 nil，第一道空值检查(0xbd38)就 FAIL 打 LIC-1，
+     * 判定函数根本跑不到。所以先把 0xbd38 空值检查补丁成无条件跳入解析路径(0xbe4c)。 */
+    patch_branch(base, 0xbd38, (void*)(base + 0xbe4c)); /* 空值检查 -> 强制进解析路径 */
+    patch_ret(base, 0xc5a8, 0);   /* ParsePlaintext -> 0 (解析成功) */
+    patch_ret(base, 0xc704, 1);   /* IsSuccess -> 1 */
+    patch_ret(base, 0xc904, 0);   /* HasSuspiciousExpire -> 0 */
+    patch_ret(base, 0xcbc8, 1);   /* MaterializeFields -> 1 */
+    patch_branch(base, 0xcd28, (void*)&hook_derive_session); /* DeriveSessionKey -> 固定会话 */
+
+    /* ---- 2) MarkVerified 的 seal 签名校验全过 ---- */
+    patch_ret(base, 0x1648c, 1);  /* r_aXiNy_VerifySeal -> 1 */
+    patch_ret(base, 0x1666c, 1);  /* r_aXiNy_CanarySeal -> 1 */
+
+    /* ---- 3) 解锁总闸 + 全局状态（v3 保留）---- */
+    *(void **)(base + 0x12a00b0) = (void *)CFBridgingRetain(sSession); /* gMenuUnlockKey */
+    *(uint64_t *)(base + 0x12a00c0) = 0;                               /* expireTS=0 */
+    *(volatile uint8_t *)(base + 0x12a01d2) = 0x00;  /* kill 标志: 未篡改 */
+    *(volatile uint8_t *)(base + 0x1eba70)  = 0x01;
+    *(volatile uint8_t *)(base + 0x12a01d3) = 0x00;
+    *(volatile uint8_t *)(base + 0x1eba71)  = 0x01;
+    patch_ret(base, 0xfa374, 1);   /* HasMenuUnlockKey -> TRUE */
+    patch_ret(base, 0x121b04, 0);  /* c0029 -> 0 */
+    patch_ret(base, 0x121c1c, 0);  /* c0030 -> 0 */
+    patch_ret(base, 0x667c8, 1);   /* isEnabledForKey -> TRUE */
 }
 
 static void on_add_image(const struct mach_header *h, intptr_t slide)
@@ -147,5 +141,4 @@ static void bypass_init(void)
 {
     do_unlock();
     _dyld_register_func_for_add_image(on_add_image);
-    schedule_installs();
 }
