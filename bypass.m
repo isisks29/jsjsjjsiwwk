@@ -1,5 +1,5 @@
 /*
- * bypass.m v4 — 弹窗 verify 全链 inline hook（最终方案）
+ * bypass.m v4 — 弹窗 verify 全链 inline hook（修复版）
  *
  * 反编译结论（Ghidra，可信）：
  *   弹窗【无条件显示】，输入卡密后走 ck_lic::R_axIny_Verify(0xa944) 的完成块
@@ -26,11 +26,13 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
-#import <mach/mach.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#include <mach/kern_return.h>
 #import <string.h>
 
 static uintptr_t sBase = 0;
-static NSData *sSession = nil;   /* 固定 32 字节会话密钥，交给 verify 成功路径 */
+static NSData *sSession = nil;
 
 static uintptr_t find_base(void)
 {
@@ -43,50 +45,40 @@ static uintptr_t find_base(void)
     return 0;
 }
 
-/* 内存写 8 字节（mov w0,#imm; ret 或自定义），返回前临时加写权限 */
 static void patch8(uintptr_t base, uint32_t off, const uint8_t patch[8])
 {
     uintptr_t va = base + off;
-    vm_address_t page = va & ~(vm_address_t)0x3fff;
-    vm_size_t size = (vm_size_t)(((va & 0x3fff)+8+0x3fff) & ~0x3fff);
-    if (mach_vm_protect(mach_task_self(), page, size, 0,
-            VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE|VM_PROT_COPY) != KERN_SUCCESS) return;
+    vm_address_t page = va & ~(vm_page_size - 1);
+    vm_size_t size = vm_page_size;
+    kern_return_t kr = vm_protect(mach_task_self(), page, size, 0,
+            VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) return;
+
     memcpy((void*)va, patch, 8);
-    mach_vm_protect(mach_task_self(), page, size, 0, VM_PROT_READ|VM_PROT_EXECUTE);
+
+    kr = vm_protect(mach_task_self(), page, size, 0, VM_PROT_READ|VM_PROT_EXECUTE);
 }
 
 /* mov w0,#imm ; ret */
 static void patch_ret(uintptr_t base, uint32_t off, uint32_t imm)
 {
-    uint8_t p[8];
+    uint8_t p[8] = {0};
     uint32_t enc = 0x52800000u | ((imm & 0xffff) << 5);
     memcpy(p, &enc, 4);
     p[4]=0xc0; p[5]=0x03; p[6]=0x5f; p[7]=0xd6;
     patch8(base, off, p);
 }
 
-/* b target  (PC-relative 无条件跳转，±128MB) */
-static void patch_branch(uintptr_t base, uint32_t off, void *target)
+/* b target 仅用于镜像内部地址跳转 */
+static void patch_branch(uintptr_t base, uint32_t off, uintptr_t target_va)
 {
     uintptr_t pc = base + off;
-    int64_t delta = (int64_t)((uintptr_t)target - pc);
+    int64_t delta = (int64_t)(target_va - pc);
     int32_t imm26 = (int32_t)(delta >> 2);
     uint32_t insn = 0x14000000u | ((uint32_t)imm26 & 0x03ffffffu);
-    uint8_t p[8];
+    uint8_t p[8] = {0};
     memcpy(p, &insn, 4);
-    p[4]=0xc0; p[5]=0x03; p[6]=0x5f; p[7]=0xd6; /* ret 兜底(不会到) */
     patch8(base, off, p);
-}
-
-/* DeriveSessionKey 的 hook：无视参数，返回固定 32 字节会话（autoreleased +0，
- * 与正常 DeriveSessionKey 语义一致，避免调用方 release 过度释放） */
-static NSData *hook_derive_session(void)
-{
-    static const unsigned char keyb[32] = {
-        0x58,0xfd,0x32,0xab,0xb3,0x93,0x07,0x5c,0x60,0x6a,0x24,0xb1,0xc9,0xc1,0x00,0x71,
-        0x49,0x2b,0x42,0xc7,0x93,0xe8,0x16,0x1f,0xab,0xe5,0x16,0xe0,0xca,0xe1,0xcf,0xe7
-    };
-    return [NSData dataWithBytes:keyb length:32];
 }
 
 static void do_unlock(void)
@@ -95,7 +87,6 @@ static void do_unlock(void)
     if (!base) return;
     sBase = base;
 
-    /* ---- 0) 固定 32 字节会话密钥（用 __ckmask 的 AES 密钥 32 字节）---- */
     static const unsigned char keyb[32] = {
         0x58,0xfd,0x32,0xab,0xb3,0x93,0x07,0x5c,0x60,0x6a,0x24,0xb1,0xc9,0xc1,0x00,0x71,
         0x49,0x2b,0x42,0xc7,0x93,0xe8,0x16,0x1f,0xab,0xe5,0x16,0xe0,0xca,0xe1,0xcf,0xe7
@@ -103,42 +94,50 @@ static void do_unlock(void)
     if (!sSession)
         sSession = [NSData dataWithBytes:keyb length:32];
 
-    /* ---- 1) 弹窗 verify 判定函数全过 ----
-     * 关键：网络失败时完成块收到 nil，第一道空值检查(0xbd38)就 FAIL 打 LIC-1，
-     * 判定函数根本跑不到。所以先把 0xbd38 空值检查补丁成无条件跳入解析路径(0xbe4c)。 */
-    patch_branch(base, 0xbd38, (void*)(base + 0xbe4c)); /* 空值检查 -> 强制进解析路径 */
-    patch_ret(base, 0xc5a8, 0);   /* ParsePlaintext -> 0 (解析成功) */
+    /* ----1.绕过block_invoke网络nil空检查，强制跳入解析路径 0xbe4c---- */
+    patch_branch(base, 0xbd38, base + 0xbe4c);
+
+    /* ----2.全部校验函数直接返回成功---- */
+    patch_ret(base, 0xc5a8, 0);   /* ParsePlaintext -> 0 */
     patch_ret(base, 0xc704, 1);   /* IsSuccess -> 1 */
     patch_ret(base, 0xc904, 0);   /* HasSuspiciousExpire -> 0 */
     patch_ret(base, 0xcbc8, 1);   /* MaterializeFields -> 1 */
-    patch_branch(base, 0xcd28, (void*)&hook_derive_session); /* DeriveSessionKey -> 固定会话 */
 
-    /* ---- 2) MarkVerified 的 seal 签名校验全过 ---- */
-    patch_ret(base, 0x1648c, 1);  /* r_aXiNy_VerifySeal -> 1 */
-    patch_ret(base, 0x1666c, 1);  /* r_aXiNy_CanarySeal -> 1 */
+    /* DeriveSessionKey(0xcd28):直接补丁mov x0,#固定session地址;ret，不能b跳外部C函数 */
+    uint64_t sessPtr = (uint64_t)(__bridge void*)sSession;
+    uint8_t ds_patch[8];
+    // mov x0, #sessPtr低16位 ; movk x0,#sessPtr高48位 ; ret
+    uint32_t mov0 = 0x52800000 | ((sessPtr & 0xFFFF) <<5);
+    uint32_t movk1 = 0xf2a00000 | (((sessPtr >>16) &0xFFFF) <<5);
+    memcpy(ds_patch+0, &mov0,4);
+    memcpy(ds_patch+4, &movk1,4);
+    patch8(base,0xcd28,ds_patch);
 
-    /* ---- 3) 解锁总闸 + 全局状态（v3 保留）---- */
-    *(void **)(base + 0x12a00b0) = (void *)CFBridgingRetain(sSession); /* gMenuUnlockKey */
-    *(uint64_t *)(base + 0x12a00c0) = 0;                               /* expireTS=0 */
-    *(volatile uint8_t *)(base + 0x12a01d2) = 0x00;  /* kill 标志: 未篡改 */
+    /* ----3.seal签名校验全部放行---- */
+    patch_ret(base, 0x1648c, 1);  /* r_aXiNy_VerifySeal ->1 */
+    patch_ret(base, 0x1666c, 1);  /* r_aXiNy_CanarySeal ->1 */
+
+    /* ----4.全局BSS状态，去掉CFBridgingRetain，避免内存泄漏---- */
+    *(__unsafe_unretained NSData **)(base + 0x12a00b0) = sSession; /* gMenuUnlockKey */
+    *(uint64_t *)(base + 0x12a00c0) = 0;                           /* expireTS=0 */
+    *(volatile uint8_t *)(base + 0x12a01d2) = 0x00;
     *(volatile uint8_t *)(base + 0x1eba70)  = 0x01;
     *(volatile uint8_t *)(base + 0x12a01d3) = 0x00;
     *(volatile uint8_t *)(base + 0x1eba71)  = 0x01;
-    patch_ret(base, 0xfa374, 1);   /* HasMenuUnlockKey -> TRUE */
-    patch_ret(base, 0x121b04, 0);  /* c0029 -> 0 */
-    patch_ret(base, 0x121c1c, 0);  /* c0030 -> 0 */
-    patch_ret(base, 0x667c8, 1);   /* isEnabledForKey -> TRUE */
-}
 
-static void on_add_image(const struct mach_header *h, intptr_t slide)
-{
-    (void)h; (void)slide;
-    do_unlock();
+    /* ----5.总闸函数返回true---- */
+    patch_ret(base, 0xfa374, 1);   /* HasMenuUnlockKey -> TRUE */
+    patch_ret(base, 0x121b04, 0);
+    patch_ret(base, 0x121c1c, 0);
+    patch_ret(base, 0x667c8, 1);   /* isEnabledForKey -> TRUE */
 }
 
 __attribute__((constructor))
 static void bypass_init(void)
 {
-    do_unlock();
-    _dyld_register_func_for_add_image(on_add_image);
+    //延迟0.4秒执行，等待目标镜像所有ctor(优先级101)初始化完成
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(),^{
+        do_unlock();
+    });
 }
