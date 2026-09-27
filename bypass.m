@@ -28,7 +28,6 @@
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/mach_init.h>
 #import <stdint.h>
 #import <string.h>
@@ -76,9 +75,9 @@ static void compute_gate_words(uint64_t *gate0, uint32_t *g1, uint32_t *g2, uint
 #pragma mark - 运行内存读写
 
 static kern_return_t safe_read(uintptr_t addr, void *out, size_t n) {
-    mach_vm_size_t got = 0;
-    return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)addr,
-                                  (mach_vm_size_t)n, (mach_vm_address_t)out, &got);
+    vm_size_t got = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)addr,
+                             (vm_size_t)n, (vm_address_t)out, &got);
 }
 
 static int patch_insn(uintptr_t base, uint32_t off,
