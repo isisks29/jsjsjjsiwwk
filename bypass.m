@@ -1,13 +1,14 @@
 // ============================================================
-//  ace 靶场卡密验证绕过 dylib · v7（纯ObjC层并联，不碰全局内存）
+//  ace 靶场卡密验证绕过 dylib · v8（防崩溃版：用真实面板实例，禁止裸创建）
 //  目标：ace-第四课-授权靶场.dylib
 //
-//  v6 闪退原因：写 0x3d6ed8/ee4/ee8 破坏反篡改 murmur 校验 → 崩。
-//  v7 彻底放弃写全局内存，全部走 ObjC 层并联电路：
-//    A. hook 面板 _0xB1D7F3A9 initWithFrame: → 保存实例 + 强制显示
-//    B. hook _0xE4C8719B getter → 首字节=1（菜单显示开关）
-//    C. 延迟遍历窗口 → 找到面板强制显示提到最上层；找不到则主动创建+addSubview
-//    D. 弹窗抑制 + 状态伪造 + 保护抑制
+//  v7 崩溃源：ForceShowPanel 主动 [[_0xB1D7F3A9 alloc] initWithFrame:]
+//            裸创建面板 → 缺游戏上下文 → 崩
+//  v8 原则：
+//    · 只用真实创建的面板实例（主视图流程里 0x1097a0 创建，肯定执行）
+//    · 不主动 alloc 任何靶场类
+//    · getter hook 收窄到菜单相关两个类
+//    · 加回卡密弹窗抑制（v4 验证过稳定）
 // ============================================================
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -20,7 +21,7 @@ static BOOL ReturnYES(id self, SEL _cmd, ...) { return YES; }
 static BOOL ReturnNO(id self, SEL _cmd, ...) { return NO; }
 
 static NSString *FakePassword(id self, SEL _cmd, NSString *service, NSString *account) {
-    return @"ACTIVATED_V7";
+    return @"ACTIVATED_V8";
 }
 
 static void WriteActivationKeychain(void) {
@@ -29,7 +30,7 @@ static void WriteActivationKeychain(void) {
     if (!keychain) return;
     NSString *service = @"com.apple.LSDocumentRegistry";
     NSString *account = @"com.apple.identitytoken.v4";
-    NSString *password = @"ACTIVATED_BY_BYPASS_V7";
+    NSString *password = @"ACTIVATED_BY_BYPASS_V8";
     SEL sel1 = NSSelectorFromString(@"setPassword:forService:account:error:");
     SEL sel2 = NSSelectorFromString(@"setPassword:forService:account:");
     if ([keychain respondsToSelector:sel1]) {
@@ -57,90 +58,88 @@ static UIWindow *GetCurrentKeyWindow(void) {
 #pragma clang diagnostic pop
 }
 
-// 全局保存面板实例（hook 创建时捕获）
+// 真实面板实例（hook 捕获，绝不裸创建）
 static __strong UIView *g_panel = nil;
 
-// ---------- 通道A：hook 面板创建，保存实例+强制显示 ----------
+// ---------- 通道A：捕获真实面板实例（只保存+轻量显示，不操作内部） ----------
 static IMP orig_panelInit = NULL;
 static UIView *Hook_panelInit(id self, SEL _cmd, CGRect frame) {
     UIView *v = ((UIView*(*)(id,SEL,CGRect))orig_panelInit)(self,_cmd,frame);
+    if (v) g_panel = v;   // 仅保存引用
+    return v;
+}
+
+// ---------- 通道B：菜单显示开关（只 hook 菜单相关两个类） ----------
+static IMP orig_ballGetter = NULL;
+static id Hook_ballGetter(id self, SEL _cmd) {
+    id obj = ((id(*)(id,SEL))orig_ballGetter)(self, _cmd);
+    if (obj) *((uint8_t *)(__bridge void *)obj) = 1;
+    return obj;
+}
+static IMP orig_panelGetter = NULL;
+static id Hook_panelGetter(id self, SEL _cmd) {
+    id obj = ((id(*)(id,SEL))orig_panelGetter)(self, _cmd);
+    if (obj) *((uint8_t *)(__bridge void *)obj) = 1;
+    return obj;
+}
+static void HookMenuGetters(void) {
+    Class ball = objc_getClass("_0xD4E9A3C7");
+    Class panel = objc_getClass("_0xB1D7F3A9");
+    SEL sel = NSSelectorFromString(@"_0xE4C8719B");
+    if (ball) {
+        Method m = class_getInstanceMethod(ball, sel);
+        if (m) { orig_ballGetter = method_getImplementation(m); method_setImplementation(m, (IMP)Hook_ballGetter); }
+    }
+    if (panel) {
+        Method m = class_getInstanceMethod(panel, sel);
+        if (m) { orig_panelGetter = method_getImplementation(m); method_setImplementation(m, (IMP)Hook_panelGetter); }
+    }
+}
+
+// ---------- 通道C：把真实面板加入窗口并显示（不裸创建） ----------
+static void ForceShowPanel(void) {
+    UIWindow *win = GetCurrentKeyWindow();
+    if (!win) return;
+    UIView *panel = g_panel;
+    Class panelCls = objc_getClass("_0xB1D7F3A9");
+    // 1) 先找窗口树里已有的面板
+    if (!panel && panelCls) {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:win];
+        while (stack.count > 0) {
+            UIView *cur = stack.lastObject;
+            [stack removeLastObject];
+            if ([cur isKindOfClass:panelCls]) { panel = cur; break; }
+            [stack addObjectsFromArray:cur.subviews];
+        }
+    }
+    if (!panel) return;   // 面板未创建 → 什么都不做（不裸创建，防崩）
+    // 2) 若无 superview，加入 keyWindow
+    if (!panel.superview) {
+        panel.frame = win.bounds;
+        [win addSubview:panel];
+    }
+    // 3) 强制显示
+    panel.hidden = NO;
+    panel.alpha = 1;
+    panel.userInteractionEnabled = YES;
+    [panel.superview bringSubviewToFront:panel];
+}
+
+// ---------- 通道D：卡密弹窗抑制（v4 验证过稳定） ----------
+static IMP orig_cardInit = NULL;
+static UIView *Hook_cardInit(id self, SEL _cmd, CGRect frame) {
+    UIView *v = ((UIView*(*)(id,SEL,CGRect))orig_cardInit)(self,_cmd,frame);
     if (v) {
-        g_panel = v;   // 保存强引用，防止被释放
-        v.hidden = NO;
-        v.alpha = 1;
-        v.userInteractionEnabled = YES;
+        v.hidden = YES;
+        v.alpha = 0;
+        v.userInteractionEnabled = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.3*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(),^{ [v removeFromSuperview]; });
     }
     return v;
 }
 
-// ---------- 通道B：菜单显示开关 ----------
-static NSMutableDictionary *orig_getters = nil;
-static id Hook_menuStateGetter(id self, SEL _cmd) {
-    NSString *key = NSStringFromClass([self class]);
-    IMP orig = (IMP)[orig_getters[key] pointerValue];
-    id obj = ((id(*)(id,SEL))orig)(self, _cmd);
-    if (obj) {
-        *((uint8_t *)(__bridge void *)obj) = 1;
-    }
-    return obj;
-}
-static void HookMenuStateGetters(void) {
-    orig_getters = [NSMutableDictionary dictionary];
-    SEL sel = NSSelectorFromString(@"_0xE4C8719B");
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return;
-    __unsafe_unretained Class *buf = (__unsafe_unretained Class*)malloc(sizeof(Class)*count);
-    objc_getClassList(buf, count);
-    for (int i = 0; i < count; i++) {
-        Class cls = buf[i];
-        if (!cls) continue;
-        Method m = class_getInstanceMethod(cls, sel);
-        if (m) {
-            IMP orig = method_getImplementation(m);
-            orig_getters[NSStringFromClass(cls)] = [NSValue valueWithPointer:orig];
-            method_setImplementation(m, (IMP)Hook_menuStateGetter);
-        }
-    }
-    free(buf);
-}
-
-// ---------- 通道C：遍历窗口找面板；找不到则主动创建+addSubview ----------
-static void ForceShowPanel(void) {
-    UIWindow *win = GetCurrentKeyWindow();
-    if (!win) return;
-    Class panelCls = objc_getClass("_0xB1D7F3A9");
-    __block UIView *found = nil;
-    // 1) 先在窗口树里找面板
-    NSMutableArray *allWindows = [NSMutableArray array];
-    [allWindows addObject:win];
-    if (win.windowScene) [allWindows addObjectsFromArray:win.windowScene.windows];
-    for (UIWindow *w in allWindows) {
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-        while (stack.count > 0) {
-            UIView *cur = stack.lastObject;
-            [stack removeLastObject];
-            if (panelCls && [cur isKindOfClass:panelCls]) { found = cur; break; }
-            [stack addObjectsFromArray:cur.subviews];
-        }
-        if (found) break;
-    }
-    // 2) 若没找到但 hook 捕获过实例，用它
-    if (!found && g_panel && [g_panel isKindOfClass:panelCls]) found = g_panel;
-    // 3) 仍没有 → 主动创建面板并加进 window
-    if (!found && panelCls) {
-        UIView *nv = [(UIView*)[panelCls alloc] initWithFrame:win.bounds];
-        if (nv) { found = nv; [win addSubview:nv]; }
-    }
-    // 4) 强制显示
-    if (found) {
-        found.hidden = NO;
-        found.alpha = 1;
-        found.userInteractionEnabled = YES;
-        if (found.superview) [found.superview bringSubviewToFront:found];
-    }
-}
-
-// ---------- 通道D：弹窗兜底 ----------
+// ---------- 通道E：弹窗兜底 ----------
 static BOOL IsCardErrorMsg(NSString *msg) {
     if (!msg || ![msg isKindOfClass:[NSString class]]) return NO;
     NSArray *kws = @[@"不存在",@"失败",@"错误",@"无效",@"过期",@"已使用",
@@ -188,7 +187,7 @@ static void SwizzleOnAllClasses(NSArray<NSString*> *selectors, IMP imp, BOOL ins
 }
 
 __attribute__((constructor))
-static void BypassV7Init(void) {
+static void BypassV8Init(void) {
     WriteActivationKeychain();
 
     // 状态伪造
@@ -213,10 +212,10 @@ static void BypassV7Init(void) {
     SwizzleOnAllClasses(@[@"passwordForService:account:error:"], (IMP)FakePassword, YES);
     SwizzleOnAllClasses(@[@"q17"], (IMP)NoopVoid, YES);
 
-    // 通道B：菜单显示开关
-    HookMenuStateGetters();
+    // 通道B：菜单显示开关（收窄到两个类）
+    HookMenuGetters();
 
-    // 通道A：hook 面板创建
+    // 通道A：捕获真实面板实例
     Class panelCls = objc_getClass("_0xB1D7F3A9");
     if (panelCls) {
         Method m = class_getInstanceMethod(panelCls, @selector(initWithFrame:));
@@ -226,7 +225,17 @@ static void BypassV7Init(void) {
         }
     }
 
-    // 通道D：弹窗兜底
+    // 通道D：卡密弹窗抑制
+    Class cardCls = objc_getClass("_0x37C8E2B6");
+    if (cardCls) {
+        Method m = class_getInstanceMethod(cardCls, @selector(initWithFrame:));
+        if (m) {
+            orig_cardInit = method_getImplementation(m);
+            method_setImplementation(m, (IMP)Hook_cardInit);
+        }
+    }
+
+    // 通道E：弹窗兜底
     Class ac = objc_getClass("UIAlertController");
     if (ac) {
         Method m1 = class_getClassMethod(ac, @selector(alertControllerWithTitle:message:preferredStyle:));
@@ -241,7 +250,7 @@ static void BypassV7Init(void) {
         }
     }
 
-    // 通道C：多轮延迟强制显示面板（覆盖不同初始化时机）
+    // 通道C：多轮延迟把真实面板加入窗口并显示（绝不裸创建）
     for (int delay = 2; delay <= 14; delay += 2) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{ ForceShowPanel(); });
