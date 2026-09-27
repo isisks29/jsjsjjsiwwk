@@ -61,12 +61,14 @@ static UIWindow *GetCurrentKeyWindow(void) {
 // 真实面板实例（hook 捕获，绝不裸创建）
 static __strong UIView *g_panel = nil;
 
-// ---------- 通道A：捕获真实面板实例（只保存+轻量显示，不操作内部） ----------
-static IMP orig_panelInit = NULL;
-static UIView *Hook_panelInit(id self, SEL _cmd, CGRect frame) {
-    UIView *v = ((UIView*(*)(id,SEL,CGRect))orig_panelInit)(self,_cmd,frame);
-    if (v) g_panel = v;   // 仅保存引用
-    return v;
+// ---------- 通道A：通过主视图 setter 捕获真实面板实例 ----------
+// 面板创建不用 initWithFrame:（自定义init），所以 hook init 无效。
+// 主视图 _0x1E6B7A93 的 set_0xB1D7F3A9: 一定被调用（@0x7e9d8），
+// 参数就是面板实例——hook 它捕获。
+static IMP orig_setPanel = NULL;
+static void Hook_setPanel(id self, SEL _cmd, id panel) {
+    if (panel) g_panel = panel;
+    ((void(*)(id,SEL,id))orig_setPanel)(self, _cmd, panel);
 }
 
 // ---------- 通道B：菜单显示开关（hook 全部 4 个靶场类的 _0xE4C8719B） ----------
@@ -85,8 +87,7 @@ static void HookMenuGetters(void) {
     NSArray *classNames = @[@"_0xD4E9A3C7", @"_0xB1D7F3A9", @"_0x1E6B7A93", @"_0xC8E2A541"];
     SEL sel = NSSelectorFromString(@"_0xE4C8719B");
     for (NSString *cn in classNames) {
-        const char *cname = [cn UTF8String];
-        Class cls = objc_getClass(cname);
+        Class cls = objc_getClass(cn);
         if (!cls) continue;
         Method m = class_getInstanceMethod(cls, sel);
         if (m) {
@@ -216,13 +217,14 @@ static void BypassV8Init(void) {
     // 通道B：菜单显示开关（收窄到两个类）
     HookMenuGetters();
 
-    // 通道A：捕获真实面板实例
-    Class panelCls = objc_getClass("_0xB1D7F3A9");
-    if (panelCls) {
-        Method m = class_getInstanceMethod(panelCls, @selector(initWithFrame:));
+    // 通道A：通过主视图 setter 捕获真实面板实例（面板不用 initWithFrame:）
+    Class mainViewCls = objc_getClass("_0x1E6B7A93");
+    if (mainViewCls) {
+        SEL setPanelSel = NSSelectorFromString(@"set_0xB1D7F3A9:");
+        Method m = class_getInstanceMethod(mainViewCls, setPanelSel);
         if (m) {
-            orig_panelInit = method_getImplementation(m);
-            method_setImplementation(m, (IMP)Hook_panelInit);
+            orig_setPanel = method_getImplementation(m);
+            method_setImplementation(m, (IMP)Hook_setPanel);
         }
     }
 
