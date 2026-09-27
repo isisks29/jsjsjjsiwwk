@@ -1,3 +1,4 @@
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -249,6 +250,60 @@ static const patch_t kPatches[] = {
     {0x4f84, {0xa0,0x02,0x00,0x54}, {0x04,0x00,0x00,0x14}},};
 #define kPatchCount (sizeof(kPatches) / sizeof(kPatches[0]))
 
+#pragma mark - 自检（屏幕状态条 + 文件日志）
+
+static NSMutableString *g_status(void) {
+    static NSMutableString *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[NSMutableString alloc] init]; });
+    return s;
+}
+
+static void log_line(NSString *msg) {
+    if ([g_status() rangeOfString:msg].location == NSNotFound) {
+        [g_status() appendString:[NSString stringWithFormat:@"%@\n", msg]];
+    }
+    NSLog(@"[bypass] %@", msg);
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (paths.count) {
+        NSString *p = [paths[0] stringByAppendingPathComponent:@"bypass.log"];
+        NSString *line = [NSString stringWithFormat:@"[bypass] %@\n", msg];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (fh) {
+                [fh seekToEndOfFile];
+                [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                [fh closeFile];
+            }
+        }
+    }
+}
+
+/* 把全部诊断状态贴到 statusbar 下方（半透明红条），在手机上直接可见，证明 dylib 已加载执行 */
+static void paint_status(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *w = [UIApplication sharedApplication].keyWindow;
+        if (!w) w = [UIApplication sharedApplication].windows.firstObject;
+        if (!w) return;
+        UILabel *lbl = (UILabel *)[w viewWithTag:0x5A17];
+        if (!lbl) {
+            lbl = [[UILabel alloc] initWithFrame:CGRectMake(6, 46, w.bounds.size.width - 12, 36)];
+            lbl.tag = 0x5A17;
+            lbl.numberOfLines = 2;
+            lbl.adjustsFontSizeToFitWidth = YES;
+            lbl.textColor = [UIColor redColor];
+            lbl.font = [UIFont boldSystemFontOfSize:10];
+            lbl.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
+            lbl.layer.zPosition = 99999;
+            [w addSubview:lbl];
+        }
+        NSArray *lines = [g_status() componentsSeparatedByString:@"\n"];
+        lbl.text = [lines componentsJoinedByString:@" | "];
+    });
+}
+
 #pragma mark - 挂钩（弹窗抑制 + 激活流）
 
 /* 真实弹窗判定入口：+[_0xD5A13E79 passwordForService:account:]
@@ -282,24 +337,32 @@ static void apply_hooks(void) {
     if (kc) {
         Method m = class_getClassMethod(kc, NSSelectorFromString(@SEL_PASS));
         if (!m) m = class_getInstanceMethod(kc, NSSelectorFromString(@SEL_PASS));
-        if (m) method_setImplementation(m, (IMP)bypass_passwd);
-        else NSLog(@"[bypass] passwordForService hook: method not found");
+        if (m) {
+            method_setImplementation(m, (IMP)bypass_passwd);
+            log_line(@"HOOK pw=OK");
+        } else {
+            log_line(@"HOOK pw=MISS");
+        }
     } else {
-        NSLog(@"[bypass] class %s not found", CLS_KEYCHAIN);
+        log_line(@"CLASS keychain MISS");
     }
     Class pop = objc_getClass(CLS_POPUP);
     if (pop) {
         Method m = class_getInstanceMethod(pop, NSSelectorFromString(@SEL_SETUP));
-        if (m) method_setImplementation(m, (IMP)bypass_setupUI);
+        if (m) {
+            method_setImplementation(m, (IMP)bypass_setupUI);
+            log_line(@"HOOK setupUI=OK");
+        }
     }
-    /* 全局弹窗抑制（仅 UIAlertController） */
     Class vc = [UIViewController class];
     SEL psel = @selector(presentViewController:animated:completion:);
     Method pm = class_getInstanceMethod(vc, psel);
     if (pm) {
         g_orig_present = method_getImplementation(pm);
         method_setImplementation(pm, (IMP)bypass_present);
+        log_line(@"HOOK present=OK");
     }
+    paint_status();
 }
 
 #pragma mark - 定位靶场 dylib
@@ -325,6 +388,8 @@ static uintptr_t find_target_base(void) {
 #pragma mark - 主流程
 
 static void apply_bypass(uintptr_t base) {
+    log_line([NSString stringWithFormat:@"BASE=0x%llx", (unsigned long long)base]);
+
     /* 1) 写入门卫字（心跳链，T=1） */
     uint64_t g0; uint32_t g1, g2, g3;
     compute_gate_words(&g0, &g1, &g2, &g3);
@@ -332,6 +397,7 @@ static void apply_bypass(uintptr_t base) {
     memcpy(words, &g0, 8); memcpy(words + 8, &g1, 4);
     memcpy(words + 12, &g2, 4); memcpy(words + 16, &g3, 4);
     memcpy((void *)(base + OFF_GATE0), words, sizeof(words));
+    log_line([NSString stringWithFormat:@"GATE=0x%llx", (unsigned long long)g0]);
 
     /* 2) 全部验证逃逸点补丁（逐条校验原字节） */
     uint32_t ok = 0, skip = 0;
@@ -339,24 +405,33 @@ static void apply_bypass(uintptr_t base) {
         int r = patch_insn(base, kPatches[i].off, kPatches[i].expect, kPatches[i].repl);
         if (r == 0) ok++; else skip++;
     }
+    log_line([NSString stringWithFormat:@"PATCH ok=%u skip=%u", ok, skip]);
 
     /* 3) 挂钩：卡密判定入口 + 弹窗界面 + 全局弹窗抑制 */
     apply_hooks();
-
-    NSLog(@"[bypass] base=%p patches ok=%u skip=%u gate0=%llx", (void *)base, ok, skip, (unsigned long long)g0);
 }
 
 static void try_build_once(uintptr_t base) {
     if (!base) return;
     uint8_t latch = 0;
-    if (safe_read(base + OFF_LATCH, &latch, 1) != KERN_SUCCESS) return;
-    if (latch & 1) return;                      /* 已构建过，跳过 */
+    if (safe_read(base + OFF_LATCH, &latch, 1) != KERN_SUCCESS) {
+        log_line(@"BUILD latch read FAIL");
+        return;
+    }
+    if (latch & 1) {
+        log_line(@"BUILD already(bit0=1)");
+        return;
+    }
     void (*build)(void) = (void (*)(void))(base + OFF_BUILD);
     build();                                    /* 主线程执行：构建 Metal 面板 */
+    log_line(@"BUILD called 0x109020");
+    paint_status();
 }
 
 __attribute__((constructor))
 static void bypass_ctor(void) {
+    log_line(@"CTOR ran (dylib loaded)");
+    paint_status();
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         __block uintptr_t base = find_target_base();
@@ -365,30 +440,36 @@ static void bypass_ctor(void) {
         void (^applyAndBuild)(void) = ^{
             if (!base) return;
             if (!applied) { apply_bypass(base); applied = YES; }
-            /* 等 UI 就绪后构建面板（锁存位判重，幂等；最多重试 8 次） */
+            /* 等 UI 就绪后构建面板（锁存位判重，幂等；最多重试 20 次 × 1s） */
             __block uint32_t n = 0;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                while (n++ < 8) {
+                while (n++ < 20) {
                     try_build_once(base);
-                    if (n < 8) usleep(500000);
+                    if (n < 20) usleep(1000000);
                 }
             });
         };
 
         if (base) {
+            log_line(@"TARGET found at load");
             applyAndBuild();
         } else {
-            /* 靶场尚未加载：后台轮询最多 30s 定位 */
+            /* 靶场尚未加载：后台轮询最多 60s 定位 */
+            log_line(@"TARGET not yet loaded, polling...");
             __block uint32_t tries = 0;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                while (tries++ < 100) {
+                while (tries++ < 200) {
                     if ((base = find_target_base())) break;
                     usleep(300000);
                 }
                 if (base) {
+                    log_line(@"TARGET found after poll");
                     dispatch_async(dispatch_get_main_queue(), ^{ applyAndBuild(); });
+                } else {
+                    log_line(@"TARGET NOT FOUND (60s)");
+                    paint_status();
                 }
             });
         }
