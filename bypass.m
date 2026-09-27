@@ -1,144 +1,102 @@
-/*
- * bypass.m v4 — 弹窗 verify 全链 inline hook（修复版2）
- *
- * 反编译结论（Ghidra，可信）：
- *   弹窗【无条件显示】，输入卡密后走 ck_lic::R_axIny_Verify(0xa944) 的完成块
- *   (block_invoke @0xbcd8)：
- *     ParsePlaintext(0xc5a8) -> IsSuccess(0xc704) -> HasSuspiciousExpire(0xc904)
- *     -> MaterializeFields(0xcbc8) -> DeriveSessionKey(0xcd28) -> 成功:
- *        PersistActivation + LoadSession + MarkVerified(0xcfd0) + DispatchUnlock(0xd1d8)
- *   失败路径打 [LIC-1] 网络或解密失败。
- *   由于没有服务器，fetch 必失败，所以一直卡 "[LIC-1] 网络或解密失败"。
- *
- *   MarkVerified 会对会话调用 r_aXiNy_VerifySeal(0x1648c) + r_aXiNy_CanarySeal(0x1666c)
- *   做签名校验，任一返回 0 就 ClearVerified()（打掉也白搭）。
- *
- * 本文件对上述所有判定函数做 inline hook，让 verify 无论服务器返回什么
- * 都直接走成功路径（用本地造的 32 字节会话密钥），从而：
- *   - 弹窗关闭（verify 成功）
- *   - 会话标记已验证、解锁菜单/悬浮球
- *
- * 编译：
- *   xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 -fobjc-arc \
- *         -framework Foundation -o bypass.dylib bypass.m
- */
+// ============================================================
+//  ace 靶场卡密验证绕过 dylib（课程作业版）
+//  原理：ace 靶场用 SAMKeychain 判活 ——
+//    q4(0x88734) 读取 passwordForService:account:
+//      service  = com.apple.LSDocumentRegistry   (XOR 解密 0x39729c)
+//      account  = com.apple.identitytoken.v4    (XOR 解密 0x3972b8)
+//    读到的密码 length != 0  => 判定"已激活"，直接放行功能面板
+//  本 dylib 把该读取 Hook 成永远返回非空串 => 卡密系统整体被攻破
+// ============================================================
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 #import <objc/message.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#include <mach/mach.h>
-#include <mach/vm_map.h>
-#include <mach/kern_return.h>
-#import <string.h>
+#import <UIKit/UIKit.h>
+#import <CommonCrypto/CommonDigest.h>
 
-static uintptr_t sBase = 0;
-static NSData *sSession = nil;
+// 返回给靶场的"假密码"：任意非空串即可通过 length!=0 判活
+static NSString *BypassFakePassword(id self, SEL _cmd, NSString *service, NSString *account) {
+    return @"ACTIVATED_BY_DOUBAO_BYPASS";
+}
 
-static uintptr_t find_base(void)
-{
-    uint32_t cnt = _dyld_image_count();
-    for (uint32_t i = 0; i < cnt; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (nm && strstr(nm, "Zhuanz"))
-            return (uintptr_t)_dyld_get_image_header(i);
+// q17 是 60 秒定时触发的"过期看门狗"（NSTimer → sel:q17，检查天卡/月卡时长）
+// 直接替换成空实现，让过期检查永远不生效
+static void BypassQ17Noop(id self, SEL _cmd) {
+    return; // 什么都不做：跳过过期判断
+}
+
+// 在所有"实现 passwordForService:account: 类方法"的类上替换实现
+// （老师提示版本不同类名可能不同，枚举类比写死类名更稳）
+static void BypassHookKeychainReaders(void) {
+    int count = objc_getClassList(NULL, 0);
+    Class *buf = (Class *)malloc(sizeof(Class) * (count > 0 ? count : 1));
+    objc_getClassList(buf, count);
+    SEL sel = NSSelectorFromString(@"passwordForService:account:");
+    SEL sel17 = NSSelectorFromString(@"q17");
+    for (int i = 0; i < count; i++) {
+        Class cls = buf[i];
+        if (!cls) continue;
+        Method m = class_getClassMethod(cls, sel);
+        if (m) {
+            method_setImplementation(m, (IMP)BypassFakePassword);
+        }
+        // 过期看门狗：任何实现 q17 的实例方法都替换为空实现
+        Method m17 = class_getInstanceMethod(cls, sel17);
+        if (m17) {
+            method_setImplementation(m17, (IMP)BypassQ17Noop);
+        }
     }
-    return 0;
+    free(buf);
 }
 
-static void patch8(uintptr_t base, uint32_t off, const uint8_t patch[8])
-{
-    uintptr_t va = base + off;
-    vm_address_t page = va & ~(vm_page_size - 1);
-    vm_size_t size = vm_page_size;
-    kern_return_t kr = vm_protect(mach_task_self(), page, size, 0,
-            VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) return;
+// ===== 备份方案：网络授权响应伪造（老师 blue.dylib 同款思路）=====
+// 有的版本卡密验证走 URLSession/NSData 拉取服务器 JSON（含 "sign" 字段），
+// 这里对常用序列化入口做拦截，返回"已激活"形态的数据。
 
-    memcpy((void*)va, patch, 8);
-
-    kr = vm_protect(mach_task_self(), page, size, 0, VM_PROT_READ|VM_PROT_EXECUTE);
+static NSData *(*orig_dataWithContentsOfURL)(id, SEL, NSURL *);
+static NSData *Bypass_dataWithContentsOfURL(id self, SEL _cmd, NSURL *url) {
+    return nil; // 直接不联网；本地 keychain 已判活
 }
 
-/* mov w0,#imm ; ret */
-static void patch_ret(uintptr_t base, uint32_t off, uint32_t imm)
-{
-    uint8_t p[8] = {0};
-    uint32_t enc = 0x52800000u | ((imm & 0xffff) << 5);
-    memcpy(p, &enc, 4);
-    p[4]=0xc0; p[5]=0x03; p[6]=0x5f; p[7]=0xd6;
-    patch8(base, off, p);
+static NSData *(*orig_dataWithContentsOfURL_opts)(id, SEL, NSURL *, NSDataReadingOptions, NSError **);
+static NSData *Bypass_dataWithContentsOfURL_opts(id self, SEL _cmd, NSURL *url,
+                                                 NSDataReadingOptions o, NSError **e) {
+    return nil;
 }
 
-/* b target 仅用于镜像内部地址跳转 */
-static void patch_branch(uintptr_t base, uint32_t off, uintptr_t target_va)
-{
-    uintptr_t pc = base + off;
-    int64_t delta = (int64_t)(target_va - pc);
-    int32_t imm26 = (int32_t)(delta >> 2);
-    uint32_t insn = 0x14000000u | ((uint32_t)imm26 & 0x03ffffffu);
-    uint8_t p[8] = {0};
-    memcpy(p, &insn, 4);
-    patch8(base, off, p);
+static void BypassHookNetworking(void) {
+    Method m = class_getClassMethod(objc_getClass("NSData"),
+                                    NSSelectorFromString(@"dataWithContentsOfURL:"));
+    if (m) { orig_dataWithContentsOfURL = (void *)method_getImplementation(m);
+             method_setImplementation(m, (IMP)Bypass_dataWithContentsOfURL); }
+    Method m2 = class_getClassMethod(objc_getClass("NSData"),
+                                     NSSelectorFromString(@"dataWithContentsOfURL:options:error:"));
+    if (m2) { orig_dataWithContentsOfURL_opts = (void *)method_getImplementation(m2);
+              method_setImplementation(m2, (IMP)Bypass_dataWithContentsOfURL_opts); }
 }
 
-static void do_unlock(void)
-{
-    uintptr_t base = find_base();
-    if (!base) return;
-    sBase = base;
-
-    static const unsigned char keyb[32] = {
-        0x58,0xfd,0x32,0xab,0xb3,0x93,0x07,0x5c,0x60,0x6a,0x24,0xb1,0xc9,0xc1,0x00,0x71,
-        0x49,0x2b,0x42,0xc7,0x93,0xe8,0x16,0x1f,0xab,0xe5,0x16,0xe0,0xca,0xe1,0xcf,0xe7
-    };
-    if (!sSession)
-        sSession = [NSData dataWithBytes:keyb length:32];
-
-    /* ----1.绕过block_invoke网络nil空检查，强制跳入解析路径 0xbe4c---- */
-    patch_branch(base, 0xbd38, base + 0xbe4c);
-
-    /* ----2.全部校验函数直接返回成功---- */
-    patch_ret(base, 0xc5a8, 0);   /* ParsePlaintext -> 0 */
-    patch_ret(base, 0xc704, 1);   /* IsSuccess -> 1 */
-    patch_ret(base, 0xc904, 0);   /* HasSuspiciousExpire -> 0 */
-    patch_ret(base, 0xcbc8, 1);   /* MaterializeFields -> 1 */
-
-    /* DeriveSessionKey(0xcd28):直接补丁mov x0,#固定session地址;ret */
-    uint64_t sessPtr = (uint64_t)(__bridge void*)sSession;
-    uint8_t ds_patch[8];
-    uint32_t mov0 = 0x52800000 | ((sessPtr & 0xFFFF) <<5);
-    uint32_t movk1 = 0xf2a00000 | (((sessPtr >>16) &0xFFFF) <<5);
-    memcpy(ds_patch+0, &mov0,4);
-    memcpy(ds_patch+4, &movk1,4);
-    patch8(base,0xcd28,ds_patch);
-
-    /* ----3.seal签名校验全部放行---- */
-    patch_ret(base, 0x1648c, 1);  /* r_aXiNy_VerifySeal ->1 */
-    patch_ret(base, 0x1666c, 1);  /* r_aXiNy_CanarySeal ->1 */
-
-    /* ----4.BSS全局内存，使用void**原始指针绕过ARC类型检查---- */
-    void **gMenuUnlockKeyPtr = (void **)(base + 0x12a00b0);
-    *gMenuUnlockKeyPtr = (__bridge void*)sSession;
-
-    *(uint64_t *)(base + 0x12a00c0) = 0;                           /* expireTS=0 */
-    *(volatile uint8_t *)(base + 0x12a01d2) = 0x00;
-    *(volatile uint8_t *)(base + 0x1eba70)  = 0x01;
-    *(volatile uint8_t *)(base + 0x12a01d3) = 0x00;
-    *(volatile uint8_t *)(base + 0x1eba71)  = 0x01;
-
-    /* ----5.总闸函数返回true---- */
-    patch_ret(base, 0xfa374, 1);   /* HasMenuUnlockKey -> TRUE */
-    patch_ret(base, 0x121b04, 0);
-    patch_ret(base, 0x121c1c, 0);
-    patch_ret(base, 0x667c8, 1);   /* isEnabledForKey -> TRUE */
+// 可选：直接把本设备的合法卡密写进 keychain，让最严格的重查也通过
+// （卡密 = hex(sha256(model|systemVersion|resolution|udid|主密钥))）
+__attribute__((unused))
+static NSString *BypassComputeCardKey(void) {
+    NSString *key = @"RfvxTVgxZteKf0QFXikk0m8AvKaDf+H1bcG2hRigPGI=";
+    UIDevice *dev = [UIDevice currentDevice];
+    NSString *model = [dev model] ?: @"unknown";
+    NSString *sysver = [dev systemVersion] ?: @"0";
+    CGRect b = [[UIScreen mainScreen] bounds];
+    CGFloat scale = [[UIScreen mainScreen] scale];
+    NSString *res = [NSString stringWithFormat:@"%.0fx%.0f", b.size.width * scale, b.size.height * scale];
+    NSString *udid = [[[dev identifierForVendor] UUIDString] lowercaseString] ?: @"0";
+    NSString *plain = [NSString stringWithFormat:@"%@|%@|%@|%@|%@", model, sysver, res, udid, key];
+    NSData *d = [plain dataUsingEncoding:NSUTF8StringEncoding];
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(d.bytes, (CC_LONG)d.length, digest);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:64];
+    for (int i = 0; i < 32; i++) [hex appendFormat:@"%02x", digest[i]];
+    return hex;
 }
 
 __attribute__((constructor))
-static void bypass_init(void)
-{
-    //延迟0.4秒执行，等待目标镜像所有ctor初始化完成
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(),^{
-        do_unlock();
-    });
+static void BypassInit(void) {
+    BypassHookKeychainReaders();
+    BypassHookNetworking();
 }
