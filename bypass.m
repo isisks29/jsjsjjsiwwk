@@ -85,7 +85,8 @@ static id Hook_menuStateGetter(id self, SEL _cmd) {
     id obj = ((id(*)(id,SEL))orig)(self, _cmd);
     if (obj) {
         // 原代码 iconOnClick 直接读写返回对象的第一个字节作为菜单开关
-        *((uint8_t*)obj) = 1;
+        void *ptr = (__bridge void *)obj;
+        *((uint8_t *)ptr) = 1;
     }
     return obj;
 }
