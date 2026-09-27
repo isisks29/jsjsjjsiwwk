@@ -1,4 +1,5 @@
 
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -389,15 +390,22 @@ static void apply_hooks(void) {
 static uintptr_t find_target_base(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
         const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!h || h->magic != MH_MAGIC_64) continue;
         uintptr_t base = (uintptr_t)h;
-        /* 特征：0x109020 build 序言(sub sp,sp,#336)，0x4ccc 心跳序言(adrp x1,0) */
-        uint8_t a[4], b[4];
-        if (safe_read(base + 0x109020, a, 4) != KERN_SUCCESS) continue;
-        if (safe_read(base + 0x4ccc, b, 4) != KERN_SUCCESS) continue;
-        if (a[0]==0xff && a[1]==0x43 && a[2]==0x05 && a[3]==0xd1 &&
-            b[0]==0x41 && b[1]==0x80 && b[2]==0x00 && b[3]==0xd0) {
+        /* 优先：安装名匹配（LC_ID_DYLIB=/Library/1.dylib） */
+        int nameHit = (name && strstr(name, "/1.dylib"));
+        /* 字节特征（已核实：0x109020=sub sp,sp,#336；0x4ccc=stp x24,x23,[sp,#-64]!） */
+        uint8_t a[4], c[4];
+        int fea = 0;
+        if (safe_read(base + 0x109020, a, 4) == KERN_SUCCESS &&
+            safe_read(base + 0x4ccc, c, 4) == KERN_SUCCESS) {
+            fea = (a[0]==0xff && a[1]==0x43 && a[2]==0x05 && a[3]==0xd1 &&
+                   c[0]==0xf8 && c[1]==0x5f && c[2]==0xbc && c[3]==0xa9);
+        }
+        if (nameHit || fea) {
+            log_line([NSString stringWithFormat:@"MATCH fea=%d img=%s", fea, name ? name : ""]);
             return base;
         }
     }
