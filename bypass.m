@@ -69,30 +69,30 @@ static UIView *Hook_panelInit(id self, SEL _cmd, CGRect frame) {
     return v;
 }
 
-// ---------- 通道B：菜单显示开关（只 hook 菜单相关两个类） ----------
-static IMP orig_ballGetter = NULL;
-static id Hook_ballGetter(id self, SEL _cmd) {
-    id obj = ((id(*)(id,SEL))orig_ballGetter)(self, _cmd);
-    if (obj) *((uint8_t *)(__bridge void *)obj) = 1;
-    return obj;
-}
-static IMP orig_panelGetter = NULL;
-static id Hook_panelGetter(id self, SEL _cmd) {
-    id obj = ((id(*)(id,SEL))orig_panelGetter)(self, _cmd);
+// ---------- 通道B：菜单显示开关（hook 全部 4 个靶场类的 _0xE4C8719B） ----------
+// 主视图 _0x1E6B7A93 触摸处理 updateIOWithTouches 读它首字节，
+// 首字节=0 会跳过触摸处理（点左上角无反应）——必须全部强制=1
+static NSMutableDictionary *orig_getters = nil;
+static id Hook_menuStateGetter(id self, SEL _cmd) {
+    NSString *key = NSStringFromClass([self class]);
+    IMP orig = (IMP)[orig_getters[key] pointerValue];
+    id obj = ((id(*)(id,SEL))orig)(self, _cmd);
     if (obj) *((uint8_t *)(__bridge void *)obj) = 1;
     return obj;
 }
 static void HookMenuGetters(void) {
-    Class ball = objc_getClass("_0xD4E9A3C7");
-    Class panel = objc_getClass("_0xB1D7F3A9");
+    orig_getters = [NSMutableDictionary dictionary];
+    NSArray *classNames = @[@"_0xD4E9A3C7", @"_0xB1D7F3A9", @"_0x1E6B7A93", @"_0xC8E2A541"];
     SEL sel = NSSelectorFromString(@"_0xE4C8719B");
-    if (ball) {
-        Method m = class_getInstanceMethod(ball, sel);
-        if (m) { orig_ballGetter = method_getImplementation(m); method_setImplementation(m, (IMP)Hook_ballGetter); }
-    }
-    if (panel) {
-        Method m = class_getInstanceMethod(panel, sel);
-        if (m) { orig_panelGetter = method_getImplementation(m); method_setImplementation(m, (IMP)Hook_panelGetter); }
+    for (NSString *cn in classNames) {
+        Class cls = objc_getClass(cn);
+        if (!cls) continue;
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) {
+            IMP orig = method_getImplementation(m);
+            orig_getters[cn] = [NSValue valueWithPointer:orig];
+            method_setImplementation(m, (IMP)Hook_menuStateGetter);
+        }
     }
 }
 
