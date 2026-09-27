@@ -62,6 +62,8 @@ jobs:
             -dynamiclib \
             -O2 \
             -framework Foundation \
+            -framework UIKit \
+            -fobjc-arc \
             $EXTRA \
             -o bypass.dylib \
             "$SRC"
