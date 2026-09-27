@@ -379,3 +379,6 @@ static void bypass_ctor(void) {
         } else {
             // 靶场尚未加载：后台重试最多 
         }
+
+    });
+}
