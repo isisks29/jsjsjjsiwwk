@@ -304,6 +304,25 @@ static void paint_status(void) {
     });
 }
 
+/* 持续轮询贴自检条：构造器时机窗口可能未就绪，这里每 0.5s 重试、最多 60 次（30s），
+ * 只要 dylib 确实被加载、app 窗口一出现就必然显示。这是"dylib 是否被加载"的决定性实验。 */
+static void start_status_loop(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __block int k = 0;
+        __block void (^tick)(void);
+        void (^block)(void) = ^{
+            paint_status();
+            k++;
+            if (k < 60) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), tick);
+            }
+        };
+        tick = block;
+        tick();
+    });
+}
+
 #pragma mark - 挂钩（弹窗抑制 + 激活流）
 
 /* 真实弹窗判定入口：+[_0xD5A13E79 passwordForService:account:]
@@ -431,7 +450,7 @@ static void try_build_once(uintptr_t base) {
 __attribute__((constructor))
 static void bypass_ctor(void) {
     log_line(@"CTOR ran (dylib loaded)");
-    paint_status();
+    start_status_loop();
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         __block uintptr_t base = find_target_base();
