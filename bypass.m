@@ -1,27 +1,32 @@
 // ============================================================
-//  ace 靶场卡密验证绕过 dylib · v8（防崩溃版：用真实面板实例，禁止裸创建）
+//  ace 靶场卡密验证绕过 dylib · v11（全局闸门 murmur 校验伪造）
 //  目标：ace-第四课-授权靶场.dylib
 //
-//  v7 崩溃源：ForceShowPanel 主动 [[_0xB1D7F3A9 alloc] initWithFrame:]
-//            裸创建面板 → 缺游戏上下文 → 崩
-//  v8 原则：
-//    · 只用真实创建的面板实例（主视图流程里 0x1097a0 创建，肯定执行）
-//    · 不主动 alloc 任何靶场类
-//    · getter hook 收窄到菜单相关两个类
-//    · 加回卡密弹窗抑制（v4 验证过稳定）
+//  根本原因（逆向确认）：
+//    面板是 Metal 绘制（drawInMTKView: @0x7f5d4），不是 UIView。
+//    每帧检查 0x3d6ee0/ee4/ee8 的 murmur 校验链，失败则跳过绘制。
+//    0x3d6ee0==0 时直接 cbz 跳过。
+//    悬浮球创建（0x109038 函数）也有同样校验。
+//
+//  v11：读 0x3d6ed8，用靶场相同的 murmur 算法计算正确的
+//        ee0/ee4/ee8，写入 __common 段（可读写，无需 mprotect）。
+//        这样 drawInMTKView 每帧通过 → 面板绘制；
+//        初始化函数通过 → 悬浮球创建。
 // ============================================================
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <UIKit/UIKit.h>
 #import <stdint.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
 
 static void NoopVoid(id self, SEL _cmd, ...) { return; }
 static BOOL ReturnYES(id self, SEL _cmd, ...) { return YES; }
 static BOOL ReturnNO(id self, SEL _cmd, ...) { return NO; }
 
 static NSString *FakePassword(id self, SEL _cmd, NSString *service, NSString *account) {
-    return @"ACTIVATED_V8";
+    return @"ACTIVATED_V11";
 }
 
 static void WriteActivationKeychain(void) {
@@ -30,7 +35,7 @@ static void WriteActivationKeychain(void) {
     if (!keychain) return;
     NSString *service = @"com.apple.LSDocumentRegistry";
     NSString *account = @"com.apple.identitytoken.v4";
-    NSString *password = @"ACTIVATED_BY_BYPASS_V8";
+    NSString *password = @"ACTIVATED_BY_BYPASS_V11";
     SEL sel1 = NSSelectorFromString(@"setPassword:forService:account:error:");
     SEL sel2 = NSSelectorFromString(@"setPassword:forService:account:");
     if ([keychain respondsToSelector:sel1]) {
@@ -58,22 +63,76 @@ static UIWindow *GetCurrentKeyWindow(void) {
 #pragma clang diagnostic pop
 }
 
-// 真实面板实例（hook 捕获，绝不裸创建）
-static __strong UIView *g_panel = nil;
+// ---------- 核心：伪造 murmur 全局闸门 ----------
+// 从 drawInMTKView: @0x7f5d4 还原的校验算法
+#define MURMUR_C1 0x1f3d6a71U
+#define MURMUR_C2 0x8e4b1395U
 
-// ---------- 通道A：通过主视图 setter 捕获真实面板实例 ----------
-// 面板创建不用 initWithFrame:（自定义init），所以 hook init 无效。
-// 主视图 _0x1E6B7A93 的 set_0xB1D7F3A9: 一定被调用（@0x7e9d8），
-// 参数就是面板实例——hook 它捕获。
-static IMP orig_setPanel = NULL;
-static void Hook_setPanel(id self, SEL _cmd, id panel) {
-    if (panel) g_panel = panel;
-    ((void(*)(id,SEL,id))orig_setPanel)(self, _cmd, panel);
+static uintptr_t GetAceDylibBase(void) {
+    // 通过靶场类的方法实现地址反查 image 基址
+    Class panelCls = objc_getClass("_0xB1D7F3A9");
+    if (!panelCls) return 0;
+    Method m = class_getInstanceMethod(panelCls, @selector(m0));
+    if (!m) m = class_getInstanceMethod(panelCls, NSSelectorFromString(@"m0"));
+    if (!m) return 0;
+    IMP imp = method_getImplementation(m);
+    Dl_info info;
+    if (dladdr(imp, &info) == 0) return 0;
+    return (uintptr_t)info.dli_fbase;
 }
 
-// ---------- 通道B：菜单显示开关（hook 全部 4 个靶场类的 _0xE4C8719B） ----------
-// 主视图 _0x1E6B7A93 触摸处理 updateIOWithTouches 读它首字节，
-// 首字节=0 会跳过触摸处理（点左上角无反应）——必须全部强制=1
+static void ForgeGlobalGate(void) {
+    uintptr_t base = GetAceDylibBase();
+    if (!base) return;
+    // 静态基址 0x100000000，全局变量运行时地址 = base + 偏移
+    // 0x3d6ed8/ee0/ee4/ee8 是 __common 段偏移
+    uintptr_t addr_ed8 = base + 0x3d6ed8;
+    uintptr_t addr_ee0 = base + 0x3d6ee0;
+    uintptr_t addr_ee4 = base + 0x3d6ee4;
+    uintptr_t addr_ee8 = base + 0x3d6ee8;
+
+    uint64_t ed8 = *(volatile uint64_t *)addr_ed8;
+    // 第2关：x22 = ed8 ^ 0xb75e8052babd72a6
+    uint64_t x22 = ed8 ^ 0xb75e8052babd72a6ULL;
+    uint32_t x22_lo = (uint32_t)x22;
+    uint32_t x22_hi = (uint32_t)(x22 >> 32);
+
+    // ee0 = murmur(x22_lo ^ 0xd18ddb25 ^ x22_hi)
+    uint32_t ee0 = x22_lo ^ 0xd18ddb25U;
+    ee0 ^= x22_hi;
+    ee0 ^= ee0 >> 15;
+    ee0 *= MURMUR_C1;
+    ee0 ^= ee0 >> 11;
+    ee0 *= MURMUR_C2;
+    ee0 ^= ee0 >> 17;
+
+    // ee4 = murmur2(ee0, x22)
+    uint32_t w9 = ee0 ^ 0x1767cedcU;
+    w9 ^= w9 >> 15;
+    w9 *= MURMUR_C1;
+    w9 ^= w9 >> 11;
+    w9 *= MURMUR_C2;
+    uint32_t w12 = ((uint32_t)(x22 >> 17)) ^ w9;
+    w9 = w12 ^ w9;
+    uint32_t ee4 = w9;
+
+    // ee8 = murmur3(ee4, x22_hi)
+    uint32_t w10 = ee4 ^ 0x5d41c293U;
+    w10 ^= w10 >> 15;
+    w10 *= MURMUR_C1;
+    w10 ^= w10 >> 11;
+    w10 *= MURMUR_C2;
+    uint32_t w8 = x22_hi ^ (w10 >> 17);
+    w8 ^= w10;
+    uint32_t ee8 = w8;
+
+    // 写入（__common 段可读写）
+    *(volatile uint32_t *)addr_ee0 = ee0;
+    *(volatile uint32_t *)addr_ee4 = ee4;
+    *(volatile uint32_t *)addr_ee8 = ee8;
+}
+
+// ---------- 菜单显示开关（4 类 getter 首字节=1） ----------
 static NSMutableDictionary *orig_getters = nil;
 static id Hook_menuStateGetter(id self, SEL _cmd) {
     NSString *key = NSStringFromClass([self class]);
@@ -99,36 +158,7 @@ static void HookMenuGetters(void) {
     }
 }
 
-// ---------- 通道C：把真实面板加入窗口并显示（不裸创建） ----------
-static void ForceShowPanel(void) {
-    UIWindow *win = GetCurrentKeyWindow();
-    if (!win) return;
-    UIView *panel = g_panel;
-    Class panelCls = objc_getClass("_0xB1D7F3A9");
-    // 1) 先找窗口树里已有的面板
-    if (!panel && panelCls) {
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:win];
-        while (stack.count > 0) {
-            UIView *cur = stack.lastObject;
-            [stack removeLastObject];
-            if ([cur isKindOfClass:panelCls]) { panel = cur; break; }
-            [stack addObjectsFromArray:cur.subviews];
-        }
-    }
-    if (!panel) return;   // 面板未创建 → 什么都不做（不裸创建，防崩）
-    // 2) 若无 superview，加入 keyWindow
-    if (!panel.superview) {
-        panel.frame = win.bounds;
-        [win addSubview:panel];
-    }
-    // 3) 强制显示
-    panel.hidden = NO;
-    panel.alpha = 1;
-    panel.userInteractionEnabled = YES;
-    [panel.superview bringSubviewToFront:panel];
-}
-
-// ---------- 通道D：卡密弹窗抑制（v4 验证过稳定） ----------
+// ---------- 卡密弹窗抑制 ----------
 static IMP orig_cardInit = NULL;
 static UIView *Hook_cardInit(id self, SEL _cmd, CGRect frame) {
     UIView *v = ((UIView*(*)(id,SEL,CGRect))orig_cardInit)(self,_cmd,frame);
@@ -142,7 +172,7 @@ static UIView *Hook_cardInit(id self, SEL _cmd, CGRect frame) {
     return v;
 }
 
-// ---------- 通道E：弹窗兜底 ----------
+// ---------- 弹窗兜底 ----------
 static BOOL IsCardErrorMsg(NSString *msg) {
     if (!msg || ![msg isKindOfClass:[NSString class]]) return NO;
     NSArray *kws = @[@"不存在",@"失败",@"错误",@"无效",@"过期",@"已使用",
@@ -190,7 +220,10 @@ static void SwizzleOnAllClasses(NSArray<NSString*> *selectors, IMP imp, BOOL ins
 }
 
 __attribute__((constructor))
-static void BypassV8Init(void) {
+static void BypassV11Init(void) {
+    // ★ 核心：伪造全局闸门 murmur 校验（让 Metal 面板绘制通过）
+    ForgeGlobalGate();
+
     WriteActivationKeychain();
 
     // 状态伪造
@@ -215,21 +248,10 @@ static void BypassV8Init(void) {
     SwizzleOnAllClasses(@[@"passwordForService:account:error:"], (IMP)FakePassword, YES);
     SwizzleOnAllClasses(@[@"q17"], (IMP)NoopVoid, YES);
 
-    // 通道B：菜单显示开关（收窄到两个类）
+    // 菜单显示开关
     HookMenuGetters();
 
-    // 通道A：通过主视图 setter 捕获真实面板实例（面板不用 initWithFrame:）
-    Class mainViewCls = objc_getClass("_0x1E6B7A93");
-    if (mainViewCls) {
-        SEL setPanelSel = NSSelectorFromString(@"set_0xB1D7F3A9:");
-        Method m = class_getInstanceMethod(mainViewCls, setPanelSel);
-        if (m) {
-            orig_setPanel = method_getImplementation(m);
-            method_setImplementation(m, (IMP)Hook_setPanel);
-        }
-    }
-
-    // 通道D：卡密弹窗抑制
+    // 卡密弹窗抑制
     Class cardCls = objc_getClass("_0x37C8E2B6");
     if (cardCls) {
         Method m = class_getInstanceMethod(cardCls, @selector(initWithFrame:));
@@ -239,7 +261,7 @@ static void BypassV8Init(void) {
         }
     }
 
-    // 通道E：弹窗兜底
+    // 弹窗兜底
     Class ac = objc_getClass("UIAlertController");
     if (ac) {
         Method m1 = class_getClassMethod(ac, @selector(alertControllerWithTitle:message:preferredStyle:));
@@ -254,9 +276,9 @@ static void BypassV8Init(void) {
         }
     }
 
-    // 通道C：多轮延迟把真实面板加入窗口并显示（绝不裸创建）
-    for (int delay = 2; delay <= 14; delay += 2) {
+    // 延迟再次伪造（防止保护代码在 constructor 之后重置全局变量）
+    for (int delay = 1; delay <= 10; delay += 2) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{ ForceShowPanel(); });
+                       dispatch_get_main_queue(),^{ ForgeGlobalGate(); });
     }
 }
