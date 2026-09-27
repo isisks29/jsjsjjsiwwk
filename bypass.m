@@ -87,7 +87,8 @@ static void HookMenuGetters(void) {
     NSArray *classNames = @[@"_0xD4E9A3C7", @"_0xB1D7F3A9", @"_0x1E6B7A93", @"_0xC8E2A541"];
     SEL sel = NSSelectorFromString(@"_0xE4C8719B");
     for (NSString *cn in classNames) {
-        Class cls = objc_getClass(cn);
+        const char *cstr = [cn UTF8String];
+        Class cls = objc_getClass(cstr);
         if (!cls) continue;
         Method m = class_getInstanceMethod(cls, sel);
         if (m) {
