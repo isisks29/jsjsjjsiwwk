@@ -33,6 +33,7 @@
 #import <string.h>
 #import <dlfcn.h>
 #import <unistd.h>
+#import <libkern/OSCacheControl.h>
 
 #pragma mark - 常量（来自静态分析，勿改）
 
@@ -91,7 +92,7 @@ static int patch_insn(uintptr_t base, uint32_t off,
                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) return -3;
     memcpy((void *)addr, repl, 4);
-    __builtin___clear_cache((char *)addr, (char *)addr + 4);
+    sys_icache_invalidate((void *)addr, 4);
     vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
               VM_PROT_READ | VM_PROT_EXECUTE);
     return 0;
@@ -376,18 +377,4 @@ static void bypass_ctor(void) {
         if (base) {
             applyAndBuild();
         } else {
-            /* 靶场尚未加载：后台重试最多 30s */
-            __block uint32_t tries = 0;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                while (tries++ < 100) {
-                    if ((base = find_target_base())) break;
-                    usleep(300000);
-                }
-                if (base) {
-                    dispatch_async(dispatch_get_main_queue(), ^{ applyAndBuild(); });
-                }
-            });
-        }
-    });
-}
+            /* 靶场尚未加载：后台重试最多 
