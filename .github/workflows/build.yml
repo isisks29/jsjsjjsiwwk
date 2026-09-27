@@ -78,37 +78,3 @@ jobs:
           path: bypass.dylib
           if-no-files-found: error
 
-  # ---------- job 2: 直接对靶场 dylib 打补丁 ----------
-  # 手动触发时运行：把老师给的"原授权靶场 dylib"（仓库里或自动从课程仓库下载）
-  # 打成破解版 patched.dylib，再替换回 IPA 里重新签名。不打运行时补丁，不会闪退。
-  build-patched:
-    name: Patch target dylib -> patched.dylib
-    runs-on: macos-latest
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download original target dylib
-        run: |
-          if ls *.dylib >/dev/null 2>&1; then
-            echo "use repo dylib"
-          else
-            echo "downloading target..."
-            curl -sL -o target.dylib \
-              "https://github.com/isisks29/ground/raw/main/Zhuanz-%E7%AC%AC%E5%9B%9B%E8%AF%BE-%E6%8E%88%E6%9D%83%E9%9D%B6%E5%9C%BA.dylib"
-          fi
-
-      - name: Patch
-        run: |
-          TGT=$(ls -1 *.dylib | head -n1)
-          echo "patching: $TGT"
-          python3 patch_dylib.py "$TGT" -o patched.dylib
-
-      - name: Upload patched.dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: patched.dylib
-          path: patched.dylib
-          if-no-files-found: error
