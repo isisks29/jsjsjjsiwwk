@@ -1,3 +1,4 @@
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -410,9 +411,14 @@ static uintptr_t find_target_base(void) {
 
 #pragma mark - 主流程
 
+/* 隔离闪退源：设为 1 时只做 hook（弹窗抑制），暂不写门卫字/打补丁。
+ * 确认"仅 hook"稳定且弹窗被抑制后，再置 0 逐层开启。 */
+#define STAGE_HOOK_ONLY 1
+
 static void apply_bypass(uintptr_t base) {
     log_line([NSString stringWithFormat:@"BASE=0x%llx", (unsigned long long)base]);
 
+#if !STAGE_HOOK_ONLY
     /* 1) 写入门卫字（心跳链，T=1），写后读回校验 */
     uint64_t g0; uint32_t g1, g2, g3;
     compute_gate_words(&g0, &g1, &g2, &g3);
@@ -435,6 +441,7 @@ static void apply_bypass(uintptr_t base) {
         if (r == 0) ok++; else skip++;
     }
     log_line([NSString stringWithFormat:@"PATCH ok=%u skip=%u", ok, skip]);
+#endif
 
     /* 3) 挂钩：卡密判定入口 + 弹窗界面 + 全局弹窗抑制 */
     apply_hooks();
