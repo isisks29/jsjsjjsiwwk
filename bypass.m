@@ -411,6 +411,34 @@ static uintptr_t find_target_base(void) {
 
 #pragma mark - 主流程
 
+/* 功能引擎 offset（10 组层级校验）：面板显现不依赖，先不 NOP 以降低崩溃风险 */
+static int is_feature_engine(uint32_t off) {
+    if (off >= 0x253f0 && off <= 0x25880) return 1;
+    if (off >= 0x26d60 && off <= 0x27284) return 1;
+    if (off >= 0x2769c && off <= 0x27b8c) return 1;
+    if (off >= 0x2d5d0 && off <= 0x2db38) return 1;
+    if (off >= 0x3447c && off <= 0x3470c) return 1;
+    if (off >= 0x3b818 && off <= 0x3ba6c) return 1;
+    if (off >= 0x3e1dc && off <= 0x3e430) return 1;
+    if (off >= 0x7f628 && off <= 0x7f878) return 1;
+    if (off >= 0x81798 && off <= 0x819e8) return 1;
+    if (off == 0x10b8a8) return 1;
+    return 0;
+}
+
+/* 只打"面板链"补丁：构造 0x109020 + 心跳 + 定时器 + 图标（0x109020 内部构造链 bail 必须 NOP，
+ * 否则定时器/图标走通后进入构建函数仍会因内部校验失败退出 -> 面板不出） */
+static void apply_patch_panel(uintptr_t base) {
+    uint32_t ok = 0, skip = 0;
+    for (uint32_t i = 0; i < kPatchCount; i++) {
+        if (is_feature_engine(kPatches[i].off)) continue;
+        int r = patch_insn(base, kPatches[i].off, kPatches[i].expect, kPatches[i].repl);
+        if (r == 0) ok++; else skip++;
+    }
+    log_line([NSString stringWithFormat:@"PATCH-panel ok=%u skip=%u", ok, skip]);
+    paint_status();
+}
+
 /* 写门卫字（心跳/图标/定时器共用链，T=1），写后读回校验 */
 static void write_gate_words(uintptr_t base) {
     uint64_t g0; uint32_t g1, g2, g3;
@@ -435,12 +463,13 @@ static void apply_bypass(uintptr_t base) {
     /* 1) 立即挂钩：弹窗抑制（已确认不崩） */
     apply_hooks();
 
-    /* 2) 门卫字延迟到 app 就绪（6s）后写：启动早期写入会让靶场心跳立即走通
-     *    构建函数 0x109020，此时 app 主界面未就绪 -> 崩溃。延迟后构建时机安全。 */
+    /* 2) 门卫字 + 面板链补丁延迟到 app 就绪（6s）后：启动早期写会让靶场心跳立即走通
+     *    构建函数 0x109020，此时 app 未就绪 -> 崩溃。延迟后构建时机安全。 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         write_gate_words(base);
-        log_line(@"GATE written (delayed 6s)");
+        apply_patch_panel(base);
+        log_line(@"gate+patch applied (delayed 6s)");
         paint_status();
     });
 }
