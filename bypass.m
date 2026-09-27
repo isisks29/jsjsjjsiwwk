@@ -1,39 +1,14 @@
-/*
- * bypass.m  —— 第四课「ace 授权靶场」作业（小靶场 · Metal 界面版）
- *
- * 目标：ace-第四课-授权靶场.dylib（安装名 /Library/1.dylib，arm64）
- *   · 卡密校验   ：+[_0xA6C1F894 d1] 返回 nil -> 弹卡密输入窗
- *   · 弹窗容器   ：_0x37C8E2B6（-setupUI 构建输入界面，UIScreen/UIDevice/UIAlertController 路径）
- *   · 门卫字     ：__DATA +0x3d6ed8（gate0 8B / g1 / g2 / g3，四组同构链验证）
- *   · 验证点     ：构造 0x109020（独立链，T = gate0 ^ 0xB75E8052BABD72A6）
- *                 心跳 0x4ccc / 图标 0xfac54 / 定时器 0x109ec4（链：0xD18BDB15/0x1767CEDC/0x5D41C293）
- *                 功能引擎 0x253e8..0x81790、0x10b880（层级校验，常量各异）
- *   · 面板构建   ：0x109020 内完成（CAMetalLayer / MTKView 渲染路径，非 UIView）
- *
- * 攻破方案（运行时静态补丁 + 挂钩，全部基于靶场二进制内已确认的地址/常量）：
- *   1) 写入符合「心跳链」的门卫字（T=1）：gate0=0xB75E8052BABD72A7、g1/g2/g3 按链算出，
- *      使 0x4ccc / 0xfac54 / 0x109ec4 三处同构校验自然通过；
- *   2) NOP 掉全部「校验失败 -> bail」分支（构造独立链 14 处、心跳/图标/定时器结构体校验、
- *      功能引擎层级校验 150 处），任何内容都走"已激活"路径；
- *   3) 挂钩 +d1 恒返回 @"A"：心跳块不再弹卡密输入窗，并让靶场自身 seal 流程自然跑完；
- *   4) 挂钩 -setupUI 空转：即使弹窗被创建也不渲染内容（双保险）；
- *   5) 主线程延迟调用构建函数 0x109020（经锁存位 0x3d3c88 判重），Metal 功能面板完整显现。
- *
- * 编译（老师 yaml 蓝本）：xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2
- *      -framework Foundation -framework UIKit -fobjc-arc -o bypass.dylib bypass.m
- */
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
 #import <mach/mach_init.h>
+#import <libkern/OSCacheControl.h>
 #import <stdint.h>
 #import <string.h>
 #import <dlfcn.h>
 #import <unistd.h>
-#import <libkern/OSCacheControl.h>
 
 #pragma mark - 常量（来自静态分析，勿改）
 
@@ -51,9 +26,9 @@
 #define OFF_BUILD    0x109020u            /* 构建函数（Metal 面板） */
 
 /* 类名/方法名 */
-#define CLS_CRYPTO   "_0xA6C1F894"        /* 加密/卡密工具类 */
+#define CLS_KEYCHAIN "_0xD5A13E79"        /* 卡密/钥匙串工具类（弹窗判定的真实入口） */
+#define SEL_PASS     "passwordForService:account:"
 #define CLS_POPUP    "_0x37C8E2B6"        /* 弹窗容器类 */
-#define SEL_D1       "d1"                 /* 卡密查询（nil -> 弹窗） */
 #define SEL_SETUP    "setupUI"            /* 弹窗界面构建 */
 
 #pragma mark - 门卫字计算（心跳链的精确实现）
@@ -65,12 +40,16 @@ static void compute_gate_words(uint64_t *gate0, uint32_t *g1, uint32_t *g2, uint
     const uint32_t low  = (uint32_t)(T & 0xFFFFFFFFu);
     const uint32_t high = (uint32_t)(T >> 32);
     /* M(x) = x^>>15 ; *=0x1F3D6A71 ; x^>>11 ; *=0x8E4B1395 ; x^>>17 */
-    #define M(x) ({ uint32_t v = (x); v = fold32(v,15); v *= MUL_A; v = fold32(v,11); v *= MUL_B; v = fold32(v,17); v; })
+    uint32_t m1 = fold32((uint32_t)(low ^ high ^ K_CHAIN1), 15); m1 *= MUL_A;
+    m1 = fold32(m1, 11); m1 *= MUL_B; m1 = fold32(m1, 17);
+    uint32_t m2 = fold32((uint32_t)(m1 ^ K_CHAIN2), 15); m2 *= MUL_A;
+    m2 = fold32(m2, 11); m2 *= MUL_B; m2 = fold32(m2, 17);
+    uint32_t m3 = fold32((uint32_t)(m2 ^ K_CHAIN3), 15); m3 *= MUL_A;
+    m3 = fold32(m3, 11); m3 *= MUL_B; m3 = fold32(m3, 17);
     *gate0 = C1 ^ T;
-    *g1 = M(low ^ high ^ K_CHAIN1);
-    *g2 = low ^ M(*g1 ^ K_CHAIN2);
-    *g3 = high ^ M(*g2 ^ K_CHAIN3);
-    #undef M
+    *g1 = m1;
+    *g2 = low ^ m2;
+    *g3 = high ^ m3;
 }
 
 #pragma mark - 运行内存读写
@@ -268,33 +247,58 @@ static const patch_t kPatches[] = {
     {0x10b8a8, {0x48,0x07,0x00,0x34}, {0x1f,0x20,0x03,0xd5}}, /* NOP */
     /* 0x4f84: b.eq 0x4fd8 -> b 0x4fd8 (强制走已激活路径) */
     {0x4f84, {0xa0,0x02,0x00,0x54}, {0x04,0x00,0x00,0x14}},};
-
 #define kPatchCount (sizeof(kPatches) / sizeof(kPatches[0]))
 
 #pragma mark - 挂钩（弹窗抑制 + 激活流）
 
-/* +d1 原实现：设备指纹 -> 字典/钥匙串查询，nil 表示未激活 -> 弹窗。
- * 替换为恒返回 @"A"（非 nil），心跳块判定为已激活，不再弹卡密窗。 */
-static NSString *bypass_d1(id self, SEL _cmd) {
-    (void)self; (void)_cmd;
-    return (__bridge NSString *)CFSTR("A");
+/* 真实弹窗判定入口：+[_0xD5A13E79 passwordForService:account:]
+ * 原实现从钥匙串查卡密，返回 nil -> 心跳 dispatch 卡密输入窗(UIAlertController)。
+ * 替换为恒返回 @"A"：判定已激活，卡密弹窗不再出现。 */
+static id bypass_passwd(id self, SEL _cmd, NSString *service, NSString *account) {
+    (void)self; (void)_cmd; (void)service; (void)account;
+    return @"A";
 }
 
-/* -setupUI 原实现：构建弹窗输入界面；替换为空转，弹窗即使被创建也不渲染。 */
+/* -setupUI 空转：即便弹窗容器被创建也不渲染内容（兜底）。 */
 static void bypass_setupUI(id self, SEL _cmd) {
     (void)self; (void)_cmd;
 }
 
+/* UIViewController presentViewController 抑制：凡试图 present UIAlertController 一律忽略，
+ * 其余正常跳转放行原实现。 */
+static IMP g_orig_present = NULL;
+static void bypass_present(id self, SEL _cmd, UIViewController *vc, BOOL animated, void (^completion)(void)) {
+    if ([vc isKindOfClass:[UIAlertController class]]) {   /* 弹窗不显示 */
+        if (completion) completion();
+        return;
+    }
+    if (g_orig_present) {
+        ((void (*)(id, SEL, id, BOOL, void (^)(void)))g_orig_present)(self, _cmd, vc, animated, completion);
+    }
+}
+
 static void apply_hooks(void) {
-    Class cls = objc_getClass(CLS_CRYPTO);
-    if (cls) {
-        Method m = class_getClassMethod(cls, NSSelectorFromString(@SEL_D1));
-        if (m) method_setImplementation(m, (IMP)bypass_d1);
+    Class kc = objc_getClass(CLS_KEYCHAIN);
+    if (kc) {
+        Method m = class_getClassMethod(kc, NSSelectorFromString(@SEL_PASS));
+        if (!m) m = class_getInstanceMethod(kc, NSSelectorFromString(@SEL_PASS));
+        if (m) method_setImplementation(m, (IMP)bypass_passwd);
+        else NSLog(@"[bypass] passwordForService hook: method not found");
+    } else {
+        NSLog(@"[bypass] class %s not found", CLS_KEYCHAIN);
     }
     Class pop = objc_getClass(CLS_POPUP);
     if (pop) {
         Method m = class_getInstanceMethod(pop, NSSelectorFromString(@SEL_SETUP));
         if (m) method_setImplementation(m, (IMP)bypass_setupUI);
+    }
+    /* 全局弹窗抑制（仅 UIAlertController） */
+    Class vc = [UIViewController class];
+    SEL psel = @selector(presentViewController:animated:completion:);
+    Method pm = class_getInstanceMethod(vc, psel);
+    if (pm) {
+        g_orig_present = method_getImplementation(pm);
+        method_setImplementation(pm, (IMP)bypass_present);
     }
 }
 
@@ -303,11 +307,10 @@ static void apply_hooks(void) {
 static uintptr_t find_target_base(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
-        const char *name = _dyld_get_image_name(i);
         const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!h || h->magic != MH_MAGIC_64) continue;
         uintptr_t base = (uintptr_t)h;
-        /* 特征：0x109020 为 build 序言(sub sp,sp,#336)，0x4ccc 为心跳序言(adrp x1,0) */
+        /* 特征：0x109020 build 序言(sub sp,sp,#336)，0x4ccc 心跳序言(adrp x1,0) */
         uint8_t a[4], b[4];
         if (safe_read(base + 0x109020, a, 4) != KERN_SUCCESS) continue;
         if (safe_read(base + 0x4ccc, b, 4) != KERN_SUCCESS) continue;
@@ -315,7 +318,6 @@ static uintptr_t find_target_base(void) {
             b[0]==0x41 && b[1]==0x80 && b[2]==0x00 && b[3]==0xd0) {
             return base;
         }
-        (void)name;
     }
     return 0;
 }
@@ -338,7 +340,7 @@ static void apply_bypass(uintptr_t base) {
         if (r == 0) ok++; else skip++;
     }
 
-    /* 3) 挂钩卡密查询 + 弹窗界面 */
+    /* 3) 挂钩：卡密判定入口 + 弹窗界面 + 全局弹窗抑制 */
     apply_hooks();
 
     NSLog(@"[bypass] base=%p patches ok=%u skip=%u gate0=%llx", (void *)base, ok, skip, (unsigned long long)g0);
@@ -377,8 +379,18 @@ static void bypass_ctor(void) {
         if (base) {
             applyAndBuild();
         } else {
-            // 靶场尚未加载：后台重试最多 
+            /* 靶场尚未加载：后台轮询最多 30s 定位 */
+            __block uint32_t tries = 0;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                while (tries++ < 100) {
+                    if ((base = find_target_base())) break;
+                    usleep(300000);
+                }
+                if (base) {
+                    dispatch_async(dispatch_get_main_queue(), ^{ applyAndBuild(); });
+                }
+            });
         }
-
     });
 }
