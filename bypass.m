@@ -1,5 +1,3 @@
-
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -394,8 +392,6 @@ static uintptr_t find_target_base(void) {
         const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!h || h->magic != MH_MAGIC_64) continue;
         uintptr_t base = (uintptr_t)h;
-        /* 优先：安装名匹配（LC_ID_DYLIB=/Library/1.dylib） */
-        int nameHit = (name && strstr(name, "/1.dylib"));
         /* 字节特征（已核实：0x109020=sub sp,sp,#336；0x4ccc=stp x24,x23,[sp,#-64]!） */
         uint8_t a[4], c[4];
         int fea = 0;
@@ -404,8 +400,8 @@ static uintptr_t find_target_base(void) {
             fea = (a[0]==0xff && a[1]==0x43 && a[2]==0x05 && a[3]==0xd1 &&
                    c[0]==0xf8 && c[1]==0x5f && c[2]==0xbc && c[3]==0xa9);
         }
-        if (nameHit || fea) {
-            log_line([NSString stringWithFormat:@"MATCH fea=%d img=%s", fea, name ? name : ""]);
+        if (fea) {   /* 只认字节特征，杜绝误匹配写坏内存 */
+            log_line([NSString stringWithFormat:@"MATCH fea=1 img=%s", name ? name : ""]);
             return base;
         }
     }
@@ -417,14 +413,20 @@ static uintptr_t find_target_base(void) {
 static void apply_bypass(uintptr_t base) {
     log_line([NSString stringWithFormat:@"BASE=0x%llx", (unsigned long long)base]);
 
-    /* 1) 写入门卫字（心跳链，T=1） */
+    /* 1) 写入门卫字（心跳链，T=1），写后读回校验 */
     uint64_t g0; uint32_t g1, g2, g3;
     compute_gate_words(&g0, &g1, &g2, &g3);
     uint8_t words[20];
     memcpy(words, &g0, 8); memcpy(words + 8, &g1, 4);
     memcpy(words + 12, &g2, 4); memcpy(words + 16, &g3, 4);
     memcpy((void *)(base + OFF_GATE0), words, sizeof(words));
-    log_line([NSString stringWithFormat:@"GATE=0x%llx", (unsigned long long)g0]);
+    uint8_t chk[8];
+    if (safe_read(base + OFF_GATE0, chk, 8) == KERN_SUCCESS) {
+        uint64_t rv; memcpy(&rv, chk, 8);
+        log_line(rv == g0 ? @"GATE=OK" : [NSString stringWithFormat:@"GATE=MISMATCH r=0x%llx", (unsigned long long)rv]);
+    } else {
+        log_line(@"GATE=readback FAIL");
+    }
 
     /* 2) 全部验证逃逸点补丁（逐条校验原字节） */
     uint32_t ok = 0, skip = 0;
@@ -436,23 +438,6 @@ static void apply_bypass(uintptr_t base) {
 
     /* 3) 挂钩：卡密判定入口 + 弹窗界面 + 全局弹窗抑制 */
     apply_hooks();
-}
-
-static void try_build_once(uintptr_t base) {
-    if (!base) return;
-    uint8_t latch = 0;
-    if (safe_read(base + OFF_LATCH, &latch, 1) != KERN_SUCCESS) {
-        log_line(@"BUILD latch read FAIL");
-        return;
-    }
-    if (latch & 1) {
-        log_line(@"BUILD already(bit0=1)");
-        return;
-    }
-    void (*build)(void) = (void (*)(void))(base + OFF_BUILD);
-    build();                                    /* 主线程执行：构建 Metal 面板 */
-    log_line(@"BUILD called 0x109020");
-    paint_status();
 }
 
 __attribute__((constructor))
@@ -467,15 +452,9 @@ static void bypass_ctor(void) {
         void (^applyAndBuild)(void) = ^{
             if (!base) return;
             if (!applied) { apply_bypass(base); applied = YES; }
-            /* 等 UI 就绪后构建面板（锁存位判重，幂等；最多重试 20 次 × 1s） */
-            __block uint32_t n = 0;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                while (n++ < 20) {
-                    try_build_once(base);
-                    if (n < 20) usleep(1000000);
-                }
-            });
+            /* 面板：不在此主动构建（启动早期调用 0x109020 极易崩）。
+             * 门卫字已打通靶场心跳/图标/定时器链：激活后点左上角图标（或定时器自动）即出 Metal 面板。 */
+            paint_status();
         };
 
         if (base) {
