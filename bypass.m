@@ -1,6 +1,7 @@
 
 
 
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -415,6 +416,7 @@ static uintptr_t find_target_base(void) {
 
 static uintptr_t g_base = 0;
 static void write_gate_words(uintptr_t base);   /* 前向声明 */
+static void apply_patch_build(uintptr_t base);  /* 前向声明 */
 
 @interface _BallTap : NSObject
 @end
@@ -473,6 +475,9 @@ static void add_floating_ball(void) {
             }
             [b addTarget:[_BallTap shared] action:@selector(hit) forControlEvents:UIControlEventTouchUpInside];
             b.hidden = NO;
+            /* 悬浮球就绪 = app 已稳定，此刻 0x109020 不被并发调用：安全清掉面板构建函数
+             * 内部的 14 条 bail。点击悬浮球时才写门卫字触发构建——时序彻底分离，不崩。 */
+            if (g_base) apply_patch_build(g_base);
             log_line(@"BALL shown on top window");
             paint_status();
         } @catch (NSException *e) {
@@ -505,6 +510,28 @@ static void write_gate_words(uintptr_t base) {
         log_line(@"GATE=readback FAIL");
     }
     paint_status();
+}
+
+/* 只清 0x109020 面板构建函数内部的构造链 bail（0x109068-0x109574，共 14 条）。
+ * 只在悬浮球就绪（app 已稳定、0x109020 未被并发执行）时调用——时序安全，不崩。 */
+static int is_build_chain(uint32_t off) {
+    return (off >= 0x109068 && off <= 0x109574);
+}
+
+static void apply_patch_build(uintptr_t base) {
+    @try {
+        uint32_t ok = 0, skip = 0;
+        for (uint32_t i = 0; i < kPatchCount; i++) {
+            if (!is_build_chain(kPatches[i].off)) continue;
+            int r = patch_insn(base, kPatches[i].off, kPatches[i].expect, kPatches[i].repl);
+            if (r == 0) ok++; else skip++;
+        }
+        log_line([NSString stringWithFormat:@"PATCH-build ok=%u skip=%u", ok, skip]);
+        paint_status();
+    } @catch (NSException *e) {
+        log_line(@"PATCH-build exception");
+        paint_status();
+    }
 }
 
 static void apply_bypass(uintptr_t base) {
