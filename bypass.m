@@ -2,6 +2,7 @@
 
 
 
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -330,28 +331,12 @@ static void start_status_loop(void) {
 
 /* 真实弹窗判定入口：+[_0xD5A13E79 passwordForService:account:]
  * 原实现从钥匙串查卡密，返回 nil -> 心跳 dispatch 卡密输入窗(UIAlertController)。
- * 替换为恒返回 @"A"：判定已激活，卡密弹窗不再出现。 */
+ * 替换为恒返回 @"A"：判定已激活，卡密弹窗不再出现。
+ * 【注意】只 hook 这一个。setupUI / presentViewController 不 hook——它们很可能
+ * 同时参与 Metal 面板的呈现，hook 掉会把面板一起抑制（用户实测：弹窗没了面板也没了）。 */
 static id bypass_passwd(id self, SEL _cmd, NSString *service, NSString *account) {
     (void)self; (void)_cmd; (void)service; (void)account;
     return @"A";
-}
-
-/* -setupUI 空转：即便弹窗容器被创建也不渲染内容（兜底）。 */
-static void bypass_setupUI(id self, SEL _cmd) {
-    (void)self; (void)_cmd;
-}
-
-/* UIViewController presentViewController 抑制：凡试图 present UIAlertController 一律忽略，
- * 其余正常跳转放行原实现。 */
-static IMP g_orig_present = NULL;
-static void bypass_present(id self, SEL _cmd, UIViewController *vc, BOOL animated, void (^completion)(void)) {
-    if ([vc isKindOfClass:[UIAlertController class]]) {   /* 弹窗不显示 */
-        if (completion) completion();
-        return;
-    }
-    if (g_orig_present) {
-        ((void (*)(id, SEL, id, BOOL, void (^)(void)))g_orig_present)(self, _cmd, vc, animated, completion);
-    }
 }
 
 static void apply_hooks(void) {
@@ -367,22 +352,6 @@ static void apply_hooks(void) {
         }
     } else {
         log_line(@"CLASS keychain MISS");
-    }
-    Class pop = objc_getClass(CLS_POPUP);
-    if (pop) {
-        Method m = class_getInstanceMethod(pop, NSSelectorFromString(@SEL_SETUP));
-        if (m) {
-            method_setImplementation(m, (IMP)bypass_setupUI);
-            log_line(@"HOOK setupUI=OK");
-        }
-    }
-    Class vc = [UIViewController class];
-    SEL psel = @selector(presentViewController:animated:completion:);
-    Method pm = class_getInstanceMethod(vc, psel);
-    if (pm) {
-        g_orig_present = method_getImplementation(pm);
-        method_setImplementation(pm, (IMP)bypass_present);
-        log_line(@"HOOK present=OK");
     }
     paint_status();
 }
@@ -416,7 +385,6 @@ static uintptr_t find_target_base(void) {
 
 static uintptr_t g_base = 0;
 static void write_gate_words(uintptr_t base);   /* 前向声明 */
-static void apply_patch_build(uintptr_t base);  /* 前向声明 */
 
 @interface _BallTap : NSObject
 @end
@@ -475,9 +443,6 @@ static void add_floating_ball(void) {
             }
             [b addTarget:[_BallTap shared] action:@selector(hit) forControlEvents:UIControlEventTouchUpInside];
             b.hidden = NO;
-            /* 悬浮球就绪 = app 已稳定，此刻 0x109020 不被并发调用：安全清掉面板构建函数
-             * 内部的 14 条 bail。点击悬浮球时才写门卫字触发构建——时序彻底分离，不崩。 */
-            if (g_base) apply_patch_build(g_base);
             log_line(@"BALL shown on top window");
             paint_status();
         } @catch (NSException *e) {
@@ -510,28 +475,6 @@ static void write_gate_words(uintptr_t base) {
         log_line(@"GATE=readback FAIL");
     }
     paint_status();
-}
-
-/* 只清 0x109020 面板构建函数内部的构造链 bail（0x109068-0x109574，共 14 条）。
- * 只在悬浮球就绪（app 已稳定、0x109020 未被并发执行）时调用——时序安全，不崩。 */
-static int is_build_chain(uint32_t off) {
-    return (off >= 0x109068 && off <= 0x109574);
-}
-
-static void apply_patch_build(uintptr_t base) {
-    @try {
-        uint32_t ok = 0, skip = 0;
-        for (uint32_t i = 0; i < kPatchCount; i++) {
-            if (!is_build_chain(kPatches[i].off)) continue;
-            int r = patch_insn(base, kPatches[i].off, kPatches[i].expect, kPatches[i].repl);
-            if (r == 0) ok++; else skip++;
-        }
-        log_line([NSString stringWithFormat:@"PATCH-build ok=%u skip=%u", ok, skip]);
-        paint_status();
-    } @catch (NSException *e) {
-        log_line(@"PATCH-build exception");
-        paint_status();
-    }
 }
 
 static void apply_bypass(uintptr_t base) {
