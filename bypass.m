@@ -1,4 +1,5 @@
 
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -409,28 +410,52 @@ static uintptr_t find_target_base(void) {
     return 0;
 }
 
-#pragma mark - 主流程
+#pragma mark - 悬浮球（借用原靶场面板）
 
-/* 只打 0x109020 构建函数内部的构造链 bail（0x109068-0x109574，共 14 条）。
- * 关键：不碰 tick(0x4ccc)/定时器(0x109ec4)/图标(0xfac54) 的补丁——那些代码页正被靶场
- * 定时器每 ~12ms 并发执行，写入正在执行的代码页 + 并发执行 = 立即崩溃（6s 闪退根因）。
- * 0x109020 此刻（门卫字未写时）不会被定时器走通调用，故打它的补丁安全。 */
-static int is_build_chain(uint32_t off) {
-    return (off >= 0x109068 && off <= 0x109574);
+static uintptr_t g_base = 0;
+static void write_gate_words(uintptr_t base);   /* 前向声明 */
+
+@interface _BallTap : NSObject
+@end
+@implementation _BallTap
++ (instancetype)shared {
+    static _BallTap *s = nil;
+    static dispatch_once_t o;
+    dispatch_once(&o, ^{ s = [[_BallTap alloc] init]; });
+    return s;
 }
-
-static void apply_patch_build(uintptr_t base) {
-    uint32_t ok = 0, skip = 0;
-    for (uint32_t i = 0; i < kPatchCount; i++) {
-        if (!is_build_chain(kPatches[i].off)) continue;
-        int r = patch_insn(base, kPatches[i].off, kPatches[i].expect, kPatches[i].repl);
-        if (r == 0) ok++; else skip++;
+- (void)hit {
+    if (g_base) {
+        write_gate_words(g_base);          /* 点击后才写门卫字，app 已稳定，构建安全 */
+        log_line(@"BALL tap: gate written");
+        paint_status();
     }
-    log_line([NSString stringWithFormat:@"PATCH-build ok=%u skip=%u", ok, skip]);
-    paint_status();
+}
+@end
+
+static void add_floating_ball(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *w = [UIApplication sharedApplication].keyWindow;
+        if (!w) w = [UIApplication sharedApplication].windows.firstObject;
+        if (!w) return;
+        UIButton *b = (UIButton *)[w viewWithTag:0x5B17];
+        if (!b) {
+            b = [UIButton buttonWithType:UIButtonTypeSystem];
+            b.tag = 0x5B17;
+            b.frame = CGRectMake(w.bounds.size.width - 76, w.bounds.size.height - 170, 64, 64);
+            b.layer.cornerRadius = 32;
+            b.backgroundColor = [UIColor colorWithRed:0.2 green:0.5 blue:1.0 alpha:0.85];
+            [b setTitle:@"⚙" forState:UIControlStateNormal];
+            [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            b.titleLabel.font = [UIFont boldSystemFontOfSize:28];
+            [w addSubview:b];
+        }
+        [b addTarget:[_BallTap shared] action:@selector(hit) forControlEvents:UIControlEventTouchUpInside];
+    });
 }
 
-/* 写门卫字（心跳/图标/定时器共用链，T=1），写后读回校验 */
+#pragma mark - 写门卫字（心跳/图标/定时器共用链，T=1），写后读回校验
+
 static void write_gate_words(uintptr_t base) {
     uint64_t g0; uint32_t g1, g2, g3;
     compute_gate_words(&g0, &g1, &g2, &g3);
@@ -450,20 +475,11 @@ static void write_gate_words(uintptr_t base) {
 
 static void apply_bypass(uintptr_t base) {
     log_line([NSString stringWithFormat:@"BASE=0x%llx", (unsigned long long)base]);
-
+    g_base = base;
     /* 1) 立即挂钩：弹窗抑制（已确认不崩） */
     apply_hooks();
-
-    /* 2) 延迟到 app 就绪（6s）后：先打 0x109020 构造链补丁（此刻未被并发执行，安全），
-     *    再写门卫字（写 __DATA，不碰代码页）——门卫字一写，靶场定时器走通共享链、
-     *    调用 0x109020，此时内部构造链 bail 已 NOP，且 app 已就绪，构建安全。 */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        apply_patch_build(base);
-        write_gate_words(base);
-        log_line(@"build-patch + gate applied (delayed 6s)");
-        paint_status();
-    });
+    /* 2) 悬浮球：点击才写门卫字 -> 靶场定时器/图标走通构建面板。零代码页补丁，不崩。 */
+    add_floating_ball();
 }
 
 __attribute__((constructor))
