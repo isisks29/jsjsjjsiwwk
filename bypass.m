@@ -3,6 +3,7 @@
 
 
 
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -330,13 +331,26 @@ static void start_status_loop(void) {
 #pragma mark - 挂钩（弹窗抑制 + 激活流）
 
 /* 真实弹窗判定入口：+[_0xD5A13E79 passwordForService:account:]
- * 原实现从钥匙串查卡密，返回 nil -> 心跳 dispatch 卡密输入窗(UIAlertController)。
- * 替换为恒返回 @"A"：判定已激活，卡密弹窗不再出现。
- * 【注意】只 hook 这一个。setupUI / presentViewController 不 hook——它们很可能
- * 同时参与 Metal 面板的呈现，hook 掉会把面板一起抑制（用户实测：弹窗没了面板也没了）。 */
+ * 替换为恒返回 @"A"。弹窗抑制需三件套：pw(判定入口) + setupUI(容器不渲染) + present(拦 UIAlertController)。
+ * 【重要】panel 显现与这三者无关(实测 pw-only 面板也不出)，面板靠主动调 0x109020 构建。 */
 static id bypass_passwd(id self, SEL _cmd, NSString *service, NSString *account) {
     (void)self; (void)_cmd; (void)service; (void)account;
     return @"A";
+}
+
+static void bypass_setupUI(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+}
+
+static IMP g_orig_present = NULL;
+static void bypass_present(id self, SEL _cmd, UIViewController *vc, BOOL animated, void (^completion)(void)) {
+    if ([vc isKindOfClass:[UIAlertController class]]) {
+        if (completion) completion();
+        return;
+    }
+    if (g_orig_present) {
+        ((void (*)(id, SEL, id, BOOL, void (^)(void)))g_orig_present)(self, _cmd, vc, animated, completion);
+    }
 }
 
 static void apply_hooks(void) {
@@ -352,6 +366,22 @@ static void apply_hooks(void) {
         }
     } else {
         log_line(@"CLASS keychain MISS");
+    }
+    Class pop = objc_getClass(CLS_POPUP);
+    if (pop) {
+        Method m = class_getInstanceMethod(pop, NSSelectorFromString(@SEL_SETUP));
+        if (m) {
+            method_setImplementation(m, (IMP)bypass_setupUI);
+            log_line(@"HOOK setupUI=OK");
+        }
+    }
+    Class vc = [UIViewController class];
+    SEL psel = @selector(presentViewController:animated:completion:);
+    Method pm = class_getInstanceMethod(vc, psel);
+    if (pm) {
+        g_orig_present = method_getImplementation(pm);
+        method_setImplementation(pm, (IMP)bypass_present);
+        log_line(@"HOOK present=OK");
     }
     paint_status();
 }
@@ -396,11 +426,22 @@ static void write_gate_words(uintptr_t base);   /* 前向声明 */
     return s;
 }
 - (void)hit {
-    if (g_base) {
-        write_gate_words(g_base);          /* 点击后才写门卫字，app 已稳定，构建安全 */
-        log_line(@"BALL tap: gate written");
-        paint_status();
+    if (!g_base) return;
+    /* 1) 写门卫字（共享链） */
+    write_gate_words(g_base);
+    log_line(@"BALL tap: gate written");
+    paint_status();
+    /* 2) 主动调用 0x109020 面板构建函数（门卫字已就绪、app 已稳定）。
+     *    若内部构造链 bail 通过则 Metal 面板直接构建上屏。 */
+    @try {
+        log_line(@"BALL: calling build @0x109020");
+        void (*build)(void) = (void (*)(void))(g_base + OFF_BUILD);
+        build();
+        log_line(@"BALL: build returned (no crash)");
+    } @catch (NSException *e) {
+        log_line(@"BALL: build EXCEPTION");
     }
+    paint_status();
 }
 @end
 
