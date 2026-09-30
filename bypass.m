@@ -434,24 +434,40 @@ static void write_gate_words(uintptr_t base);   /* 前向声明 */
 @end
 
 static void add_floating_ball(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *w = [UIApplication sharedApplication].keyWindow;
-        if (!w) w = [UIApplication sharedApplication].windows.firstObject;
-        if (!w) return;
-        UIButton *b = (UIButton *)[w viewWithTag:0x5B17];
+    __block uint32_t tries = 0;
+    void (^tryAdd)(void) = ^{
+        /* 取最顶层可见 window（游戏通常是最顶那个） */
+        UIWindow *target = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (!w.hidden) target = w;          /* 最后一个可见 = 最顶 */
+        }
+        if (!target) target = [UIApplication sharedApplication].keyWindow;
+        if (!target || !target.rootViewController || !target.rootViewController.view) {
+            if (tries++ < 60) {                 /* 轮询最多 30s 等游戏 window 就绪 */
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ tryAdd(); });
+            }
+            return;
+        }
+        UIView *host = target.rootViewController.view;
+        UIButton *b = (UIButton *)[host viewWithTag:0x5B17];
         if (!b) {
             b = [UIButton buttonWithType:UIButtonTypeSystem];
             b.tag = 0x5B17;
-            b.frame = CGRectMake(w.bounds.size.width - 76, w.bounds.size.height - 170, 64, 64);
+            b.frame = CGRectMake(host.bounds.size.width - 76, host.bounds.size.height - 170, 64, 64);
             b.layer.cornerRadius = 32;
             b.backgroundColor = [UIColor colorWithRed:0.2 green:0.5 blue:1.0 alpha:0.85];
             [b setTitle:@"⚙" forState:UIControlStateNormal];
             [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
             b.titleLabel.font = [UIFont boldSystemFontOfSize:28];
-            [w addSubview:b];
+            [host addSubview:b];                 /* 加到游戏根视图最上层，不被覆盖 */
         }
         [b addTarget:[_BallTap shared] action:@selector(hit) forControlEvents:UIControlEventTouchUpInside];
-    });
+        b.hidden = NO;
+        log_line(@"BALL shown on top window");
+        paint_status();
+    };
+    dispatch_async(dispatch_get_main_queue(), ^{ tryAdd(); });
 }
 
 #pragma mark - 写门卫字（心跳/图标/定时器共用链，T=1），写后读回校验
