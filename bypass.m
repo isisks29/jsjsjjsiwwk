@@ -411,31 +411,22 @@ static uintptr_t find_target_base(void) {
 
 #pragma mark - 主流程
 
-/* 功能引擎 offset（10 组层级校验）：面板显现不依赖，先不 NOP 以降低崩溃风险 */
-static int is_feature_engine(uint32_t off) {
-    if (off >= 0x253f0 && off <= 0x25880) return 1;
-    if (off >= 0x26d60 && off <= 0x27284) return 1;
-    if (off >= 0x2769c && off <= 0x27b8c) return 1;
-    if (off >= 0x2d5d0 && off <= 0x2db38) return 1;
-    if (off >= 0x3447c && off <= 0x3470c) return 1;
-    if (off >= 0x3b818 && off <= 0x3ba6c) return 1;
-    if (off >= 0x3e1dc && off <= 0x3e430) return 1;
-    if (off >= 0x7f628 && off <= 0x7f878) return 1;
-    if (off >= 0x81798 && off <= 0x819e8) return 1;
-    if (off == 0x10b8a8) return 1;
-    return 0;
+/* 只打 0x109020 构建函数内部的构造链 bail（0x109068-0x109574，共 14 条）。
+ * 关键：不碰 tick(0x4ccc)/定时器(0x109ec4)/图标(0xfac54) 的补丁——那些代码页正被靶场
+ * 定时器每 ~12ms 并发执行，写入正在执行的代码页 + 并发执行 = 立即崩溃（6s 闪退根因）。
+ * 0x109020 此刻（门卫字未写时）不会被定时器走通调用，故打它的补丁安全。 */
+static int is_build_chain(uint32_t off) {
+    return (off >= 0x109068 && off <= 0x109574);
 }
 
-/* 只打"面板链"补丁：构造 0x109020 + 心跳 + 定时器 + 图标（0x109020 内部构造链 bail 必须 NOP，
- * 否则定时器/图标走通后进入构建函数仍会因内部校验失败退出 -> 面板不出） */
-static void apply_patch_panel(uintptr_t base) {
+static void apply_patch_build(uintptr_t base) {
     uint32_t ok = 0, skip = 0;
     for (uint32_t i = 0; i < kPatchCount; i++) {
-        if (is_feature_engine(kPatches[i].off)) continue;
+        if (!is_build_chain(kPatches[i].off)) continue;
         int r = patch_insn(base, kPatches[i].off, kPatches[i].expect, kPatches[i].repl);
         if (r == 0) ok++; else skip++;
     }
-    log_line([NSString stringWithFormat:@"PATCH-panel ok=%u skip=%u", ok, skip]);
+    log_line([NSString stringWithFormat:@"PATCH-build ok=%u skip=%u", ok, skip]);
     paint_status();
 }
 
@@ -463,13 +454,14 @@ static void apply_bypass(uintptr_t base) {
     /* 1) 立即挂钩：弹窗抑制（已确认不崩） */
     apply_hooks();
 
-    /* 2) 门卫字 + 面板链补丁延迟到 app 就绪（6s）后：启动早期写会让靶场心跳立即走通
-     *    构建函数 0x109020，此时 app 未就绪 -> 崩溃。延迟后构建时机安全。 */
+    /* 2) 延迟到 app 就绪（6s）后：先打 0x109020 构造链补丁（此刻未被并发执行，安全），
+     *    再写门卫字（写 __DATA，不碰代码页）——门卫字一写，靶场定时器走通共享链、
+     *    调用 0x109020，此时内部构造链 bail 已 NOP，且 app 已就绪，构建安全。 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        apply_patch_build(base);
         write_gate_words(base);
-        apply_patch_panel(base);
-        log_line(@"gate+patch applied (delayed 6s)");
+        log_line(@"build-patch + gate applied (delayed 6s)");
         paint_status();
     });
 }
