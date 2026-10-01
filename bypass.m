@@ -161,6 +161,15 @@ static void callBuild(void) {
     if (fn) fn();
 }
 
+// ===== 真·建UI入口：0x11fa74（自含，调 0x11ffb0 → 0x120000 建图标+MTKView）=====
+// 0x11fa74: stp x29,x30,[sp,#0x90] ... x21=sp(哨兵非零) → 0x11ff34 bl 0x11ffb0
+#define kUIEntryFile 0x11fa74
+static void callUI(void) {
+    if (!g_targetBase) return;
+    buildFn fn = (buildFn)va(kUIEntryFile);
+    if (fn) fn();
+}
+
 // ================= 5) 悬浮球 + 动态探针 =================
 static UIButton *ball = nil;
 typedef void *(*msgGetter)(id, SEL);
@@ -217,7 +226,8 @@ typedef void *(*msgGetter)(id, SEL);
 - (void)tap {
     @try {
         armFull();
-        callBuild();
+        callBuild();      // 旧build（不崩但无UI，保留）
+        callUI();         // 真·建UI入口 0x11fa74 → 0x120000 建图标+MTKView
         [self probe];
     } @catch (NSException *e) { NSLog(@"[BALL] exc: %@", e); }
 }
