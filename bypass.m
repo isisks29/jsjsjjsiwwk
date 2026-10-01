@@ -8,6 +8,7 @@
 
 
 
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -275,8 +276,35 @@ static void setup_object(uintptr_t base) {
     st([NSString stringWithFormat:@"OBJ: 0x3d6ed0 <- 0x%llx", (unsigned long long)obj]);
 }
 
-#pragma mark - 三件套 hook（弹窗抑制）
+#pragma mark - 三件套 hook（弹窗抑制，全部用 C 函数 IMP，避免 block 的 ARC retain 崩溃）
+// 崩溃根因（crash log）：imp_implementationWithBlock 的 block 被当 IMP 时，
+// ARC 会对参数做 objc_retain，而目标是 present 一个垃圾 vc(0x1) → objc_retain_x19 崩。
+// C 函数 IMP 不会产生这类 retain；并对无效 vc 直接跳过，全程不崩。
+
+// 1) 钥匙串判定入口：+[_0xD5A13E79 passwordForService:account:] 恒返回 @"A"
+static id hook_passwordForService(id __unsafe_unretained self, SEL _cmd,
+                                  id __unsafe_unretained svc, id __unsafe_unretained acct) {
+    return @"A";
+}
+
+// 2) setupUI 空转
+static void hook_setupUI(id __unsafe_unretained self, SEL _cmd) { }
+
+// 3) presentViewController 拦截（UIAlertController 吞掉，其余转发；无效 vc 跳过）
 static void (*g_orig_present)(id, SEL, id, BOOL, id);
+static void hook_present(id __unsafe_unretained self, SEL _cmd,
+                         id __unsafe_unretained vc, BOOL animated,
+                         id __unsafe_unretained completion) {
+    // 垃圾/空指针 vc：直接忽略，避免对无效指针发消息或转发导致崩
+    if ((uintptr_t)vc < 0x1000) { return; }
+    @try {
+        if ([(NSObject *)vc isKindOfClass:[UIAlertController class]]) {
+            if (completion) { void (^cb)(void) = completion; cb(); }
+            return;
+        }
+    } @catch (NSException *e) { NSLog(@"[ACE] present catch: %@", e); }
+    if (g_orig_present) g_orig_present(self, _cmd, vc, animated, completion);
+}
 
 static void install_popup_hooks(void) {
     Class keychain = NSClassFromString(@"_0xD5A13E79");
@@ -289,15 +317,14 @@ static void install_popup_hooks(void) {
     }
     if (keychain) {
         Method m = class_getClassMethod(keychain, sel_registerName("passwordForService:account:"));
-        if (m) method_setImplementation(m, imp_implementationWithBlock(
-            ^id(id s, SEL c, id svc, id acct) { return @"A"; }));
+        if (m) method_setImplementation(m, (IMP)hook_passwordForService);
         st(@"HOOK: passwordForService -> @\"A\" OK");
     } else st(@"HOOK: 未找到钥匙串类");
 
     unsigned n = 0; Class *cs = objc_copyClassList(&n);
     for (unsigned i = 0; i < n; i++) {
         Method m = class_getInstanceMethod(cs[i], sel_registerName("setupUI"));
-        if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s) { }));
+        if (m) method_setImplementation(m, (IMP)hook_setupUI);
     }
     free(cs);
     st(@"HOOK: setupUI 空转 OK");
@@ -306,14 +333,7 @@ static void install_popup_hooks(void) {
                                         sel_registerName("presentViewController:animated:completion:"));
     if (pm) {
         g_orig_present = (void (*)(id, SEL, id, BOOL, id))method_getImplementation(pm);
-        method_setImplementation(pm, imp_implementationWithBlock(
-            ^void(id self, SEL c, id vc, BOOL anim, id comp) {
-                if ([vc isKindOfClass:[UIAlertController class]]) {
-                    if (comp) { void (^cb)(void) = comp; cb(); }
-                    return;
-                }
-                g_orig_present(self, c, vc, anim, comp);
-            }));
+        method_setImplementation(pm, (IMP)hook_present);
         st(@"HOOK: presentViewController 拦截 OK");
     } else st(@"HOOK: 未找到 presentViewController");
 }
