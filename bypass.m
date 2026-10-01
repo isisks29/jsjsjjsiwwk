@@ -127,12 +127,15 @@ static void armFull(void) {
         w8(g+0x658, 1);
         w8(g+0x659, 1);
         w8(g+0x65b, 1);
-        // ===== 关键：0x120000 建UI函数门卫块（正确值，AArch64哈希链复算）=====
-        // [0x6a0]=GATE0, [0x6a8/6ac/6b0] 满足 0x11ffb0→0x120000 的三重校验
+        // ===== 关键：0x120000 建UI函数门卫块（AArch64指令级精确复算）=====
+        // x20=(G0^0xedcab79bb3b25e3a)^0x5a9437c9090f2c9c=1 (whi=0,wlo=1)
+        //   [6a8]=fmix(0xd18ddb25^wlo^whi)
+        //   [6ac]=fmixpart(0x1767cedc^[6a8])^wlo^(>>17)
+        //   [6b0]=fmixpart(0x5d41c293^[6ac]) 经 whi 折叠
         w64(g+0x6a0, GATE0);
-        w32(g+0x6a8, 0xd4a32321);
-        w32(g+0x6ac, 0x64f2ebf3);
-        w32(g+0x6b0, 0x43a77606);
+        w32(g+0x6a8, 0x3baaae07);
+        w32(g+0x6ac, 0xf41da8cb);
+        w32(g+0x6b0, 0x5cde8bb8);
         // 第二门卫块（0x680，备用/其他路径）
         w64(g+0x680, GATE0); writeGateBlock(g+0x680, GATE0);
         // 过期绕过
@@ -149,7 +152,7 @@ static void armFull(void) {
         void *obj = buildSessionObj();
         w64(g+0x698, (uintptr_t)obj);
         NSLog(@"[ARM] UI-gate armed (6a8=%x 6ac=%x 6b0=%x) obj=%p",
-              0xd4a32321, 0x64f2ebf3, 0x43a77606, obj);
+              0x3baaae07, 0xf41da8cb, 0x5cde8bb8, obj);
     } @catch (NSException *e) { NSLog(@"[ARM] exc: %@", e); }
 }
 
