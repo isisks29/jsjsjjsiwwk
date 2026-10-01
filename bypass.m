@@ -338,32 +338,107 @@ static void install_popup_hooks(void) {
     } else st(@"HOOK: 未找到 presentViewController");
 }
 
-#pragma mark - 自检条（上屏）
+#pragma mark - 自检条 + 激活按钮（自动上屏，无需手动调用、不依赖日志）
+static UIWindow *ace_window(void) {
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (@available(iOS 13.0, *)) {
+            NSArray *scenes = app.connectedScenes.allObjects;
+            for (id sc in scenes) {
+                if ([sc isKindOfClass:[UIWindowScene class]]) {
+                    NSArray *ws = ((UIWindowScene *)sc).windows;
+                    if (ws.count) return ws.firstObject;
+                }
+            }
+        }
+        if (app.windows.count) return app.windows.firstObject;
+        if (app.keyWindow) return app.keyWindow;
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+@interface _AceDiagHost : NSObject @end
+@implementation _AceDiagHost
+- (void)tapActivate { ace_activate_and_build(); }
+@end
+static _AceDiagHost *g_diagHost = nil;
+void ace_show_diag(void);   // 前置声明（定义在下方）
+
+// 激活 + 构建（点按钮触发：写门卫字 → hook/对象/补丁 → 调 0x109020）
+void ace_activate_and_build(void) {
+    @try {
+        st(@"ACT: 开始");
+        uintptr_t base = ace_base();
+        if (!base) { st(@"ACT: 未定位 ace 靶场"); return; }
+        st([NSString stringWithFormat:@"ACT: base=0x%llx", (unsigned long long)base]);
+
+        // 写门卫字（gate 区 0x3d6ed8..0x3d6ee8），让校验异或差=0
+        *(volatile uint64_t *)(base + 0x3d6ed8) = 0xb75e8052babd72a7ULL;
+        *(volatile uint32_t *)(base + 0x3d6ee0) = 0xbb3dc5bf;
+        *(volatile uint32_t *)(base + 0x3d6ee4) = 0x856ac387;
+        *(volatile uint32_t *)(base + 0x3d6ee8) = 0x7863ab97;
+        st(@"ACT: 门卫字已写 (0x3d6ed8..0x3d6ee8)");
+
+        install_popup_hooks();          // 弹窗三件套
+        setup_object(base);             // 对象预分配（0x3d6ed0）
+        int r = patch_checks(base);     // 178 处补丁
+        st([NSString stringWithFormat:@"ACT: 补丁=%d", r]);
+
+        // 调面板构建函数（主线程，addSubview 需要）
+        ((void (*)(void))(base + 0x109020))();
+        st(@"ACT: 0x109020 调用完成");
+    } @catch (NSException *e) {
+        st([NSString stringWithFormat:@"ACT 异常: %@", e]);
+    }
+    ace_show_diag();   // 刷新自检条
+}
+
 void ace_show_diag(void) {
     @try {
         dispatch_async(dispatch_get_main_queue(), ^{
             @try {
-                UIWindow *win = nil;
-                if (@available(iOS 13.0, *)) {
-                    UIWindowScene *sc = (UIWindowScene *)[[[UIApplication sharedApplication].connectedScenes allObjects] firstObject];
-                    win = sc.windows.firstObject;
-                }
-                if (!win) win = [UIApplication sharedApplication].windows.firstObject;
-                if (!win) { st(@"DIAG: 无 window，跳过"); return; }
-                UILabel *lbl = [win viewWithTag:0xACE0];
-                if (!lbl) {
-                    lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 80, win.bounds.size.width - 16, 0)];
-                    lbl.tag = 0xACE0; lbl.numberOfLines = 0; lbl.font = [UIFont systemFontOfSize:11];
+                UIWindow *win = ace_window();
+                if (!win) { st(@"DIAG: 无 window"); return; }
+                UIView *box = [win viewWithTag:0xACE1];
+                if (!box) {
+                    box = [[UIView alloc] initWithFrame:CGRectMake(8, 100, win.bounds.size.width - 16, 260)];
+                    box.tag = 0xACE1;
+                    box.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
+                    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 8, box.bounds.size.width - 16, box.bounds.size.height - 56)];
+                    lbl.tag = 0xACE0; lbl.numberOfLines = 0;
+                    lbl.font = [UIFont systemFontOfSize:10];
                     lbl.textColor = [UIColor greenColor];
-                    lbl.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.65];
-                    lbl.textAlignment = NSTextAlignmentLeft;
-                    [win addSubview:lbl];
+                    [box addSubview:lbl];
+                    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+                    btn.frame = CGRectMake(8, box.bounds.size.height - 44, box.bounds.size.width - 16, 36);
+                    btn.backgroundColor = [UIColor greenColor];
+                    [btn setTitle:@"激活 (ace_activate + 0x109020)" forState:UIControlStateNormal];
+                    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                    if (!g_diagHost) g_diagHost = [_AceDiagHost new];
+                    [btn addTarget:g_diagHost action:@selector(tapActivate)
+                          forControlEvents:UIControlEventTouchUpInside];
+                    [box addSubview:btn];
+                    [win addSubview:box];
+                    [win bringSubviewToFront:box];
                 }
-                lbl.text = ace_status(); [lbl sizeToFit];
+                UILabel *lbl = [box viewWithTag:0xACE0];
+                lbl.text = ace_status();
                 st(@"DIAG: 自检条已上屏");
             } @catch (NSException *e) { NSLog(@"[ACE] DIAG err: %@", e); }
         });
     } @catch (NSException *e) { NSLog(@"[ACE] DIAG dispatch err: %@", e); }
+}
+
+// constructor 里自动启动：后台轮询等 UI 就绪，拿到 window 即上屏自检条
+static void ace_diag_auto(void) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        for (int i = 0; i < 120; i++) {   // 最多等 60s
+            @autoreleasepool {
+                if (ace_window()) { ace_show_diag(); break; }
+            }
+            usleep(500000);
+        }
+    });
 }
 
 #pragma mark - 对外入口
@@ -380,4 +455,5 @@ __attribute__((constructor))
 static void bypass_init(void) {
     st(@"INIT: dylib 载入");
     install_popup_hooks();
+    ace_diag_auto();   // 自动等 window 上屏自检条（含激活按钮）
 }
