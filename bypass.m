@@ -128,22 +128,9 @@ static void armFull(void){
     }@catch(NSException*e){}
 }
 
-// ===== Dobby 声明（项目已内置）=====
-extern void DobbyInstrument(void *address, void (*before)(void*, void*), void (*after)(void*));
-extern int  DobbyCodePatch(void *address, uint8_t *buffer, uint32_t size);
 
-// 拦截 0x11ffb0 入口：先 arm 再放行
-static void __attribute__((noinline)) before_11ffb0(void *addr, void *ctx){
-    g_instrCount++;
-    armFull();
-}
 
-static void install11ffb0Hook(void){
-    if(!g_targetBase) return;
-    void *target = va(k11ffb0File);
-    DobbyInstrument(target, before_11ffb0, NULL);
-    g_hooked11ffb0 = 1;
-}
+
 
 // ===== 手写 patch 兜底（Dobby 无效时用）=====
 static void manualPatch11ffb0(void){
@@ -316,22 +303,10 @@ static void spawnBall(void){
 
 __attribute__((constructor))
 static void initBy(void){
-    @autoreleasepool{
-        g_targetBase = findTargetBase();
-        installSigHandler();
-        installPopupHook();
-        armFull();
+    // 优先 Dobby；失败则手写 patch
+// @try { install11ffb0Hook(); } @catch(NSException *e) { }
+// if(!g_hooked11ffb0){ ... }
 
-        // 优先 Dobby；失败则手写 patch
-        @try {
-            install11ffb0Hook();
-        } @catch(NSException *e) { }
-        if(!g_hooked11ffb0){
-            @try { manualPatch11ffb0(); g_hooked11ffb0 = 2; }
-            @catch(NSException *e) { }
-        }
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(4*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{ spawnBall(); });
-    }
-}
+// 直接手写 patch
+@try { manualPatch11ffb0(); g_hooked11ffb0 = 2; }
+@catch(NSException *e) { }
