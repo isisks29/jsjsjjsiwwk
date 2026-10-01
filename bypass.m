@@ -6,8 +6,15 @@
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
+#import <mach/mach_vm.h>
+#import <signal.h>
+#import <ucontext.h>
+#import <sys/mman.h>
+#import <string.h>
 
 static const uintptr_t kSessionBaseFile = 0x3ff000;
+static const uintptr_t kSub11fa5cFile   = 0x11fa5c;
+static const uintptr_t k11ffb0File      = 0x11ffb0;
 
 #define CFG_C   0xB75E8052BABD72A6ULL
 #define MIX_K   0xD18DDB25u
@@ -33,7 +40,36 @@ static inline void w32(uintptr_t f,uint32_t v){ *(volatile uint32_t*)va(f)=v; }
 static inline uint64_t r64(uintptr_t f){ return *(volatile uint64_t*)va(f); }
 static inline uint32_t r32(uintptr_t f){ return *(volatile uint32_t*)va(f); }
 
+// ===== 状态 =====
+static volatile int g_popupCount = 0;
+static volatile int g_hookPopup = 0;
+static volatile int g_ballAlive = 0;
+static volatile int g_ballTried = 0;
+static volatile int g_refreshTick = 0;
 static volatile int g_armDone = 0;
+static volatile int g_hooked11ffb0 = 0;
+static volatile int g_instrCount = 0;
+static UIButton *ball = nil;
+
+// ===== 崩溃抓取 =====
+static volatile uint64_t g_crashPC = 0, g_crashFAR = 0;
+static volatile int g_crashed = 0;
+static volatile int g_crashSig = 0;
+
+static void sig_handler(int sig, siginfo_t *si, void *uctx){
+    ucontext_t *uc = (ucontext_t *)uctx;
+    g_crashPC  = uc->uc_mcontext->__ss.__pc;
+    g_crashFAR = (uint64_t)si->si_addr;
+    g_crashSig = sig;
+    g_crashed  = 1;
+}
+static void installSigHandler(void){
+    struct sigaction sa = {0};
+    sa.sa_sigaction = sig_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+}
 
 static uint64_t boot_ms(void){
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
@@ -56,7 +92,24 @@ static void writeGateTriple(uintptr_t seedAddr){
     w32(seedAddr + 0x10, v3);
 }
 
-// ★★★ 测试版：只 arm 门卫，不 arm 会话对象 ★★★
+static void* buildSessionObj(void){
+    void *obj = calloc(1, 0x11c6);
+    uint64_t b0=0x123456789abcdef0ULL, b8=0xfedcba9876543210ULL;
+    uint32_t b16=0x11223344, b24=0x55667788, b32=0x99aabbcc;
+    uint64_t *P = (uint64_t*)((uintptr_t)obj + 0x119a);
+    P[0]=b0; P[1]=b8; P[2]=b16; P[3]=b24; P[4]=b32;
+
+    uint32_t h = ((uint32_t)(b8>>32) ^ (uint32_t)b8) * 0x45D9F3B7u;
+    h ^= b16; h *= W_A; h ^= b24; h *= W_B; h ^= b32; h ^= h>>16;
+    *(uint32_t*)((uintptr_t)obj + 0x11c2) = h;
+
+    *(uint32_t*)((uintptr_t)obj + 0x0)  = (b32 ^ (uint32_t)(b0>>19)) ^ 0x5F8A16E3u;
+    *(uint64_t*)((uintptr_t)obj + 0x78) = b0 ^ b8 ^ 0xA5C3E1F7B6D2489AULL;
+    *(uint32_t*)((uintptr_t)obj + 0x8e) = (b16 ^ (uint32_t)(b0>>7))  ^ 0x4A9B5206u;
+    *(uint32_t*)((uintptr_t)obj + 0x92) = (b24 ^ (uint32_t)(b0>>13)) ^ 0x8C1A73E5u;
+    return obj;
+}
+
 static void armFull(void){
     if(!g_targetBase) return;
     @try{
@@ -69,16 +122,72 @@ static void armFull(void){
         w64(g+0x680, CFG_C ^ now_sec);
         writeGateTriple(g+0x680);
 
-        // w64(g+0x698, (uintptr_t)buildSessionObj());  // ← 暂时关掉
-
+        w64(g+0x698, (uintptr_t)buildSessionObj());
         g_armDone = 1;
     }@catch(NSException*e){}
 }
 
+// ===== Dobby 声明（项目已内置）=====
+extern void DobbyInstrument(void *address, void (*before)(void*, void*), void (*after)(void*));
+extern int  DobbyCodePatch(void *address, uint8_t *buffer, uint32_t size);
+
+// 拦截 0x11ffb0 入口：先 arm 再放行
+static void __attribute__((noinline)) before_11ffb0(void *addr, void *ctx){
+    g_instrCount++;
+    armFull();
+}
+
+static void install11ffb0Hook(void){
+    if(!g_targetBase) return;
+    void *target = va(k11ffb0File);
+    DobbyInstrument(target, before_11ffb0, NULL);
+    g_hooked11ffb0 = 1;
+}
+
+// ===== 手写 patch 兜底（Dobby 无效时用）=====
+static void manualPatch11ffb0(void){
+    if(!g_targetBase) return;
+    uint32_t *p = (uint32_t*)va(k11ffb0File);
+
+    // 检查是否已被改写（Dobby 生效则第一条不再是 sub sp）
+    if((p[0] & 0xFFC003FF) != 0xD10043FF) return;
+
+    static uint32_t saved[8];
+    for(int i=0;i<8;i++) saved[i] = p[i];
+
+    uint32_t *tr = (uint32_t*)mmap(NULL, 0x1000,
+                                   PROT_READ|PROT_WRITE|PROT_EXEC,
+                                   MAP_ANON|MAP_PRIVATE, -1, 0);
+    if(tr == MAP_FAILED) return;
+
+    for(int i=0;i<8;i++) tr[i] = saved[i];
+    uint64_t back = (uint64_t)va(k11ffb0File + 32);
+    uint64_t cur  = (uint64_t)&tr[8];
+    int64_t  off  = ((int64_t)(back - cur)) >> 2;
+    tr[8] = 0x14000000 | (off & 0x03FFFFFF);
+
+    // patch: adrp x16, armFn ; add x16, x16, off ; br x16 ; b tramp
+    uint64_t armAddr = (uint64_t)&armFull;
+    uint64_t pcAddr  = (uint64_t)p;
+    uint64_t armPage = armAddr & ~0xFFFULL;
+    uint64_t pcPage  = pcAddr  & ~0xFFFULL;
+    int64_t  adrpImm = ((int64_t)(armPage - pcPage)) >> 12;
+    uint32_t addImm  = (uint32_t)(armAddr & 0xFFF);
+
+    p[0] = 0x90000010 | (((uint32_t)adrpImm & 0x1FFFFF) << 5);  // adrp x16
+    p[1] = 0x91000210 | ((addImm & 0xFFF) << 10);                // add x16,x16,#imm
+    p[2] = 0xD61F0200;                                            // br x16
+    uint64_t trAddr = (uint64_t)tr;
+    uint64_t nextPC = (uint64_t)va(k11ffb0File + 16);
+    int64_t  bOff   = ((int64_t)(trAddr - nextPC)) >> 2;
+    p[3] = 0x14000000 | (bOff & 0x03FFFFFF);                     // b tramp
+
+    __builtin___clear_cache((char*)p, (char*)p + 32);
+    __builtin___clear_cache((char*)tr, (char*)tr + 36);
+}
+
 // ===== 弹窗 hook =====
 static IMP g_origPresent = NULL;
-static volatile int g_popupCount = 0;
-static volatile int g_hookPopup = 0;
 static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)){
     if([vc isKindOfClass:[UIAlertController class]]){
         g_popupCount++;
@@ -97,11 +206,6 @@ static void installPopupHook(void){
 }
 
 // ===== 检条 =====
-static volatile int g_ballAlive = 0;
-static volatile int g_ballTried = 0;
-static volatile int g_refreshTick = 0;
-static UIButton *ball = nil;
-
 @interface BallTarget : NSObject
 @property(nonatomic,strong) UILabel *bar;
 @end
@@ -122,18 +226,22 @@ static UIButton *ball = nil;
     else             ballStr = @"NO";
 
     self.bar.text = [NSString stringWithFormat:
-        @"658=%u 348=%u obj=%p\n"
-         "sc=%llx tc=%llx\n"
+        @"658=%u 348=%u\n"
          "6a0=%llx 680=%llx\n"
          "6a8=%08x 688=%08x\n"
-         "hook=%d 弹窗=%d\n"
-         "arm=%d 球=%@ tick=%d",
-        r32(g+0x658), r32(0x3fc000+0x348), (void*)obj,
-        sc, tc,
+         "obj=%p sc=%llx tc=%llx\n"
+         "hook=%d 弹=%d arm=%d\n"
+         "dby=%d ins=%d 球=%@ tick=%d\n"
+         "crash=%d pc=%llx\n"
+         "far=%llx sig=%d",
+        r32(g+0x658), r32(0x3fc000+0x348),
         r64(g+0x6a0), r64(g+0x680),
         r32(g+0x6a8), r32(g+0x688),
-        g_hookPopup, g_popupCount,
-        g_armDone, ballStr, g_refreshTick];
+        (void*)obj, sc, tc,
+        g_hookPopup, g_popupCount, g_armDone,
+        g_hooked11ffb0, g_instrCount, ballStr, g_refreshTick,
+        g_crashed, g_crashPC,
+        g_crashFAR, g_crashSig];
 }
 - (void)tap{
     armFull();
@@ -174,12 +282,12 @@ static void spawnBall(void){
                 if(win){
                     BallTarget *t = [BallTarget new];
                     ball = [UIButton buttonWithType:UIButtonTypeSystem];
-                    ball.frame = CGRectMake(20,120,270,220);
+                    ball.frame = CGRectMake(20,120,270,240);
                     ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.9];
                     ball.layer.cornerRadius = 12;
                     UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
                     bar.textColor = [UIColor whiteColor];
-                    bar.font = [UIFont systemFontOfSize:10];
+                    bar.font = [UIFont systemFontOfSize:9];
                     bar.numberOfLines = 0;
                     bar.text = @"—";
                     t.bar = bar;
@@ -209,11 +317,19 @@ __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
         g_targetBase = findTargetBase();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{
-            installPopupHook();
-            armFull();
-        });
+        installSigHandler();
+        installPopupHook();
+        armFull();
+
+        // 优先 Dobby；失败则手写 patch
+        @try {
+            install11ffb0Hook();
+        } @catch(NSException *e) { }
+        if(!g_hooked11ffb0){
+            @try { manualPatch11ffb0(); g_hooked11ffb0 = 2; }
+            @catch(NSException *e) { }
+        }
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(4*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{ spawnBall(); });
     }
