@@ -4,6 +4,7 @@
 
 
 
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -502,9 +503,12 @@ static void add_floating_ball(void) {
 #pragma mark - 写门卫字（心跳/图标/定时器共用链，T=1），写后读回校验
 
 static void write_gate_words(uintptr_t base) {
-    uint64_t g0; uint32_t g1, g2, g3;
-    compute_gate_words(&g0, &g1, &g2, &g3);
+    /* 构造链自洽值（0x109020 用自己一套公式从 gate0 递推 g1/g2/g3，之前写共用链值
+     * 导致 14 处比较失败、面板不出）。已用 0x109020 指令模拟器逆推得：
+     *   gate0=0xb75e8052babd72a7, g1=0xbb3dc5bf, g2=0x856ac387, g3=0x7863ab97 */
     uint8_t words[20];
+    uint64_t g0 = 0xb75e8052babd72a7ull;
+    uint32_t g1 = 0xbb3dc5bfu, g2 = 0x856ac387u, g3 = 0x7863ab97u;
     memcpy(words, &g0, 8); memcpy(words + 8, &g1, 4);
     memcpy(words + 12, &g2, 4); memcpy(words + 16, &g3, 4);
     memcpy((void *)(base + OFF_GATE0), words, sizeof(words));
