@@ -10,7 +10,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
+#import <mach/vm_map.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
@@ -52,13 +52,14 @@ static int patch_checks(uintptr_t base) {
         if (a < lo) lo = a;
         if (a > hi) hi = a;
     }
-    uintptr_t pg   = (uintptr_t)vm_page_size;
-    uintptr_t p0   = lo & ~(pg - 1);
-    uintptr_t p1   = (hi + pg - 1) & ~(pg - 1);
+    vm_size_t pg   = vm_page_size;
+    vm_address_t p0   = lo & ~(pg - 1);
+    vm_address_t p1   = (hi + pg - 1) & ~(pg - 1);
 
-    // 使目标页可写（保持可执行，避免写回时被保护触发）
-    mach_vm_protect(mach_task_self(), p0, p1 - p0, 0,
+    // 替换 mach_vm_protect → vm_protect
+    kern_return_t kr = vm_protect(mach_task_self(), p0, p1 - p0, 0,
                     VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) return -2;
 
     int done = 0;
     for (int i = 0; i < kCheckCount; i++) {
@@ -77,7 +78,7 @@ static int patch_checks(uintptr_t base) {
     sys_icache_invalidate((void *)p0, p1 - p0);
 
     // 恢复只读+可执行
-    mach_vm_protect(mach_task_self(), p0, p1 - p0, 0,
+    vm_protect(mach_task_self(), p0, p1 - p0, 0,
                     VM_PROT_READ | VM_PROT_EXECUTE);
     return done;
 }
