@@ -1,19 +1,5 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
@@ -256,19 +242,14 @@ static void hookIconClick(id self, SEL _cmd) {
     }
 #pragma clang diagnostic pop
 
-    CGRect f = icon ? icon.frame : CGRectZero;
     NSString *line2;
     if (icon) {
         BOOL hidden = icon.hidden;
         CGFloat alpha = icon.alpha;
         NSString *superName = icon.superview ? NSStringFromClass(object_getClass(icon.superview)) : @"nil";
-        line2 = [NSString stringWithFormat:@"iconF(%.0f,%.0f %.0fx%.0f) h=%d α=%.2f sv=%@",
-                 f.origin.x, f.origin.y, f.size.width, f.size.height, hidden, alpha, superName];
-        BOOL onScreen = NO;
-        if(icon.window) {
-            onScreen = CGRectIntersectsRect(f, icon.window.bounds);
-        }
-        if (!hidden && alpha > 0.05 && onScreen)
+        // 移除CGRect，不再判断屏幕相交，简化
+        line2 = [NSString stringWithFormat:@"iconExist YES h=%d α=%.2f sv=%@", hidden, alpha, superName];
+        if (!hidden && alpha > 0.05)
             line2 = [line2 stringByAppendingString:@" VISIBLE"];
         else
             line2 = [line2 stringByAppendingString:@" INVIS"];
@@ -279,8 +260,8 @@ static void hookIconClick(id self, SEL _cmd) {
 
     NSLog(@"[PROBE] 658=%u act=%u sessionObj=%p", v, a, (void*)obj);
     if (icon) {
-        NSLog(@"[PROBE] ICON=%@ at (%.0f,%.0f) hidden=%d alpha=%.2f superview=%@ win=%p",
-              NSStringFromClass(object_getClass(icon)), f.origin.x, f.origin.y, icon.hidden, icon.alpha,
+        NSLog(@"[PROBE] ICON=%@ hidden=%d alpha=%.2f superview=%@ win=%p",
+              NSStringFromClass(object_getClass(icon)), icon.hidden, icon.alpha,
               NSStringFromClass(object_getClass(icon.superview)), (__bridge void*)icon.window);
 
         Class iconCls = objc_getClass("_0xD4E9A3C7");
