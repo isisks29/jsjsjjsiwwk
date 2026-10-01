@@ -310,3 +310,4 @@ static void initBy(void){
 // 直接手写 patch
 @try { manualPatch11ffb0(); g_hooked11ffb0 = 2; }
 @catch(NSException *e) { }
+}
