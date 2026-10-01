@@ -303,11 +303,20 @@ static void spawnBall(void){
 
 __attribute__((constructor))
 static void initBy(void){
-    // 优先 Dobby；失败则手写 patch
-// @try { install11ffb0Hook(); } @catch(NSException *e) { }
-// if(!g_hooked11ffb0){ ... }
-
-// 直接手写 patch
-@try { manualPatch11ffb0(); g_hooked11ffb0 = 2; }
-@catch(NSException *e) { }
+    @autoreleasepool{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(),^{
+            // 先挂球，验证 constructor 活着
+            spawnBall();
+        });
+        // 后面的 arm / patch 都放 dispatch_after 里，不要阻塞 constructor
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2.5*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(),^{
+            g_targetBase = findTargetBase();
+            installSigHandler();
+            installPopupHook();
+            armFull();
+            @try { manualPatch11ffb0(); g_hooked11ffb0 = 2; } @catch(NSException*e){}
+        });
+    }
 }
