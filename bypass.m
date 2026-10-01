@@ -1,4 +1,5 @@
 #define _XOPEN_SOURCE 700
+#define _DARWIN_C_SOURCE 1
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
