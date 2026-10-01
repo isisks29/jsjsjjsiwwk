@@ -10,477 +10,367 @@
 
 
 
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <mach/mach.h>
-#import <mach/vm_map.h>
 #import <mach-o/dyld.h>
-#import <libkern/OSCacheControl.h>
-void ace_activate_and_build(void);
+#import <dlfcn.h>
+#import <mach/mach.h>
 
-#pragma mark - 自检条状态（st 实时上屏，崩溃前最后一行=崩点）
-static NSMutableString *g_status = nil;
-static void ace_refresh_label(void);
-static void st(NSString *line) {
-if (!g_status) g_status = [NSMutableString string];
-[g_status appendFormat:@"%@\n", line];
-NSLog(@"[ACE] %@", line);
-ace_refresh_label();
-}
-NSString *ace_status(void) { return g_status ? [g_status copy] : @""; }
+// ================= 目标常量（文件 vmaddr） =================
+// 构建函数入口（其内部 14 处防篡改校验全过才会 addSubview: 挂面板）
+static const uintptr_t kBuildFnFile      = 0x109020;
+// 第二面板入口：_0xD4E9A3C7 -iconOnClick（“点击左上角”→ 面板，Metal）
+static const uintptr_t kIconOnClickFile  = 0x111bd8;
+// iconOnClick 第一道守卫：BSS 布尔激活标志（0 → 直接 return，面板不显）
+// 会话对象种子区（__bss 0x3ff000+）：0x6a0(qword 会话密钥) / 0x6a8·0x6ac·0x6b0(w32 校验字)
+static const uintptr_t kSessionBaseFile  = 0x3ff000;
+static const uintptr_t kOffActFlag       = 0x6a8;
+static const uintptr_t kOffSessionSeed   = 0x6a0;
+// 卡密验证成功锁存（0x4ed74 写；0=失败 1=成功）——控制“显示成功”与后续路径
+static const uintptr_t kOffVerifyResult  = 0x658;
+// 会话对象（0x4e98/0x290bc 惰性创建，验证成功后填充字段）——面板校验对象
+static const uintptr_t kOffSessionObj    = 0x698;
 
-#pragma mark - 靶场定位（构建函数 prologue 指纹）
-static uintptr_t ace_base(void) {
-uint32_t count = _dyld_image_count();
-for (uint32_t i = 0; i < count; i++) {
-const struct mach_header *h = _dyld_get_image_header(i);
-if (!h) continue;
-uintptr_t base = (uintptr_t)h;
-uint32_t p0 = *(volatile uint32_t *)(base + 0x109020);
-uint32_t p1 = *(volatile uint32_t *)(base + 0x109134);
-if (p0 == 0xD10543FF && p1 == 0x54006621) return base;
-}
-return 0;
-}
+// 门卫字（你逆推的正确值，运行时写入 BSS 全局）
+#define GATE0 0xb75e8052babd72a7ULL
+#define G1    0xbb3dc5bfULL
+#define G2    0x856ac387ULL
+#define G3    0x7863ab97ULL
 
-#pragma mark - 补丁表（你的综合表 + Phase2；v6 保留）
-typedef struct { uint32_t off; uint8_t expect[4]; uint8_t repl[4]; } patch_t;
+// 构建链读取的 __DATA,__bss 全局（文件 vmaddr 0x3f7000+）。
+// 反汇编确认构建链这些 offset 都做“读全局→解密→比较→bail”：
+//   0x258 0x568 0x580 0x594 0x5b0 0x5cc 0x6a4 0x6c0 0x670 0x688 0x6fc
+// 建议（务必用运行期实测核对）：
+//   gate0 → 0x568    （与共用链门卫字一致）
+//   g1    → 0x6a4
+//   g2    → 0x6c0
+//   g3    → 0x6fc
+//   对象指针 → 0x258 （写 0 → 自初始化，放行 bail7~14）
+static const uintptr_t kGateBaseFile    = 0x3f7000;
+static const uintptr_t kOffGate0        = 0x568;
+static const uintptr_t kOffG1           = 0x6a4;
+static const uintptr_t kOffG2           = 0x6c0;
+static const uintptr_t kOffG3           = 0x6fc;
+static const uintptr_t kOffObjPtr       = 0x258;
 
-static const patch_t kPatches[] = {
-/* ---- 0x109020 构建函数 Phase1 ---- */
-/* ---- 0x109020 构建函数 Phase1 ---- */
-{0x109068, {0x88,0x6c,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x109134, {0x21,0x66,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x1091d4, {0x21,0x61,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109288, {0x81,0x5b,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x1092e0, {0xc3,0x58,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109308, {0x88,0x57,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109374, {0x28,0x54,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x10937c, {0xe8,0x53,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x10938c, {0x6e,0x53,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x1093e4, {0xa1,0x50,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x10941c, {0xe1,0x4e,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109458, {0x01,0x4d,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x1094b0, {0x41,0x4a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109574, {0x21,0x44,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
+// ================= 运行时基址 =================
+static uintptr_t g_targetBase = 0;
 
-/* ---- 0x109020 构建函数 Phase2 ---- */
-{0x109804, {0xc8,0x2e,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x1098d4, {0x41,0x28,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x10996c, {0x81,0x23,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109a34, {0x41,0x1d,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109a94, {0x43,0x1a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109aa0, {0xe8,0x19,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109b44, {0xc8,0x14,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x109b4c, {0x88,0x14,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x109b5c, {0x01,0x14,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x109ba4, {0xc1,0x11,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109bfc, {0x01,0x0f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109c6c, {0x81,0x0b,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109cd4, {0x41,0x08,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x109d48, {0xa1,0x04,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-
-/* ---- 你的综合表原样保留（其余函数防篡改） ---- /
-{0x4e38, {0x88,0x0a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x4ea4, {0x29,0x07,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x4eac, {0xe9,0x06,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x4ebc, {0x6e,0x06,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x4ee4, {0x21,0x05,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x4f0c, {0xe1,0x03,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x4f2c, {0xe1,0x02,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x4f4c, {0xe1,0x01,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfadbc, {0xe8,0x13,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfae28, {0x89,0x10,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0xfae30, {0x49,0x10,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0xfae40, {0xce,0x0f,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0xfae68, {0x81,0x0e,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfae90, {0x41,0x0d,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfaeb0, {0x41,0x0c,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfaed0, {0x41,0x0b,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfaf08, {0x81,0x09,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfaf18, {0x08,0x09,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0xfaf54, {0x21,0x07,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfaf88, {0x81,0x05,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfafbc, {0xe1,0x03,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfafd4, {0x01,0x04,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfaff8, {0x03,0x02,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0xfb008, {0x88,0x01,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x10a020, {0x88,0x0a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x10a08c, {0x29,0x07,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x10a094, {0xe9,0x06,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x10a0a4, {0x6e,0x06,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x10a0cc, {0x21,0x05,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x10a0f4, {0xe1,0x03,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x10a114, {0xe1,0x02,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x10a134, {0xe1,0x01,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x253f0, {0xa8,0x6f,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x254c0, {0x21,0x69,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x25578, {0x61,0x63,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x25600, {0x21,0x5f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2565c, {0x43,0x5c,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x25684, {0x08,0x5b,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x256f0, {0xa8,0x57,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x256f8, {0x68,0x57,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x25708, {0xee,0x56,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x25754, {0x81,0x54,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2578c, {0xc1,0x52,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x257c8, {0xe1,0x50,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x25804, {0x01,0x4f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x25880, {0x21,0x4b,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x26d60, {0x68,0x39,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x26e48, {0x21,0x32,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x26f18, {0xa1,0x2b,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x26fd0, {0xe1,0x25,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2702c, {0x03,0x23,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x27038, {0xa8,0x22,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x270a4, {0x48,0x1f,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x270ac, {0x08,0x1f,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x270bc, {0x8e,0x1e,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x27114, {0xc1,0x1b,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x27174, {0xc1,0x18,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x271d8, {0xa1,0x15,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x27208, {0x21,0x14,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x27284, {0x41,0x10,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2769c, {0x88,0x3f,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x27780, {0x61,0x38,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x277f0, {0xe1,0x34,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x278a8, {0x21,0x2f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x279a0, {0x68,0x27,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x279a8, {0x28,0x27,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x279b8, {0xae,0x26,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x27a10, {0xe1,0x23,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x27a7c, {0x81,0x20,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x27ad4, {0xc1,0x1d,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x27b10, {0xe1,0x1b,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x27b8c, {0x01,0x18,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2d5d0, {0xc8,0x2c,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x2d6e4, {0x21,0x24,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2d784, {0x21,0x1f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2d83c, {0x61,0x19,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2d8a0, {0x43,0x16,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2d8ac, {0xe8,0x15,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2d918, {0x88,0x12,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x2d920, {0x48,0x12,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x2d930, {0xce,0x11,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x2d99c, {0x61,0x0e,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2d9e0, {0x41,0x0c,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2da10, {0xc1,0x0a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2da4c, {0xe1,0x08,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x2db30, {0xca,0x01,0x00,0x37}, {0x1f,0x20,0x03,0xd5}},
-{0x2db38, {0x88,0x01,0x00,0x37}, {0x1f,0x20,0x03,0xd5}},
-{0x3447c, {0xa8,0x87,0x02,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x344e0, {0x81,0x84,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3451c, {0xa1,0x82,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x34558, {0xc1,0x80,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x345c0, {0x88,0x7d,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3462c, {0x29,0x7a,0x02,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x34634, {0xe9,0x79,0x02,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x34644, {0x6e,0x79,0x02,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x3466c, {0x21,0x78,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x34694, {0xe1,0x76,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x346b4, {0xe1,0x75,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x346d4, {0xe1,0x74,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3470c, {0x21,0x73,0x02,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3b818, {0x88,0x14,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x3b87c, {0x61,0x11,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3b8b8, {0x81,0x0f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3b8f4, {0xa1,0x0d,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3b958, {0x88,0x0a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3b9c4, {0x29,0x07,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x3b9cc, {0xe9,0x06,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x3b9dc, {0x6e,0x06,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x3ba04, {0x21,0x05,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3ba2c, {0xe1,0x03,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3ba4c, {0xe1,0x02,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3ba6c, {0xe1,0x01,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3e1dc, {0x88,0x14,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x3e240, {0x61,0x11,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3e27c, {0x81,0x0f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3e2b8, {0xa1,0x0d,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3e31c, {0x88,0x0a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3e388, {0x29,0x07,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x3e390, {0xe9,0x06,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x3e3a0, {0x6e,0x06,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x3e3c8, {0x21,0x05,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3e3f0, {0xe1,0x03,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3e410, {0xe1,0x02,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x3e430, {0xe1,0x01,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x7f628, {0x68,0x14,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x7f68c, {0x41,0x11,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x7f6c8, {0x61,0x0f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x7f704, {0x81,0x0d,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x7f764, {0x88,0x0a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x7f7d0, {0x29,0x07,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x7f7d8, {0xe9,0x06,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x7f7e8, {0x6e,0x06,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x7f810, {0x21,0x05,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x7f838, {0xe1,0x03,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x7f858, {0xe1,0x02,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x7f878, {0xe1,0x01,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x81798, {0x68,0x14,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x817fc, {0x41,0x11,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x81838, {0x61,0x0f,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x81874, {0x81,0x0d,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x818d4, {0x88,0x0a,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x81940, {0x29,0x07,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x81948, {0xe9,0x06,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-{0x81958, {0x6e,0x06,0x00,0xb4}, {0x1f,0x20,0x03,0xd5}},
-{0x81980, {0x21,0x05,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x819a8, {0xe1,0x03,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x819c8, {0xe1,0x02,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x819e8, {0xe1,0x01,0x00,0x54}, {0x1f,0x20,0x03,0xd5}},
-{0x10b8a8, {0x48,0x07,0x00,0x34}, {0x1f,0x20,0x03,0xd5}},
-/ 0x4f84: b.eq 0x4fd8 -> b 0x4fd8 (强制走已激活路径) */
-{0x4f84, {0xa0,0x02,0x00,0x54}, {0x04,0x00,0x00,0x14}},
-};
-static const int kPatchCount = sizeof(kPatches)/sizeof(kPatches[0]);
-
-static int patch_checks(uintptr_t base) {
-if (!base) { st(@"PATCH: 未定位到 ace 靶场 (base=0)"); return -1; }
-st([NSString stringWithFormat:@"PATCH: base=0x%llx", (unsigned long long)base]);
-
-uintptr_t lo = base + kPatches[0].off, hi = base + kPatches[0].off;
-for (int i = 1; i < kPatchCount; i++) {
-uintptr_t a = base + kPatches[i].off;
-if (a < lo) lo = a;
-if (a > hi) hi = a;
-}
-vm_size_t pg = vm_page_size;
-vm_address_t p0 = lo & ~(pg - 1);
-vm_address_t p1 = (hi + pg - 1) & ~(pg - 1);
-
-kern_return_t kr = vm_protect(mach_task_self(), p0, p1 - p0, 0,
-VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-if (kr != KERN_SUCCESS) { st([NSString stringWithFormat:@"PATCH: vm_protect 失败 err=%d", kr]); return -2; }
-
-int done = 0, mismatch = 0;
-for (int i = 0; i < kPatchCount; i++) {
-volatile uint8_t *p = (volatile uint8_t *)(base + kPatches[i].off);
-if (memcmp((void *)p, kPatches[i].expect, 4) != 0) { mismatch++; continue; }
-memcpy((void *)p, kPatches[i].repl, 4);
-done++;
-if ((i + 1) % 40 == 0)
-st([NSString stringWithFormat:@"PATCH: %d/%d", i + 1, kPatchCount]);
-}
-sys_icache_invalidate((void *)p0, p1 - p0);
-vm_protect(mach_task_self(), p0, p1 - p0, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-
-st([NSString stringWithFormat:@"PATCH: 成功 %d/%d，编码不符 %d", done, kPatchCount, mismatch]);
-return done;
+// 通过 dyld 镜像列表找靶场 dylib 基址（arm64：运行期地址 = imagebase + 文件vmaddr）
+static uintptr_t findTargetBase(void) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        // 安装名/文件名含 ace 或 ballsace 即命中；必要时改成你实测到的名字
+        if (strstr(name, "ace") || strstr(name, "ballsace")) {
+            return (uintptr_t)_dyld_get_image_header(i);
+        }
+    }
+    return 0;
 }
 
-#pragma mark - 对象预分配（v6：补全 Phase1 对象区全部校验字段）
-// Phase1 对象区 0x109370-0x109574 是自洽哈希：计算值=magic 与相邻字段函数，比目标字段。
-// v5 只填 [obj+0]=-1 与 magic → 校验全 bail。v6 补全 5 个目标字段 + [obj+0x119a+0x20]。
-// VM 验证：对象区 5 处 cmp 全部 PASS。
-static void setup_object(uintptr_t base) {
-if (!base) return;
-uint64_t *slot = (uint64_t *)(base + 0x3d6ed0);
-void *obj = calloc(1, 0x2000);                       // 足够容纳 0x119a+0xaf8 等
-if (!obj) { st(@"OBJ: calloc 失败"); return; }
-uint8_t *b = (uint8_t *)obj;
-
-*(int32_t *)b = -1;                                  // [obj+0] = -1 (固定)
-*(uint64_t *)(b + 0x78)  = 0x63674664ed03a10full;    // 校验1 目标
-*(uint32_t *)(b + 0x8e)  = 0x6c2cf1d5u;              // 校验2 目标
-*(uint32_t *)(b + 0x92)  = 0xb080ad6au;              // 校验3 目标
-*(uint64_t *)(b + 0x119a)      = 0xC6A4A7935BD1E995ull; // magic (固定)
-*(uint64_t *)(b + 0x119a + 8)  = 0;                  // x11
-*(uint64_t *)(b + 0x119a + 0x10)= 0;                 // x13
-*(uint64_t *)(b + 0x119a + 0x18)= 0;                 // x12
-*(uint32_t *)(b + 0x119a + 0x20)= 0x34878266u;       // X (check4 硬约束 -> [obj+0]=-1)
-*(uint32_t *)(b + 0x11c2)  = 0x3487b6e1u;            // 校验6 目标
-*slot = (uint64_t)obj;
-st([NSString stringWithFormat:@"OBJ: 0x3d6ed0 <- 0x%llx (字段已补全)", (unsigned long long)obj]);
+static inline void *va(uintptr_t fileAddr) {
+    return (void *)(g_targetBase + fileAddr);
 }
 
-#pragma mark - 三件套 hook（弹窗抑制，C 函数 IMP 避免 ARC block retain 崩溃）
-static id hook_passwordForService(id __unsafe_unretained self, SEL _cmd,
-id __unsafe_unretained svc, id __unsafe_unretained acct) {
-return @"A";
+static inline void w64(uintptr_t fileAddr, uint64_t v) {
+    *(volatile uint64_t *)va(fileAddr) = v;
 }
-static void hook_setupUI(id __unsafe_unretained self, SEL _cmd) { }
-
-static void (*g_orig_present)(id, SEL, id, BOOL, id);
-static void hook_present(id __unsafe_unretained self, SEL _cmd,
-id __unsafe_unretained vc, BOOL animated,
-id __unsafe_unretained completion) {
-if ((uintptr_t)vc < 0x1000) { return; }
-@try {
-if ([(NSObject *)vc isKindOfClass:[UIAlertController class]]) {
-if (completion) { void (^cb)(void) = completion; cb(); }
-return;
+static inline void w32(uintptr_t fileAddr, uint32_t v) {
+    *(volatile uint32_t *)va(fileAddr) = v;
 }
-} @catch (NSException *e) { NSLog(@"[ACE] present catch: %@", e); }
-if (g_orig_present) g_orig_present(self, _cmd, vc, animated, completion);
+static inline uint64_t r64(uintptr_t fileAddr) {
+    return *(volatile uint64_t *)va(fileAddr);
 }
 
-static void install_popup_hooks(void) {
-Class keychain = NSClassFromString(@"_0xD5A13E79");
-if (!keychain) {
-unsigned n = 0; Class *cs = objc_copyClassList(&n);
-for (unsigned i = 0; i < n; i++)
-if (class_getClassMethod(cs[i], sel_registerName("passwordForService:account:")))
-{ keychain = cs[i]; break; }
-free(cs);
-}
-if (keychain) {
-Method m = class_getClassMethod(keychain, sel_registerName("passwordForService:account:"));
-if (m) method_setImplementation(m, (IMP)hook_passwordForService);
-st(@"HOOK: passwordForService -> @\"A\" OK");
-} else st(@"HOOK: 未找到钥匙串类");
-
-unsigned n = 0; Class *cs = objc_copyClassList(&n);
-for (unsigned i = 0; i < n; i++) {
-Method m = class_getInstanceMethod(cs[i], sel_registerName("setupUI"));
-if (m) method_setImplementation(m, (IMP)hook_setupUI);
-}
-free(cs);
-st(@"HOOK: setupUI 空转 OK");
-
-Method pm = class_getInstanceMethod([UIViewController class],
-sel_registerName("presentViewController:animated:completion:"));
-if (pm) {
-g_orig_present = (void (*)(id, SEL, id, BOOL, id))method_getImplementation(pm);
-method_setImplementation(pm, (IMP)hook_present);
-st(@"HOOK: presentViewController 拦截 OK");
-} else st(@"HOOK: 未找到 presentViewController");
+// ================= 1) 三件套：抑制卡密弹窗 =================
+// +[_0xD5A13E79 passwordForService:account:] → 恒 @"A"
+static id (*origPassword)(id, SEL, id, id);
+static id hookPassword(id self, SEL _cmd, id svc, id acct) {
+    return @"A";
 }
 
-#pragma mark - 自检条 + 激活按钮
-static UIWindow *ace_window(void) {
-@try {
-UIApplication *app = [UIApplication sharedApplication];
-if (@available(iOS 13.0, *)) {
-NSArray *scenes = app.connectedScenes.allObjects;
-for (id sc in scenes) {
-if ([sc isKindOfClass:[UIWindowScene class]]) {
-NSArray *ws = ((UIWindowScene *)sc).windows;
-if (ws.count) return ws.firstObject;
-}
-}
-}
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-if (app.windows.count) return app.windows.firstObject;
-if (app.keyWindow) return app.keyWindow;
-#pragma clang diagnostic pop
-} @catch (NSException *e) { }
-return nil;
+// setupUI 空转（注意：若发现面板也被吞掉，说明菜单与弹窗共用此构建，
+// 应去掉本 hook，改为只拦 UIAlertController——见第 3 步）
+static void (*origSetup)(id, SEL);
+static void hookSetup(id self, SEL _cmd) {}
+
+// UIViewController presentViewController:animated:completion: —— 全局拦 UIAlertController
+static IMP g_origPresent = NULL;
+static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)) {
+    if ([vc isKindOfClass:[UIAlertController class]]) {
+        if (comp) comp();
+        return;
+    }
+    ((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))g_origPresent)(self, _cmd, vc, anim, comp);
 }
 
-@interface _AceDiagHost : NSObject @end
-@implementation _AceDiagHost
+static void installHooks(void) {
+    // 1) 钥匙串查询
+    Class keychain = objc_getClass("_0xD5A13E79");
+    Method mPass = keychain ? class_getClassMethod(keychain, sel_registerName("passwordForService:account:")) : NULL;
+    if (mPass) {
+        origPassword = (id(*)(id,SEL,id,id))method_getImplementation(mPass);
+        method_setImplementation(mPass, (IMP)hookPassword);
+    }
+    // 2) setupUI 空转（若吞面板则改为不装）
+    Method mSetup = NULL;
+    Class popup = objc_getClass("_0x6D1C8F45"); // 或你实测的弹窗类
+    if (popup) mSetup = class_getInstanceMethod(popup, sel_registerName("setupUI"));
+    if (mSetup) {
+        origSetup = (void(*)(id,SEL))method_getImplementation(mSetup);
+        method_setImplementation(mSetup, (IMP)hookSetup);
+    }
+    // 3) 全局拦 UIAlertController
+    g_origPresent = class_getMethodImplementation([UIViewController class],
+                                                   sel_registerName("presentViewController:animated:completion:"));
+    if (g_origPresent) {
+        Method mPres = class_getInstanceMethod([UIViewController class],
+                                               sel_registerName("presentViewController:animated:completion:"));
+        method_setImplementation(mPres, (IMP)hookPresent);
+    }
+}
 
-- (void)tapActivate { ace_activate_and_build(); }
+// ================= 2) 写门卫 + 会话状态 + 验证成功锁存 =================
+static void writeGateWords(void) {
+    // 验证成功锁存：置 1 → “显示成功”那层门打开
+    w32(kSessionBaseFile + kOffVerifyResult, 1);
+    w64(kGateBaseFile + kOffGate0, GATE0);
+    w64(kGateBaseFile + kOffG1,    G1);
+    w64(kGateBaseFile + kOffG2,    G2);
+    w64(kGateBaseFile + kOffG3,    G3);
+    w64(kGateBaseFile + kOffObjPtr, 0);   // 关键：写 0 → 构建函数自初始化对象
+}
+
+// 运行时诊断：打印会话对象字段，判断面板被哪层门卡住
+static void logSessionState(void) {
+    if (!g_targetBase) return;
+    uintptr_t obj = r64(kSessionBaseFile + kOffSessionObj);
+    NSLog(@"[DBG] verifyLatch(0x658)=%u  sessionObj(0x698)=%p  actFlag(0x6a8)=%u",
+          (unsigned)r32(kSessionBaseFile + kOffVerifyResult),
+          (void *)obj,
+          (unsigned)r32(kSessionBaseFile + kOffActFlag));
+    if (obj) {
+        NSLog(@"[DBG] obj +0x78=%llx +0x8e=%u +0x92=%u +0x119a=%llx",
+              *(volatile uint64_t *)(obj+0x78),
+              *(volatile uint32_t *)(obj+0x8e),
+              *(volatile uint32_t *)(obj+0x92),
+              *(volatile uint64_t *)(obj+0x119a));
+    }
+}
+
+// ================= 3) 完整自洽武装（无卡密，纯逆向公式复现） =================
+#define W20 0x8e4b1395u
+#define W21 0x1f3d6a71u
+#define W22 0xd18ddb25u
+#define W24 0x1767cedcu
+#define W25 0x5d41c293u
+
+// 复现“门卫块”哈希链（来自 iconOnClick 0x111c38..0x111cdc）：seed → 写出 3 个 w32
+static void writeGateBlock(uintptr_t base, uint64_t seed) {
+    uint64_t x26 = seed ^ GATE0;
+    uint32_t w8  = (uint32_t)(x26 >> 32);
+    uint32_t w26 = (uint32_t)x26;
+    uint32_t w11 = (w26 ^ W22) ^ w8;
+    w11 ^= w11>>15; w11 *= W21; w11 ^= w11>>11; w11 *= W20; w11 ^= w11>>17;
+    w32(base+0x08, w11);                       // [seed+8] 非零门
+    uint32_t w9 = w11 ^ W24;
+    w9 ^= w9>>15; w9 *= W21; w9 ^= w9>>11; w9 *= W20;
+    w9 = ((uint32_t)x26 ^ (w9>>17)) ^ w9;
+    w32(base+0x0c, w9);                        // [seed+0xc]
+    uint32_t w10 = w9 ^ W25;
+    w10 ^= w10>>15; w10 *= W21; w10 ^= w10>>11; w10 *= W20;
+    w8 = w8 ^ (w10>>17) ^ w10;
+    w32(base+0x10, w8);                        // [seed+0x10]
+}
+
+// 会话对象自洽填充（复现 iconOnClick 0x111dc4..0x111e88）：自选载荷→算校验和→写字段
+static void* buildSessionObj(void) {
+    void *obj = calloc(1, 0x1200);             // 足够大（含 +0x119a 载荷区）
+    uint64_t b0 = 0x123456789abcdef0ULL, b8 = 0xfedcba9876543210ULL;
+    uint32_t b16 = 0x11223344, b24 = 0x55667788, b32 = 0x99aabbcc;
+    uint64_t *buf = (uint64_t *)((uintptr_t)obj + 0x119a);
+    buf[0] = b0; buf[1] = b8; buf[2] = b16; buf[3] = b24; buf[4] = b32;
+    uint32_t w = ((uint32_t)(b8>>32) ^ (uint32_t)b8);
+    w *= 0x45d9f3b7u; w ^= b16; w *= W20; w ^= b24; w *= W21; w ^= b32; w ^= w>>16;
+    buf[5] = w;                                 // b40 校验和
+    *(volatile uint32_t*)((uintptr_t)obj + 0x0)  = ((uint32_t)(b0>>0x13)) ^ (b32 ^ 0x5f8a16e3u);
+    *(volatile uint64_t*)((uintptr_t)obj + 0x78) = (b0 ^ b8) ^ 0xa5c3e1f7b6d2489aULL;
+    *(volatile uint32_t*)((uintptr_t)obj + 0x8e) = ((uint32_t)(b0>>7)) ^ (b16 ^ 0x4a9b5206u);
+    *(volatile uint32_t*)((uintptr_t)obj + 0x92) = ((uint32_t)(b0>>0xd)) ^ (b24 ^ 0x8c1a73e5u);
+    return obj;
+}
+
+static void armFull(void) {
+    if (!g_targetBase) return;
+    @try {
+        uintptr_t g = kSessionBaseFile;         // 0x3ff000
+        // 门卫块 A（seed 0x6a0）与 C（seed 0x680=GATE0 → 过期项 x23=0）
+        w64(g+0x6a0, GATE0); writeGateBlock(g+0x6a0, GATE0);
+        w64(g+0x680, GATE0); writeGateBlock(g+0x680, GATE0);
+        // 过期(天卡/周卡)绕过：时间项归零，x23=0 → 恒在有效窗
+        w32(0x3fb000+0x98c, 0);
+        w32(0x3fb000+0x990, 1);
+        w32(0x3fb000+0x998, 0);                 // 必须 != -1
+        // 会话对象
+        void *obj = buildSessionObj();
+        w64(g+0x698, (uintptr_t)obj);
+        NSLog(@"[ARM] gates+expiry+session armed obj=%p", obj);
+    } @catch (NSException *e) { NSLog(@"[ARM] exc: %@", e); }
+}
+
+// ================= 4) 主动调用构建函数 =================
+typedef void (*buildFn)(void);
+static void callBuild(void) {
+    if (!g_targetBase) return;
+    buildFn fn = (buildFn)va(kBuildFnFile);
+    if (fn) fn();   // 内部14处校验全过才会 addSubview: 挂载 Metal 面板
+}
+
+// ================= 3b) 第二面板：iconOnClick（点左上角） =================
+// hook 真实 iconOnClick：先武装，再放行原实现 → 点击即出面板（实现见第4节）
+static void (*origIconClick)(id, SEL);          // 前向声明
+static void hookIconClick(id, SEL);             // 前向声明
+static void installIconHook(void) {
+    Class menu = objc_getClass("_0xD4E9A3C7");
+    Method m = menu ? class_getInstanceMethod(menu, sel_registerName("iconOnClick")) : NULL;
+    if (m) {
+        origIconClick = (void(*)(id,SEL))method_getImplementation(m);
+        method_setImplementation(m, (IMP)hookIconClick);
+        NSLog(@"[ICON] iconOnClick hooked (orig @%p)", origIconClick);
+    }
+}
+
+// ================= 4) 悬浮球 + 屏上动态分析台 =================
+static UIButton *ball = nil;
+static volatile int g_iconTapCount = 0;      // iconOnClick hook 命中计数
+static void hookIconClick(id self, SEL _cmd) {
+    g_iconTapCount++;
+    @try { armFull(); }
+    @catch (NSException *e) { NSLog(@"[ICON] arm exc: %@", e); }
+    if (origIconClick) origIconClick(self, _cmd);
+}
+
+@interface BallTarget : NSObject
+@property(nonatomic,strong) UILabel *bar;
 @end
-static _AceDiagHost *g_diagHost = nil;
-void ace_show_diag(void);
+@implementation BallTarget
+// 递归扫描视图树，找图标类实例（_0xD4E9A3C7：图标控制器/视图）
+- (UIView *)scanIconIn:(UIView *)v {
+    if (!v) return nil;
+    Class iconCls = objc_getClass("_0xD4E9A3C7");
+    if (iconCls && object_getClass(v) == iconCls) return v;
+    if ([v isKindOfClass:iconCls]) return v;
+    for (UIView *s in v.subviews) {
+        UIView *r = [self scanIconIn:s];
+        if (r) return r;
+    }
+    return nil;
+}
+- (void)probe {
+    // 1) 会话/门卫状态
+    uintptr_t obj = r64(kSessionBaseFile + kOffSessionObj);
+    uint32_t v = (uint32_t)r32(kSessionBaseFile + kOffVerifyResult);
+    uint32_t a = (uint32_t)r32(kSessionBaseFile + kOffActFlag);
+    // 2) 图标定位
+    UIView *icon = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        UIView *r = [self scanIconIn:w];
+        if (r) { icon = r; break; }
+    }
+    CGRect f = icon ? icon.frame : CGRectZero;
+    NSString *line2;
+    if (icon) {
+        BOOL hidden = icon.hidden;
+        CGFloat alpha = icon.alpha;
+        NSString *superName = icon.superview ? NSStringFromClass(object_getClass(icon.superview)) : @"nil";
+        line2 = [NSString stringWithFormat:@"iconF(%.0f,%.0f %.0fx%.0f) h=%d α=%.2f sv=%@",
+                 f.origin.x, f.origin.y, f.size.width, f.size.height, hidden, alpha, superName];
+        if (!hidden && alpha > 0.05 && CGRectIntersectsRect(f, icon.window.bounds))
+            line2 = [line2 stringByAppendingString:@" VISIBLE"];
+        else
+            line2 = [line2 stringByAppendingString:@" INVIS"];
+    } else {
+        line2 = @"icon=NOT-FOUND";
+    }
+    self.bar.text = [NSString stringWithFormat:@"658=%u obj=%p\n%@ tap=%d", v, (void*)obj, line2, g_iconTapCount];
+    // 详细打点（一次性）
+    NSLog(@"[PROBE] 658=%u act=%u sessionObj=%p", v, a, (void*)obj);
+    if (icon) {
+        NSLog(@"[PROBE] ICON=%@ at (%.0f,%.0f) hidden=%d alpha=%.2f superview=%@ win=%p",
+              NSStringFromClass(object_getClass(icon)), f.origin.x, f.origin.y, icon.hidden, icon.alpha,
+              NSStringFromClass(object_getClass(icon.superview)), (void*)icon.window);
+        // 若不可见，尝试程序化触发（=模拟点左上角）
+        if (icon.hidden || icon.alpha < 0.05) {
+            @try { if ([icon respondsToSelector:@selector(iconOnClick)]) [icon iconOnClick]; }
+            @catch (NSException *e) { NSLog(@"[PROBE] prog-icon exc: %@", e); }
+        }
+    }
+}
+- (void)tap {
+    @try {
+        armFull();
+        callBuild();
+        [self probe];
+    } @catch (NSException *e) { NSLog(@"[BALL] exc: %@", e); }
+}
+@end
 
-static void ace_refresh_label(void) {
-@try {
-if (![NSThread isMainThread]) {
-dispatch_async(dispatch_get_main_queue(), ^{ ace_refresh_label(); });
-return;
-}
-UIWindow *win = ace_window();
-if (!win) return;
-UIView *box = [win viewWithTag:0xACE1];
-UILabel *lbl = box ? [box viewWithTag:0xACE0] : nil;
-if (lbl) lbl.text = ace_status();
-} @catch (NSException *e) { }
-}
-
-// 激活 + 构建（点按钮触发）
-void ace_activate_and_build(void) {
-@try {
-st(@"ACT: 开始");
-uintptr_t base = ace_base();
-if (!base) { st(@"ACT: 未定位 ace 靶场"); return; }
-st([NSString stringWithFormat:@"ACT: base=0x%llx", (unsigned long long)base]);
-
-// 正确 gate 组（VM 双确认：三处校验全 PASS）
-*(volatile uint64_t *)(base + 0x3d6ed8) = 0xb75e8052babd72a6ULL;
-*(volatile uint32_t *)(base + 0x3d6ee0) = 0x2083b63c;
-*(volatile uint32_t *)(base + 0x3d6ee4) = 0x414d2423;
-*(volatile uint32_t *)(base + 0x3d6ee8) = 0x5210f48d;
-st(@"ACT: 门卫字已写 (0x3d6ed8..0x3d6ee8)");
-
-install_popup_hooks();
-setup_object(base);
-int r = patch_checks(base);
-st([NSString stringWithFormat:@"ACT: 补丁=%d", r]);
-
-st(@"ACT: 调用 0x109020 ...");
-((void (*)(void))(base + 0x109020))();
-st(@"ACT: 0x109020 调用完成");
-} @catch (NSException *e) {
-st([NSString stringWithFormat:@"ACT 异常: %@", e]);
-}
-ace_show_diag();
-}
-
-void ace_show_diag(void) {
-@try {
-dispatch_async(dispatch_get_main_queue(), ^{
-@try {
-UIWindow *win = ace_window();
-if (!win) { st(@"DIAG: 无 window"); return; }
-UIView *box = [win viewWithTag:0xACE1];
-if (!box) {
-box = [[UIView alloc] initWithFrame:CGRectMake(8, 100, win.bounds.size.width - 16, 260)];
-box.tag = 0xACE1;
-box.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
-UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 8, box.bounds.size.width - 16, box.bounds.size.height - 56)];
-lbl.tag = 0xACE0; lbl.numberOfLines = 0;
-lbl.font = [UIFont systemFontOfSize:10];
-lbl.textColor = [UIColor greenColor];
-[box addSubview:lbl];
-UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-btn.frame = CGRectMake(8, box.bounds.size.height - 44, box.bounds.size.width - 16, 36);
-btn.backgroundColor = [UIColor greenColor];
-[btn setTitle:@"激活 (gate+obj+patch+0x109020)" forState:UIControlStateNormal];
-[btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-if (!g_diagHost) g_diagHost = [_AceDiagHost new];
-[btn addTarget:g_diagHost action:@selector(tapActivate)
-forControlEvents:UIControlEventTouchUpInside];
-[box addSubview:btn];
-[win addSubview:box];
-[win bringSubviewToFront:box];
-}
-UILabel *lbl = [box viewWithTag:0xACE0];
-lbl.text = ace_status();
-st(@"DIAG: 自检条已上屏");
-} @catch (NSException *e) { NSLog(@"[ACE] DIAG err: %@", e); }
-});
-} @catch (NSException *e) { NSLog(@"[ACE] DIAG dispatch err: %@", e); }
-}
-
-static void ace_diag_auto(void) {
-dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-for (int i = 0; i < 120; i++) {
-@autoreleasepool {
-if (ace_window()) { ace_show_diag(); break; }
-}
-usleep(500000);
-}
-});
-}
-
-#pragma mark - 对外入口
-int ace_activate(void) {
-install_popup_hooks();
-uintptr_t base = ace_base();
-setup_object(base);
-int r = patch_checks(base);
-st([NSString stringWithFormat:@"ACE: 全部完成，补丁=%d", r]);
-return r;
+static void spawnBall(void) {
+    @try {
+        for (int i = 0; i < 100; i++) {            // 轮询等 keyWindow 最多 30s
+            @autoreleasepool {
+                UIWindow *win = UIApplication.sharedApplication.keyWindow;
+                if (win) {
+                    BallTarget *tgt = [BallTarget new];
+                    ball = [UIButton buttonWithType:UIButtonTypeSystem];
+                    ball.frame = CGRectMake(20, 120, 150, 72);
+                    ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1.0 alpha:0.85];
+                    ball.layer.cornerRadius = 12;
+                    UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
+                    bar.textColor = [UIColor whiteColor];
+                    bar.font = [UIFont systemFontOfSize:11];
+                    bar.numberOfLines = 0;
+                    bar.text = @"—";
+                    tgt.bar = bar;
+                    [ball addSubview:bar];
+                    [ball addTarget:tgt action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+                    [win addSubview:ball];
+                    [tgt probe];
+                    // 动态分析：每 2s 自动刷新图标/会话状态
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        [tgt probe];
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{ [tgt probe]; });
+                    });
+                    return;
+                }
+            }
+            usleep(300000);                        // 300ms
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[BALL] spawn exc: %@", e);
+    }
 }
 
+// ================= 构造入口 =================
 __attribute__((constructor))
-static void bypass_init(void) {
-st(@"INIT: dylib 载入");
-install_popup_hooks();
-ace_diag_auto();
+static void initBy(void) {
+    @autoreleasepool {
+        g_targetBase = findTargetBase();
+        NSLog(@"[BY] target base = %p", (void *)g_targetBase);
+        installHooks();
+        installIconHook();    // 第二面板：点左上角即出 Metal 菜单
+        // 启动 5s 后打印会话状态基线
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ logSessionState(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            spawnBall();
+        });
+    }
 }
