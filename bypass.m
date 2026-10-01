@@ -17,6 +17,7 @@
 #import <mach/vm_map.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
+void ace_activate_and_build(void);
 
 #pragma mark - 自检条状态（st 实时上屏，崩溃前最后一行=崩点）
 static NSMutableString *g_status = nil;
