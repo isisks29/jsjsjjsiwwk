@@ -85,6 +85,10 @@ static inline void w32(uintptr_t fileAddr, uint32_t v) {
 static inline uint64_t r64(uintptr_t fileAddr) {
     return *(volatile uint64_t *)va(fileAddr);
 }
+// 【修复】新增缺失 r32 读取函数
+static inline uint32_t r32(uintptr_t fileAddr) {
+    return *(volatile uint32_t *)va(fileAddr);
+}
 
 // ================= 1) 三件套：抑制卡密弹窗 =================
 // +[_0xD5A13E79 passwordForService:account:] → 恒 @"A"
@@ -302,11 +306,19 @@ static void hookIconClick(id self, SEL _cmd) {
     if (icon) {
         NSLog(@"[PROBE] ICON=%@ at (%.0f,%.0f) hidden=%d alpha=%.2f superview=%@ win=%p",
               NSStringFromClass(object_getClass(icon)), f.origin.x, f.origin.y, icon.hidden, icon.alpha,
-              NSStringFromClass(object_getClass(icon.superview)), (void*)icon.window);
+              NSStringFromClass(object_getClass(icon.superview)), (__bridge void*)icon.window);
+        // 【修复】强转至靶场自定义类，消除selector找不到编译错误
+        Class iconCls = objc_getClass("_0xD4E9A3C7");
+        id iconObj = icon;
         // 若不可见，尝试程序化触发（=模拟点左上角）
         if (icon.hidden || icon.alpha < 0.05) {
-            @try { if ([icon respondsToSelector:@selector(iconOnClick)]) [icon iconOnClick]; }
-            @catch (NSException *e) { NSLog(@"[PROBE] prog-icon exc: %@", e); }
+            @try {
+                if ([iconObj isKindOfClass:iconCls] && [iconObj respondsToSelector:@selector(iconOnClick)]) {
+                    ((void(*)(id,SEL))objc_msgSend)(iconObj, @selector(iconOnClick));
+                }
+            } @catch (NSException *e) {
+                NSLog(@"[PROBE] prog-icon exc: %@", e);
+            }
         }
     }
 }
