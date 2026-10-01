@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE 700
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -6,7 +7,6 @@
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
-#import <mach/mach_vm.h>
 #import <signal.h>
 #import <ucontext.h>
 #import <sys/mman.h>
