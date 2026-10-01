@@ -156,8 +156,8 @@ static void manualPatch11ffb0(void){
     for(int i=0;i<8;i++) saved[i] = p[i];
 
     uint32_t *tr = (uint32_t*)mmap(NULL, 0x1000,
-                                   PROT_READ|PROT_WRITE|PROT_EXEC,
-                                   MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+                               PROT_READ|PROT_WRITE|PROT_EXEC,
+                               MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
     if(tr == MAP_FAILED) return;
 
     for(int i=0;i<8;i++) tr[i] = saved[i];
