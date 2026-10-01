@@ -228,10 +228,8 @@ typedef void *(*msgGetter)(id, SEL);
 }
 - (void)tap {
     @try {
-        armFull();
-        callBuild();      // 旧build（不崩但无UI，保留）
-        callUI();         // 真·建UI入口 0x11fa74 → 0x120000 建图标+MTKView
-        [self probe];
+        armFull();          // 重写门卫（幂等）
+        [self probe];       // 只探测+强制开菜单，绝不调用建UI函数（防崩）
     } @catch (NSException *e) { NSLog(@"[BALL] exc: %@", e); }
 }
 @end
@@ -277,9 +275,30 @@ static void initBy(void) {
     @autoreleasepool {
         g_targetBase = findTargetBase();
         NSLog(@"[BY] base = %p", (void *)g_targetBase);
+        // 关键：加载即写门卫（0x120000 校验通过）——ace 构造函数 0x11fa74 在 __mod_init_func
+        // 中稍后运行时会自然走到 0x120000 建图标+MTKView（不靠我们手动调，避免崩）
+        armFull();
         installHooks();
         installBoolHook();
+        // 兜底：仅当渲染器确实未建成（说明 ace 构造函数已先于我们跑过且当时门卫为0）才补跑一次。
+        // 守卫：存在已含 _0x1E6B7A93/_0xD4E9A3C7 的窗口则跳过，避免 double-run 崩溃。
+        static dispatch_once_t onceUI;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            dispatch_once(&onceUI, ^{
+                @try {
+                    BOOL built = NO;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                    for (UIWindow *w in UIApplication.sharedApplication.windows)
+                        if ([objc_getClass("_0x1E6B7A93") isSubclassOfClass:[UIView class]] &&
+                            [w subviews].count > 0) { built = YES; break; }
+#pragma clang diagnostic pop
+                    if (!built) callUI();
+                } @catch (NSException *e) { NSLog(@"[UI] retry exc: %@", e); }
+            });
+        });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ armFull(); spawnBall(); });
+                       dispatch_get_main_queue(), ^{ spawnBall(); });
     }
 }
