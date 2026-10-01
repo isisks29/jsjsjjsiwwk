@@ -14,8 +14,8 @@ static const uintptr_t kSub11fa5cFile   = 0x11fa5c;
 #define MIX_K   0xD18DDB25u
 #define MIX_K1  0x1767CEDCu
 #define MIX_K2  0x5D41C293u
-#define W_A     0x8E4B1395u   // w20/w24
-#define W_B     0x1F3D6A71u   // w21/w25
+#define W_A     0x8E4B1395u
+#define W_B     0x1F3D6A71u
 
 static uintptr_t g_targetBase = 0;
 
@@ -34,28 +34,34 @@ static inline void w32(uintptr_t f,uint32_t v){ *(volatile uint32_t*)va(f)=v; }
 static inline uint64_t r64(uintptr_t f){ return *(volatile uint64_t*)va(f); }
 static inline uint32_t r32(uintptr_t f){ return *(volatile uint32_t*)va(f); }
 
-// ============ 阶段 ============
+// ===== 状态量 =====
 typedef NS_ENUM(int, Stage){ S_INIT=0, S_ARM, S_CALL, S_OK };
 static volatile int g_stage = S_INIT;
+static volatile int g_popupCount = 0;
+static volatile int g_hookPopup = 0;
+static volatile int g_hookIcon = 0;
+static volatile int g_callSub11fa5c = 0;
+static volatile int g_ballAlive = 0;
+static volatile int g_ballTried = 0;
+static volatile int g_refreshTick = 0;
+static UIButton *ball = nil;
+
 static NSString *stageName(int s){
     switch(s){ case S_INIT:return @"INIT"; case S_ARM:return @"ARM";
                case S_CALL:return @"CALL"; case S_OK:return @"OK"; }
     return @"?";
 }
 
-// ============ 开机毫秒 ============
 static uint64_t boot_ms(void){
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     return mach_absolute_time() * tb.numer / tb.denom / 1000000ULL;
 }
 
-// ============ 门卫哈希 ============
 static inline uint32_t mix(uint32_t x){
     x ^= x>>15; x *= W_B;
     x ^= x>>11; x *= W_A;
     x ^= x>>17; return x;
 }
-// seedAddr: 0x3ff6a0 或 0x3ff680
 static void writeGateTriple(uintptr_t seedAddr){
     uint64_t x  = r64(seedAddr) ^ CFG_C;
     uint32_t lo = (uint32_t)x, hi = (uint32_t)(x>>32);
@@ -67,7 +73,6 @@ static void writeGateTriple(uintptr_t seedAddr){
     w32(seedAddr + 0x10, v3);
 }
 
-// ============ 会话对象 ============
 static void* buildSessionObj(void){
     void *obj = calloc(1, 0x11c6);
     uint64_t b0=0x123456789abcdef0ULL, b8=0xfedcba9876543210ULL;
@@ -86,7 +91,6 @@ static void* buildSessionObj(void){
     return obj;
 }
 
-// ============ 武装 ============
 static void armFull(void){
     if(!g_targetBase) return;
     @try{
@@ -94,56 +98,78 @@ static void armFull(void){
         uint64_t now_ms  = boot_ms();
         uint64_t now_sec = now_ms / 1000;
 
-        // 门卫 #1：x20 = now_ms（毫秒窗口 [x20, x20+45000]）
         w64(g+0x6a0, CFG_C ^ now_ms);
         writeGateTriple(g+0x6a0);
 
-        // 门卫 #2：x23 = now_sec（秒窗口 [x23, x23+419520]）
         w64(g+0x680, CFG_C ^ now_sec);
         writeGateTriple(g+0x680);
 
-        // 会话对象
         w64(g+0x698, (uintptr_t)buildSessionObj());
-
-        // 成功锁存位
         w32(g+0x658, 1);
-
         g_stage = S_ARM;
-        NSLog(@"[ARM] ms=%llu 6a8=%08x 688=%08x obj=%p",
-              now_ms, r32(g+0x6a8), r32(g+0x688), (void*)r64(g+0x698));
-    }@catch(NSException*e){ NSLog(@"[ARM] %@",e); }
+    }@catch(NSException*e){}
 }
 
-// ============ 球 + 检条 ============
+// ===== 弹窗 hook =====
+static IMP g_origPresent = NULL;
+static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)){
+    if([vc isKindOfClass:[UIAlertController class]]){
+        g_popupCount++;
+        if(comp) comp();
+        return;
+    }
+    ((void(*)(id,SEL,UIViewController*,BOOL,void(^)(void)))g_origPresent)(self,_cmd,vc,anim,comp);
+}
+static void installPopupHook(void){
+    Method m = class_getInstanceMethod([UIViewController class],
+                                       sel_registerName("presentViewController:animated:completion:"));
+    if(m){
+        g_origPresent = method_getImplementation(m);
+        method_setImplementation(m, (IMP)hookPresent);
+        g_hookPopup = 1;
+    }
+}
+
+// ===== 检条 =====
 @interface BallTarget : NSObject
 @property(nonatomic,strong) UILabel *bar;
 @end
 @implementation BallTarget
 - (void)refresh{
+    g_refreshTick++;
     uintptr_t g = kSessionBaseFile;
     uint32_t v658 = g_targetBase ? r32(g+0x658) : 0;
     uint64_t obj  = g_targetBase ? r64(g+0x698) : 0;
+    uint32_t flag = g_targetBase ? r32(0x3fc000+0x348) : 0;
+
+    NSString *ballStr;
+    if(!g_ballTried) ballStr = @"球未试";
+    else if(!ball)   ballStr = @"球NULL";
+    else if(g_ballAlive) ballStr = @"球YES";
+    else             ballStr = @"球NO";
+
     self.bar.text = [NSString stringWithFormat:
-        @"[%@] 658=%u obj=%p\n"
-         "6a8=%08x 6ac=%08x 6b0=%08x\n"
-         "688=%08x 68c=%08x 690=%08x\n"
-         "348=%u",
-        stageName(g_stage), v658, (void*)obj,
-        r32(g+0x6a8), r32(g+0x6ac), r32(g+0x6b0),
-        r32(g+0x688), r32(g+0x68c), r32(g+0x690),
-        g_targetBase ? r32(0x3fc000+0x348) : 0];
+        @"[%@] 658=%u 348=%u\n"
+         "obj=%p\n"
+         "6a8=%08x 688=%08x\n"
+         "hook P=%d I=%d\n"
+         "弹窗=%d call5c=%d\n"
+         "%@ tick=%d",
+        stageName(g_stage), v658, flag, (void*)obj,
+        r32(g+0x6a8), r32(g+0x688),
+        g_hookPopup, g_hookIcon,
+        g_popupCount, g_callSub11fa5c,
+        ballStr, g_refreshTick];
 }
 - (void)tap{
     armFull();
     typedef void(*fn_t)(void);
     fn_t f = (fn_t)va(kSub11fa5cFile);
-    if(f){ g_stage = S_CALL; f(); g_stage = S_OK; }
+    if(f){ g_stage = S_CALL; g_callSub11fa5c++; f(); g_stage = S_OK; }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.5*NSEC_PER_SEC)),
                    dispatch_get_main_queue(),^{ [self refresh]; });
 }
 @end
-
-static UIButton *ball = nil;
 
 static UIWindow *findKeyWindow(void){
     UIApplication *app = UIApplication.sharedApplication;
@@ -163,7 +189,13 @@ static UIWindow *findKeyWindow(void){
     return nil;
 }
 
+static void updateBallAlive(void){
+    if(!ball){ g_ballAlive = 0; return; }
+    g_ballAlive = (ball.window != nil || ball.superview != nil) ? 1 : 0;
+}
+
 static void spawnBall(void){
+    g_ballTried = 1;
     @try{
         for(int i=0;i<600;i++){
             @autoreleasepool{
@@ -171,7 +203,7 @@ static void spawnBall(void){
                 if(win){
                     BallTarget *t = [BallTarget new];
                     ball = [UIButton buttonWithType:UIButtonTypeSystem];
-                    ball.frame = CGRectMake(20,120,270,180);
+                    ball.frame = CGRectMake(20,120,270,200);
                     ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.9];
                     ball.layer.cornerRadius = 12;
                     UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
@@ -185,35 +217,38 @@ static void spawnBall(void){
                     [win addSubview:ball];
                     [win bringSubviewToFront:ball];
                     [t refresh];
-                    NSLog(@"[BALL] spawned");
+                    // 自动刷新
+                    __block BallTarget *bt = t;
+                    void (^tick)(void) = ^{
+                        [bt refresh];
+                        updateBallAlive();
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), tick);
+                    };
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), tick);
                     return;
                 }
             }
             usleep(500000);
         }
-        NSLog(@"[BALL] no window");
-    }@catch(NSException*e){ NSLog(@"[BALL] %@",e); }
+    }@catch(NSException*e){}
 }
 
-// ============ 入口 ============
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
         g_targetBase = findTargetBase();
-        NSLog(@"[BY] base=%p", (void*)g_targetBase);
-
-        // ① 立即武装
+        installPopupHook();
         armFull();
 
-        // ② 1秒后主动触发验证（建定时器 + 立即跑一次 0x11ffb0）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
             typedef void(*fn_t)(void);
             fn_t f = (fn_t)va(kSub11fa5cFile);
-            if(f){ g_stage = S_CALL; NSLog(@"[BY] call sub_11fa5c"); f(); }
+            if(f){ g_stage = S_CALL; g_callSub11fa5c++; f(); }
         });
 
-        // ③ 3秒后挂球
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{ spawnBall(); });
     }
