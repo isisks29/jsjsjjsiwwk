@@ -14,7 +14,6 @@
 #import <string.h>
 
 static const uintptr_t kSessionBaseFile = 0x3ff000;
-static const uintptr_t kSub11fa5cFile   = 0x11fa5c;
 static const uintptr_t k11ffb0File      = 0x11ffb0;
 
 #define CFG_C   0xB75E8052BABD72A6ULL
@@ -48,7 +47,8 @@ static volatile int g_ballAlive = 0;
 static volatile int g_ballTried = 0;
 static volatile int g_refreshTick = 0;
 static volatile int g_armDone = 0;
-static volatile int g_hooked11ffb0 = 0;
+static volatile int g_patched11ffb0 = 0;
+static volatile int g_mmapOK = 0;
 static volatile int g_instrCount = 0;
 static UIButton *ball = nil;
 
@@ -122,56 +122,78 @@ static void armFull(void){
         writeGateTriple(g+0x6a0);
         w64(g+0x680, CFG_C ^ now_sec);
         writeGateTriple(g+0x680);
-
         w64(g+0x698, (uintptr_t)buildSessionObj());
         g_armDone = 1;
     }@catch(NSException*e){}
 }
 
+// ===== 前置声明 =====
+static void armFull_entry(void);
 
-
-
-
-// ===== 手写 patch 兜底（Dobby 无效时用）=====
+// ===== 手写 patch：入口换成跳板，先 arm 再执行原指令 =====
 static void manualPatch11ffb0(void){
     if(!g_targetBase) return;
     uint32_t *p = (uint32_t*)va(k11ffb0File);
 
-    // 检查是否已被改写（Dobby 生效则第一条不再是 sub sp）
+    // 检查是否已是 sub sp,sp,#0x150（0xD10043FF）
     if((p[0] & 0xFFC003FF) != 0xD10043FF) return;
 
     static uint32_t saved[8];
     for(int i=0;i<8;i++) saved[i] = p[i];
 
+    // 使用数字常量：0x1000=MAP_ANON, 0x0002=MAP_PRIVATE
     uint32_t *tr = (uint32_t*)mmap(NULL, 0x1000,
-                               PROT_READ|PROT_WRITE|PROT_EXEC,
-                               MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
-    if(tr == MAP_FAILED) return;
+                                   PROT_READ|PROT_WRITE|PROT_EXEC,
+                                   0x1000|0x0002, -1, 0);
+    if(tr == MAP_FAILED){
+        g_mmapOK = -1;
+        return;
+    }
+    g_mmapOK = 1;
 
-    for(int i=0;i<8;i++) tr[i] = saved[i];
+    // trampoline 布局：
+    // [0]  adrp x16, armFull_entry页
+    // [1]  add  x16, x16, #offset
+    // [2]  br   x16
+    // [3..10] 原 8 条指令
+    // [11] b 回 0x11ffb0+32
+    uint64_t entryAddr = (uint64_t)&armFull_entry;
+    uint64_t trAddr    = (uint64_t)tr;
+    uint64_t trPage    = trAddr & ~0xFFFULL;
+    int64_t  adrpImm   = ((int64_t)((entryAddr & ~0xFFFULL) - trPage)) >> 12;
+    uint32_t addImm    = (uint32_t)(entryAddr & 0xFFF);
+
+    tr[0] = 0x90000010 | (((uint32_t)adrpImm & 0x1FFFFF) << 5);
+    tr[1] = 0x91000210 | ((addImm & 0xFFF) << 10);
+    tr[2] = 0xD61F0200;
+
+    for(int i=0;i<8;i++) tr[3+i] = saved[i];
+
     uint64_t back = (uint64_t)va(k11ffb0File + 32);
-    uint64_t cur  = (uint64_t)&tr[8];
+    uint64_t cur  = (uint64_t)&tr[11];
     int64_t  off  = ((int64_t)(back - cur)) >> 2;
-    tr[8] = 0x14000000 | (off & 0x03FFFFFF);
+    tr[11] = 0x14000000 | (off & 0x03FFFFFF);
 
-    // patch: adrp x16, armFn ; add x16, x16, off ; br x16 ; b tramp
-    uint64_t armAddr = (uint64_t)&armFull;
-    uint64_t pcAddr  = (uint64_t)p;
-    uint64_t armPage = armAddr & ~0xFFFULL;
-    uint64_t pcPage  = pcAddr  & ~0xFFFULL;
-    int64_t  adrpImm = ((int64_t)(armPage - pcPage)) >> 12;
-    uint32_t addImm  = (uint32_t)(armAddr & 0xFFF);
+    // 入口 patch：adrp x16,tr页 ; add x16,x16,off ; br x16 ; nop
+    uint64_t pcPage  = (uint64_t)p & ~0xFFFULL;
+    int64_t  trAdrp  = ((int64_t)(trPage - pcPage)) >> 12;
+    uint32_t trAdd   = (uint32_t)(trAddr & 0xFFF);
 
-    p[0] = 0x90000010 | (((uint32_t)adrpImm & 0x1FFFFF) << 5);  // adrp x16
-    p[1] = 0x91000210 | ((addImm & 0xFFF) << 10);                // add x16,x16,#imm
-    p[2] = 0xD61F0200;                                            // br x16
-    uint64_t trAddr = (uint64_t)tr;
-    uint64_t nextPC = (uint64_t)va(k11ffb0File + 16);
-    int64_t  bOff   = ((int64_t)(trAddr - nextPC)) >> 2;
-    p[3] = 0x14000000 | (bOff & 0x03FFFFFF);                     // b tramp
+    p[0] = 0x90000010 | (((uint32_t)trAdrp & 0x1FFFFF) << 5);
+    p[1] = 0x91000210 | ((trAdd & 0xFFF) << 10);
+    p[2] = 0xD61F0200;
+    p[3] = 0xD503201F; // nop
 
     __builtin___clear_cache((char*)p, (char*)p + 32);
-    __builtin___clear_cache((char*)tr, (char*)tr + 36);
+    __builtin___clear_cache((char*)tr, (char*)tr + 48);
+
+    g_patched11ffb0 = 1;
+}
+
+// 跳板先执行这个 → arm 一次 → 再走原指令
+static void armFull_entry(void){
+    g_instrCount++;
+    armFull();
 }
 
 // ===== 弹窗 hook =====
@@ -217,17 +239,21 @@ static void installPopupHook(void){
         @"658=%u 348=%u\n"
          "6a0=%llx 680=%llx\n"
          "6a8=%08x 688=%08x\n"
-         "obj=%p sc=%llx tc=%llx\n"
+         "obj=%p\n"
+         "sc=%llx tc=%llx\n"
          "hook=%d 弹=%d arm=%d\n"
-         "dby=%d ins=%d 球=%@ tick=%d\n"
+         "pat=%d mm=%d ins=%d\n"
+         "球=%@ tick=%d\n"
          "crash=%d pc=%llx\n"
          "far=%llx sig=%d",
         r32(g+0x658), r32(0x3fc000+0x348),
         r64(g+0x6a0), r64(g+0x680),
         r32(g+0x6a8), r32(g+0x688),
-        (void*)obj, sc, tc,
+        (void*)obj,
+        sc, tc,
         g_hookPopup, g_popupCount, g_armDone,
-        g_hooked11ffb0, g_instrCount, ballStr, g_refreshTick,
+        g_patched11ffb0, g_mmapOK, g_instrCount,
+        ballStr, g_refreshTick,
         g_crashed, g_crashPC,
         g_crashFAR, g_crashSig];
 }
@@ -270,7 +296,7 @@ static void spawnBall(void){
                 if(win){
                     BallTarget *t = [BallTarget new];
                     ball = [UIButton buttonWithType:UIButtonTypeSystem];
-                    ball.frame = CGRectMake(20,120,270,240);
+                    ball.frame = CGRectMake(20,120,270,260);
                     ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.9];
                     ball.layer.cornerRadius = 12;
                     UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
@@ -304,19 +330,15 @@ static void spawnBall(void){
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{
-            // 先挂球，验证 constructor 活着
-            spawnBall();
-        });
-        // 后面的 arm / patch 都放 dispatch_after 里，不要阻塞 constructor
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2.5*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{
-            g_targetBase = findTargetBase();
-            installSigHandler();
-            installPopupHook();
-            armFull();
-            @try { manualPatch11ffb0(); g_hooked11ffb0 = 2; } @catch(NSException*e){}
-        });
+        g_targetBase = findTargetBase();
+        installSigHandler();
+        installPopupHook();
+        armFull();
+
+        @try { manualPatch11ffb0(); }
+        @catch(NSException *e) { }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(),^{ spawnBall(); });
     }
 }
