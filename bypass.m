@@ -34,23 +34,14 @@ static inline void w32(uintptr_t f,uint32_t v){ *(volatile uint32_t*)va(f)=v; }
 static inline uint64_t r64(uintptr_t f){ return *(volatile uint64_t*)va(f); }
 static inline uint32_t r32(uintptr_t f){ return *(volatile uint32_t*)va(f); }
 
-// ===== 状态量 =====
-typedef NS_ENUM(int, Stage){ S_INIT=0, S_ARM, S_CALL, S_OK };
-static volatile int g_stage = S_INIT;
+// ===== 状态量（全部显示在检条）=====
 static volatile int g_popupCount = 0;
 static volatile int g_hookPopup = 0;
-static volatile int g_hookIcon = 0;
-static volatile int g_callSub11fa5c = 0;
 static volatile int g_ballAlive = 0;
 static volatile int g_ballTried = 0;
 static volatile int g_refreshTick = 0;
+static volatile int g_armDone = 0;
 static UIButton *ball = nil;
-
-static NSString *stageName(int s){
-    switch(s){ case S_INIT:return @"INIT"; case S_ARM:return @"ARM";
-               case S_CALL:return @"CALL"; case S_OK:return @"OK"; }
-    return @"?";
-}
 
 static uint64_t boot_ms(void){
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
@@ -105,8 +96,9 @@ static void armFull(void){
         writeGateTriple(g+0x680);
 
         w64(g+0x698, (uintptr_t)buildSessionObj());
-        w32(g+0x658, 1);
-        g_stage = S_ARM;
+        // 注意：不再写 0x658（它是 UserDefaults 缓存，非验证位）
+
+        g_armDone = 1;
     }@catch(NSException*e){}
 }
 
@@ -115,7 +107,6 @@ static IMP g_origPresent = NULL;
 static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)){
     if([vc isKindOfClass:[UIAlertController class]]){
         g_popupCount++;
-        if(comp) comp();
         return;
     }
     ((void(*)(id,SEL,UIViewController*,BOOL,void(^)(void)))g_origPresent)(self,_cmd,vc,anim,comp);
@@ -138,34 +129,38 @@ static void installPopupHook(void){
 - (void)refresh{
     g_refreshTick++;
     uintptr_t g = kSessionBaseFile;
-    uint32_t v658 = g_targetBase ? r32(g+0x658) : 0;
-    uint64_t obj  = g_targetBase ? r64(g+0x698) : 0;
-    uint32_t flag = g_targetBase ? r32(0x3fc000+0x348) : 0;
+
+    if(!g_targetBase){
+        self.bar.text = @"[NO BASE]";
+        return;
+    }
+
+    uint32_t v658 = r32(g+0x658);
+    uint64_t obj  = r64(g+0x698);
+    uint32_t flag = r32(0x3fc000+0x348);
+    uint64_t sc   = r64(0x3fc000+0x338);   // 观察者 token
+    uint64_t tc   = r64(0x3fc000+0x340);   // timer source
 
     NSString *ballStr;
-    if(!g_ballTried) ballStr = @"球未试";
-    else if(!ball)   ballStr = @"球NULL";
-    else if(g_ballAlive) ballStr = @"球YES";
-    else             ballStr = @"球NO";
+    if(!g_ballTried) ballStr = @"未试";
+    else if(!ball)   ballStr = @"NULL";
+    else if(g_ballAlive) ballStr = @"YES";
+    else             ballStr = @"NO";
 
     self.bar.text = [NSString stringWithFormat:
-        @"[%@] 658=%u 348=%u\n"
-         "obj=%p\n"
+        @"658=%u 348=%u obj=%p\n"
+         "sc=%llx tc=%llx\n"
          "6a8=%08x 688=%08x\n"
-         "hook P=%d I=%d\n"
-         "弹窗=%d call5c=%d\n"
-         "%@ tick=%d",
-        stageName(g_stage), v658, flag, (void*)obj,
+         "hook=%d 弹=%d 弹窗=%d\n"
+         "arm=%d 球=%@ tick=%d",
+        v658, flag, (void*)obj,
+        sc, tc,
         r32(g+0x6a8), r32(g+0x688),
-        g_hookPopup, g_hookIcon,
-        g_popupCount, g_callSub11fa5c,
-        ballStr, g_refreshTick];
+        g_hookPopup, g_popupCount, g_popupCount,
+        g_armDone, ballStr, g_refreshTick];
 }
 - (void)tap{
     armFull();
-    typedef void(*fn_t)(void);
-    fn_t f = (fn_t)va(kSub11fa5cFile);
-    if(f){ g_stage = S_CALL; g_callSub11fa5c++; f(); g_stage = S_OK; }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.5*NSEC_PER_SEC)),
                    dispatch_get_main_queue(),^{ [self refresh]; });
 }
@@ -217,7 +212,7 @@ static void spawnBall(void){
                     [win addSubview:ball];
                     [win bringSubviewToFront:ball];
                     [t refresh];
-                    // 自动刷新
+
                     __block BallTarget *bt = t;
                     void (^tick)(void) = ^{
                         [bt refresh];
@@ -239,17 +234,16 @@ __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
         g_targetBase = findTargetBase();
-        installPopupHook();
-        armFull();
 
+        // 主队列上延后装 hook + arm
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
-            typedef void(*fn_t)(void);
-            fn_t f = (fn_t)va(kSub11fa5cFile);
-            if(f){ g_stage = S_CALL; g_callSub11fa5c++; f(); }
+            installPopupHook();
+            armFull();
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
+        // 4 秒后挂球
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(4*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{ spawnBall(); });
     }
 }
