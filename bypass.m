@@ -105,18 +105,35 @@ static void writeGateBlock(uintptr_t base, uint64_t seed) {
     w32(base+0x10, w8);
 }
 static void* buildSessionObj(void) {
+    // 精确复现 0x120334-0x12054c 建UI块对会话对象 [0x698] 的 5 处字段校验
     void *obj = calloc(1, 0x1200);
     uint64_t b0 = 0x123456789abcdef0ULL, b8 = 0xfedcba9876543210ULL;
     uint32_t b16 = 0x11223344, b24 = 0x55667788, b32 = 0x99aabbcc;
     uint64_t *buf = (uint64_t *)((uintptr_t)obj + 0x119a);
     buf[0]=b0; buf[1]=b8; buf[2]=b16; buf[3]=b24; buf[4]=b32;
-    uint32_t w = ((uint32_t)(b8>>32) ^ (uint32_t)b8);
-    w *= 0x45d9f3b7u; w ^= b16; w *= W20; w ^= b24; w *= W21; w ^= b32; w ^= w>>16;
-    buf[5]=w;
-    *(volatile uint32_t*)((uintptr_t)obj + 0x0)  = ((uint32_t)(b0>>0x13)) ^ (b32 ^ 0x5f8a16e3u);
-    *(volatile uint64_t*)((uintptr_t)obj + 0x78) = (b0 ^ b8) ^ 0xa5c3e1f7b6d2489aULL;
-    *(volatile uint32_t*)((uintptr_t)obj + 0x8e) = ((uint32_t)(b0>>7)) ^ (b16 ^ 0x4a9b5206u);
-    *(volatile uint32_t*)((uintptr_t)obj + 0x92) = ((uint32_t)(b0>>0xd)) ^ (b24 ^ 0x8c1a73e5u);
+    // buf[5] = fmix32( hi32(b8)~lo32(b8) mix, 0x45d9f3b7,^b16,0x8e4b1395,^b24,0x1f3d6a71,^b32 ) ^>>16
+    // mix(a)= (0xe53db4f3 & ~a) | (a & 0x6d12354)
+#define MIX_E(a) ((uint32_t)((0xe53db4f3u & ~(uint32_t)(a)) | ((uint32_t)(a) & 0x06d12354u)))
+    uint32_t w11_ = MIX_E((uint32_t)(b8>>32)) ^ MIX_E((uint32_t)b8);
+    uint32_t w9_ = (uint32_t)((w11_ * 0x45d9f3b7u) & 0xffffffffu);
+    w9_ ^= b16; w9_ = (uint32_t)((w9_ * 0x8e4b1395u) & 0xffffffffu);
+    w9_ ^= b24; w9_ = (uint32_t)((w9_ * 0x1f3d6a71u) & 0xffffffffu);
+    w9_ ^= b32; w9_ ^= w9_>>16;
+    buf[5] = w9_;
+    // [obj+0] = (b32 ^ (b0>>19)) ^ 0xe2381705 ^ 0xbdb21e6
+    *(volatile uint32_t*)((uintptr_t)obj + 0x0)  = (uint32_t)(((uint32_t)(b0>>19)) ^ b32) ^ 0xe2381705u ^ 0x0bdb21e6u;
+    // [obj+0x78] = ((b0^b8) ^ 0xaa72c5aa2901395a) ^ 0x0fb1245d9fd371c0
+    *(volatile uint64_t*)((uintptr_t)obj + 0x78) = ((b0 ^ b8) ^ 0xaa72c5aa2901395aULL) ^ 0x0fb1245d9fd371c0ULL;
+    // [obj+0x8e] = mix(b16) ^ mix(b0>>7) ^ 0x4a9b5206   mix2(a)=(0x99f38047&~a)|(a&0x40a34f35)
+    // [obj+0x92] = mix(b24) ^ mix(b0>>13) ^ 0x8c1a73e5  mix3(a)=(0x1f67e042&~a)|(a&0x2397d106)
+    uint32_t s8e = ((0x99f38047u & ~b16) | (b16 & 0x40a34f35u)) ^
+                   ((0x99f38047u & ~(uint32_t)(b0>>7)) | ((uint32_t)(b0>>7) & 0x40a34f35u));
+    s8e ^= 0x4a9b5206u;
+    *(volatile uint32_t*)((uintptr_t)obj + 0x8e) = s8e;
+    uint32_t s92 = ((0x1f67e042u & ~b24) | (b24 & 0x2397d106u)) ^
+                   ((0x1f67e042u & ~(uint32_t)(b0>>13)) | ((uint32_t)(b0>>13) & 0x2397d106u));
+    s92 ^= 0x8c1a73e5u;
+    *(volatile uint32_t*)((uintptr_t)obj + 0x92) = s92;
     return obj;
 }
 static void armFull(void) {
@@ -142,6 +159,12 @@ static void armFull(void) {
         w32(0x3fb000+0x98c, 0);
         w32(0x3fb000+0x990, 1);
         w32(0x3fb000+0x998, 0);
+        // ===== 时间窗授权检查(0x1202a0/0x1202cc)=====
+        // v=(now*[0x34c])/[0x350] 需满足: 1.0e6<=v<=4.5e10 => [0x34c]=1,[0x350]=1000 恒过
+        // 设 init 标志跳过 0x14fbd8 惰性初始化，直接喂我们的值
+        w8(0x3fc000+0x354, 1);
+        w32(0x3fc000+0x34c, 1);
+        w32(0x3fc000+0x350, 1000);
         // 构建函数门卫
         w64(kGateBaseFile + kOffGate0, GATE0);
         w64(kGateBaseFile + kOffG1, 0xbb3dc5bfULL);
