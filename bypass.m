@@ -194,7 +194,6 @@ static void installHooks(void) {
                     v.superview ? NSStringFromClass([v.superview class]) : @"nil"];
                 [s appendFormat:@"win=%p\n", (__bridge void*)v.window];
 
-                // 枚举前 5 个子视图
                 for(int i=0;i<(int)v.subviews.count && i<5;i++){
                     UIView *sub = v.subviews[i];
                     [s appendFormat:@"  %d:%@ h=%d a=%.2f\n",
@@ -204,6 +203,28 @@ static void installHooks(void) {
             }@catch(NSException*e){ [s appendString:@"exc\n"]; }
         }
     }
+
+    // 扫描所有 window 层级，找 _0x1E6B7A93 / MTKView
+    @try{
+        __block void (^scan)(UIView*, int) = NULL;
+        scan = ^(UIView *v, int depth){
+            if(depth > 4) return;
+            NSString *cls = NSStringFromClass([v class]);
+            if([cls containsString:@"1E6B7A93"] || [cls containsString:@"MTKView"]){
+                [s appendFormat:@"HIT %@ f=%.0f,%.0f,%.0f,%.0f h=%d\n",
+                    cls, v.frame.origin.x, v.frame.origin.y,
+                    v.frame.size.width, v.frame.size.height, v.hidden];
+            }
+            for(UIView *sub in v.subviews) scan(sub, depth+1);
+        };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        for(UIWindow *win in UIApplication.sharedApplication.windows){
+            scan(win, 0);
+        }
+#pragma clang diagnostic pop
+    }@catch(NSException*e){ [s appendString:@"scan exc\n"]; }
+
     self.lbl.text = s;
 }
 - (void)tap{ [self refresh]; }
