@@ -41,10 +41,117 @@ static void enumerateAllImages(void){
 
 static uintptr_t findTargetBase(void){
     for(int i=0;i<g_nimg;i++){
-        if(strcasestr(g_imgs[i].name, "ace") || strcasestr(g_imgs[i].name, "balls"))
-            return g_imgs[i].hdr;
+        if(strcasestr(g_imgs[i].name, "ballsace")) return g_imgs[i].hdr;
+    }
+    for(int i=0;i<g_nimg;i++){
+        if(strcasestr(g_imgs[i].name, "ace")) return g_imgs[i].hdr;
     }
     return 0;
+}
+
+static inline void *va(uintptr_t f){ return (void*)(g_targetBase+f); }
+static inline void w64(uintptr_t f,uint64_t v){ *(volatile uint64_t*)va(f)=v; }
+static inline void w32(uintptr_t f,uint32_t v){ *(volatile uint32_t*)va(f)=v; }
+static inline uint64_t r64(uintptr_t f){ return *(volatile uint64_t*)va(f); }
+static inline uint32_t r32(uintptr_t f){ return *(volatile uint32_t*)va(f); }
+
+// ===== 状态 =====
+static volatile int g_popupCount = 0;
+static volatile int g_hookPopup = 0;
+static volatile int g_armDone = 0;
+static volatile int g_patchedConnect = 0;
+static volatile int g_called5c = 0;
+
+// ===== 常量 =====
+static const uintptr_t kSessionBaseFile = 0x3ff000;
+#define CFG_C   0xB75E8052BABD72A6ULL
+#define MIX_K   0xD18DDB25u
+#define MIX_K1  0x1767CEDCu
+#define MIX_K2  0x5D41C293u
+#define W_A     0x8E4B1395u
+#define W_B     0x1F3D6A71u
+
+static uint64_t boot_ms(void){
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    return mach_absolute_time() * tb.numer / tb.denom / 1000000ULL;
+}
+
+static inline uint32_t mix(uint32_t x){
+    x ^= x>>15; x *= W_B;
+    x ^= x>>11; x *= W_A;
+    x ^= x>>17; return x;
+}
+static void writeGateTriple(uintptr_t seedAddr){
+    uint64_t x  = r64(seedAddr) ^ CFG_C;
+    uint32_t lo = (uint32_t)x, hi = (uint32_t)(x>>32);
+    uint32_t v1 = mix((lo^hi) ^ MIX_K);
+    w32(seedAddr + 0x08, v1);
+    uint32_t v2 = mix(v1 ^ MIX_K1) ^ lo;
+    w32(seedAddr + 0x0C, v2);
+    uint32_t v3 = mix(v2 ^ MIX_K2) ^ hi;
+    w32(seedAddr + 0x10, v3);
+}
+
+static void* buildSessionObj(void){
+    void *obj = calloc(1, 0x11c6);
+    uint64_t b0=0x123456789abcdef0ULL, b8=0xfedcba9876543210ULL;
+    uint32_t b16=0x11223344, b24=0x55667788, b32=0x99aabbcc;
+    uint64_t *P = (uint64_t*)((uintptr_t)obj + 0x119a);
+    P[0]=b0; P[1]=b8; P[2]=b16; P[3]=b24; P[4]=b32;
+
+    uint32_t h = ((uint32_t)(b8>>32) ^ (uint32_t)b8) * 0x45D9F3B7u;
+    h ^= b16; h *= W_A; h ^= b24; h *= W_B; h ^= b32; h ^= h>>16;
+    *(uint32_t*)((uintptr_t)obj + 0x11c2) = h;
+
+    *(uint32_t*)((uintptr_t)obj + 0x0)  = (b32 ^ (uint32_t)(b0>>19)) ^ 0x5F8A16E3u;
+    *(uint64_t*)((uintptr_t)obj + 0x78) = b0 ^ b8 ^ 0xA5C3E1F7B6D2489AULL;
+    *(uint32_t*)((uintptr_t)obj + 0x8e) = (b16 ^ (uint32_t)(b0>>7))  ^ 0x4A9B5206u;
+    *(uint32_t*)((uintptr_t)obj + 0x92) = (b24 ^ (uint32_t)(b0>>13)) ^ 0x8C1A73E5u;
+    return obj;
+}
+
+static void armFull(void){
+    if(!g_targetBase) return;
+    @try{
+        uintptr_t g = kSessionBaseFile;
+        uint64_t now_ms  = boot_ms();
+        uint64_t now_sec = now_ms / 1000;
+
+        w64(g+0x6a0, CFG_C ^ now_ms);
+        writeGateTriple(g+0x6a0);
+        w64(g+0x680, CFG_C ^ now_sec);
+        writeGateTriple(g+0x680);
+        w64(g+0x698, (uintptr_t)buildSessionObj());
+        g_armDone = 1;
+    }@catch(NSException*e){}
+}
+
+static void patchConnectFail(void){
+    if(!g_targetBase) return;
+    uint32_t *p = (uint32_t*)va(0xd28d0);
+    if(p[0] == 0xB90B07FF) return;
+    p[0] = 0xB90B07FF;
+    sys_icache_invalidate(p, 4);
+    g_patchedConnect = 1;
+}
+
+// ===== 弹窗 hook =====
+static IMP g_origPresent = NULL;
+static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)){
+    if([vc isKindOfClass:[UIAlertController class]]){
+        g_popupCount++;
+        return;
+    }
+    ((void(*)(id,SEL,UIViewController*,BOOL,void(^)(void)))g_origPresent)(self,_cmd,vc,anim,comp);
+}
+static void installPopupHook(void){
+    Method m = class_getInstanceMethod([UIViewController class],
+                                       sel_registerName("presentViewController:animated:completion:"));
+    if(m){
+        g_origPresent = method_getImplementation(m);
+        method_setImplementation(m, (IMP)hookPresent);
+        g_hookPopup = 1;
+    }
 }
 
 // ===== 球 + label =====
@@ -57,6 +164,20 @@ static uintptr_t findTargetBase(void){
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"tick=%d n=%d\n", g_tick, g_nimg];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
+    if(g_targetBase){
+        uintptr_t g = kSessionBaseFile;
+        [s appendFormat:@"348=%u 658=%u\n",
+            r32(0x3fc000+0x348), r32(g+0x658)];
+        [s appendFormat:@"6a0=%llx\n680=%llx\n", r64(g+0x6a0), r64(g+0x680)];
+        [s appendFormat:@"obj=%p\n", (void*)r64(g+0x698)];
+        [s appendFormat:@"v330=%p\n", (void*)r64(0x3fc000+0x330)];
+        [s appendFormat:@"sc=%llx tc=%llx\n",
+            r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
+        [s appendFormat:@"arm=%d cn=%d c5=%d\n", g_armDone, g_patchedConnect, g_called5c];
+    }
+    [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
+
+    // 列出前 12 个 image
     for(int i=0;i<g_nimg && i<12;i++){
         const char *bn = strrchr(g_imgs[i].name,'/');
         bn = bn ? bn+1 : g_imgs[i].name;
@@ -78,10 +199,10 @@ static void spawnBall(void){
         UIWindow *w = wins[0];
         BallTarget *t = [BallTarget new];
 
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10,60,340,500)];
-        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(5,40,360,600)];
+        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
         lbl.textColor = [UIColor whiteColor];
-        lbl.font = [UIFont systemFontOfSize:12];
+        lbl.font = [UIFont systemFontOfSize:10];
         lbl.numberOfLines = 0;
         lbl.text = @"init";
         lbl.userInteractionEnabled = YES;
@@ -90,9 +211,9 @@ static void spawnBall(void){
         [w bringSubviewToFront:lbl];
 
         UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-        b.frame = CGRectMake(w.bounds.size.width-80, w.bounds.size.height-150, 60, 60);
+        b.frame = CGRectMake(w.bounds.size.width-70, w.bounds.size.height-140, 55, 55);
         b.backgroundColor = [UIColor redColor];
-        b.layer.cornerRadius = 30;
+        b.layer.cornerRadius = 27;
         [b addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
         [w addSubview:b];
         [w bringSubviewToFront:b];
@@ -106,8 +227,19 @@ static void initBy(void){
     @autoreleasepool{
         enumerateAllImages();
         g_targetBase = findTargetBase();
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
+            installPopupHook();
+            armFull();
+            patchConnectFail();
+
+            // 手动调 sub_11fa5c
+            if(g_targetBase){
+                typedef void(*fn_t)(void);
+                fn_t f = (fn_t)va(0x11fa5c);
+                if(f){ f(); g_called5c = 1; }
+            }
             spawnBall();
         });
     }
