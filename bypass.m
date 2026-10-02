@@ -19,6 +19,8 @@ static volatile uint32_t g_drawW0 = 0, g_drawW1 = 0;
 static volatile int g_tick = 0;
 static uintptr_t g_targetBase = 0;
 
+static volatile int g_patchRet = 0;
+
 // ===== 枚举 image =====
 #define MAX_IMG 256
 typedef struct { char name[256]; uintptr_t hdr; } ImgInfo;
