@@ -261,28 +261,37 @@ static UIButton *ball = nil;
 
 static void spawnBall(void){
     @try{
-        UIWindow *win = nil;
+        NSArray *wins = nil;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        win = UIApplication.sharedApplication.keyWindow;
-        if(!win && UIApplication.sharedApplication.windows.count>0)
-            win = UIApplication.sharedApplication.windows.firstObject;
+        wins = UIApplication.sharedApplication.windows;
 #pragma clang diagnostic pop
-        if(!win) return;
+
+        if(!wins || wins.count == 0){
+            // 没窗口，1 秒后重试
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+                           dispatch_get_main_queue(),^{ spawnBall(); });
+            return;
+        }
 
         BallTarget *t = [BallTarget new];
         ball = [UIButton buttonWithType:UIButtonTypeSystem];
-        ball.frame = CGRectMake(20,120,200,100);
-        ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.9];
+        ball.frame = CGRectMake(50, 200, 240, 120);
+        ball.backgroundColor = [UIColor redColor];   // 鲜红色，肯定能看到
         UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
         bar.textColor = [UIColor whiteColor];
-        bar.font = [UIFont systemFontOfSize:12];
+        bar.font = [UIFont systemFontOfSize:14];
         bar.numberOfLines = 0;
         bar.text = @"init";
         t.bar = bar;
         [ball addSubview:bar];
         [ball addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:ball];
+
+        // 挂到每个 window 上
+        for(UIWindow *w in wins){
+            [w addSubview:ball];
+            [w bringSubviewToFront:ball];
+        }
         [t refresh];
     }@catch(NSException*e){}
 }
