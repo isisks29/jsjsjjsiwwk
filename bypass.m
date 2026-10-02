@@ -166,24 +166,30 @@ static void installHooks(void) {
 @property(nonatomic,strong) UILabel *lbl;
 @end
 @implementation BallTarget
-if(g_targetBase){
-    uint32_t w = *(volatile uint32_t*)va(0xd28d0);
-    [s appendFormat:@"w0xd28d0=%08x\n", w];
+- (void)refresh{
+    g_tick++;
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"tick=%d n=%d\n", g_tick, g_nimg];
+    [s appendFormat:@"base=%p\n", (void*)g_targetBase];
+    [s appendFormat:@"arm=%d hook=%d\n", g_armDone, g_hookPopup];
+    if(g_targetBase){
+        uint32_t w = *(volatile uint32_t*)va(0xd28d0);
+        [s appendFormat:@"w0xd28d0=%08x\n", w];
 
-    // 临时测试：写一下看崩不崩
-    static int done = 0;
-    if(!done){
-        done = 1;
-        uint32_t *p = (uint32_t*)va(0xd28d0);
-        p[0] = 0xB90B07FF;          // 写
-        sys_icache_invalidate(p, 4);
-        uint32_t w2 = *(volatile uint32_t*)va(0xd28d0);
-        [s appendFormat:@"after=%08x\n", w2];
+        static int done = 0;
+        if(!done){
+            done = 1;
+            uint32_t *p = (uint32_t*)va(0xd28d0);
+            p[0] = 0xB90B07FF;
+            sys_icache_invalidate(p, 4);
+            uint32_t w2 = *(volatile uint32_t*)va(0xd28d0);
+            [s appendFormat:@"after=%08x\n", w2];
+        }
     }
+    self.lbl.text = s;
 }
 - (void)tap{ [self refresh]; }
 @end
-
 static void spawnBall(void){
     @try{
         NSArray *wins = UIApplication.sharedApplication.windows;
