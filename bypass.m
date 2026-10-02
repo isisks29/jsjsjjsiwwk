@@ -227,18 +227,17 @@ static void initBy(void){
     @autoreleasepool{
         enumerateAllImages();
         g_targetBase = findTargetBase();
-        installHooks();
+        installHooks();          // ← 你验证过的，不动
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
-            armFull();
-            patchConnectFail();
-            if(g_targetBase){
-                typedef void(*fn_t)(void);
-                fn_t f = (fn_t)va(0x11fa5c);
-                if(f){ f(); g_called5c = 1; }
-            }
-            spawnBall();
+
+            // ===== 只开一个 =====
+            // armFull();              // 开这行，其他注掉
+            // patchConnectFail();     // 开这行，其他注掉
+            // 调 sub_11fa5c            // 开这行，其他注掉
+
+          //  spawnBall();
         });
     }
 }
