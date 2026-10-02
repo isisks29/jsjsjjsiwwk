@@ -173,12 +173,22 @@ static void installHooks(void) {
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
     [s appendFormat:@"arm=%d hook=%d c5=%d\n", g_armDone, g_hookPopup, g_called5c];
     if(g_targetBase){
-        uintptr_t g = 0x3ff000;
-        [s appendFormat:@"348=%u 6a8=%08x\n", r32(0x3fc000+0x348), r32(g+0x6a8)];
-        [s appendFormat:@"sc=%llx tc=%llx\n", r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
-        [s appendFormat:@"v330=%p\n", (void*)r64(0x3fc000+0x330)];
+    uintptr_t g = 0x3ff000;
+    [s appendFormat:@"348=%u 6a8=%08x\n", r32(0x3fc000+0x348), r32(g+0x6a8)];
+    [s appendFormat:@"sc=%llx tc=%llx\n", r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
+    [s appendFormat:@"v330=%p\n", (void*)r64(0x3fc000+0x330)];
+    
+    // 面板视图状态
+    id panel = (__bridge id)(void*)r64(0x3fc000+0x330);
+    if(panel){
+        @try{
+            UIView *v = (UIView*)panel;
+            [s appendFormat:@"hidden=%d α=%.2f\n", v.hidden, v.alpha];
+            [s appendFormat:@"frame=%.0f,%.0f\n", v.frame.origin.x, v.frame.origin.y];
+            [s appendFormat:@"sv=%@\n", v.superview ? NSStringFromClass([v.superview class]) : @"nil"];
+            [s appendFormat:@"win=%p\n", (__bridge void*)v.window];
+        }@catch(NSException*e){ [s appendString:@"exc\n"]; }
     }
-    self.lbl.text = s;
 }
 - (void)tap{ [self refresh]; }
 @end
