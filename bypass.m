@@ -266,7 +266,7 @@ static void spawnBall(void){
 
         BallTarget *t = [BallTarget new];
         ball = [UIButton buttonWithType:UIButtonTypeSystem];
-        ball.frame = CGRectMake(20, 120, 200, 100);
+        ball.frame = CGRectMake(20, 400, 200, 100);
         ball.backgroundColor = [UIColor redColor];
         UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
         bar.textColor = [UIColor whiteColor];
@@ -286,6 +286,7 @@ static void spawnBall(void){
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
+        installPopupHook();          // ← 同步调，弹窗被拦
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
             spawnBall();
