@@ -193,8 +193,6 @@ static void installHooks(void) {
 }
 - (void)tap{ [self refresh]; }
 @end
-- (void)tap{ [self refresh]; }
-@end
 static void spawnBall(void){
     @try{
         NSArray *wins = UIApplication.sharedApplication.windows;
