@@ -61,6 +61,7 @@ jobs:
             -arch arm64 \
             -dynamiclib \
             -O2 \
+            -mios-version-min=13.0 \
             -framework Foundation \
             -framework UIKit \
             -fobjc-arc \
