@@ -170,6 +170,9 @@ static void installHooks(void) {
 // 全局（放在文件顶部，其他 static 旁边）
 
 
+// 全局（放文件顶部）
+
+
 - (void)refresh{
     g_tick++;
     NSMutableString *s = [NSMutableString string];
@@ -180,9 +183,7 @@ static void installHooks(void) {
         uintptr_t g = 0x3ff000;
         [s appendFormat:@"348=%u 6a8=%08x\n", r32(0x3fc000+0x348), r32(g+0x6a8)];
         [s appendFormat:@"sc=%llx tc=%llx\n", r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
-        [s appendFormat:@"v328=%p v330=%p\n",
-            (void*)r64(0x3fc000+0x328),
-            (void*)r64(0x3fc000+0x330)];
+        [s appendFormat:@"v328=%p\n", (void*)r64(0x3fc000+0x328)];
 
         id metal = (__bridge id)(void*)r64(0x3fc000+0x328);
         if(metal){
@@ -193,23 +194,31 @@ static void installHooks(void) {
             }@catch(NSException*e){}
         }
 
-        // ===== 测试 patch 0x8d0b4 =====
+        // ===== patch 4 条 b.ne → nop =====
         if(!g_patchedDraw){
             g_patchedDraw = 1;
-            uintptr_t addr = (uintptr_t)va(0x8d0b4);
-            g_drawW0 = *(volatile uint32_t*)addr;
-            uintptr_t page = addr & ~0x3FFFULL;
+            uintptr_t addr0 = (uintptr_t)va(0x8d010);
+            uintptr_t page  = addr0 & ~0x3FFFULL;
             int r = mprotect((void*)page, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
             if(r == 0){
-                *(volatile uint32_t*)addr = 0x1400001E;
-                sys_icache_invalidate((void*)addr, 4);
-                g_drawW1 = *(volatile uint32_t*)addr;
+                *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
+                *(volatile uint32_t*)va(0x8d038) = 0xD503201F;
+                *(volatile uint32_t*)va(0x8d058) = 0xD503201F;
+                *(volatile uint32_t*)va(0x8d078) = 0xD503201F;
+                sys_icache_invalidate((void*)addr0, 0x100);
                 mprotect((void*)page, 0x4000, PROT_READ|PROT_EXEC);
+                g_patchRet = 1;
             } else {
-                g_drawW1 = 0xDEAD0000u | (uint32_t)(-r);
+                g_patchRet = -r;
             }
         }
-        [s appendFormat:@"draw w0=%08x w1=%08x\n", g_drawW0, g_drawW1];
+        [s appendFormat:@"pat=%d\n", g_patchRet];
+        [s appendFormat:@"d10=%08x d38=%08x\n",
+            *(volatile uint32_t*)va(0x8d010),
+            *(volatile uint32_t*)va(0x8d038)];
+        [s appendFormat:@"d58=%08x d78=%08x\n",
+            *(volatile uint32_t*)va(0x8d058),
+            *(volatile uint32_t*)va(0x8d078)];
     }
     self.lbl.text = s;
 }
