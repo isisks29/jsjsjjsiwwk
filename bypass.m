@@ -176,55 +176,41 @@ static void installHooks(void) {
         uintptr_t g = 0x3ff000;
         [s appendFormat:@"348=%u 6a8=%08x\n", r32(0x3fc000+0x348), r32(g+0x6a8)];
         [s appendFormat:@"sc=%llx tc=%llx\n", r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
-        [s appendFormat:@"v330=%p\n", (void*)r64(0x3fc000+0x330)];
+        [s appendFormat:@"v328=%p v330=%p\n",
+            (void*)r64(0x3fc000+0x328),
+            (void*)r64(0x3fc000+0x330)];
 
-        id panel = (__bridge id)(void*)r64(0x3fc000+0x330);
-        if(panel){
+        // ---- Metal 面板 (0x3fc328) ----
+        id metal = (__bridge id)(void*)r64(0x3fc000+0x328);
+        if(metal){
             @try{
-                UIView *v = (UIView*)panel;
-                [s appendFormat:@"h=%d a=%.2f\n", v.hidden, v.alpha];
-                [s appendFormat:@"f=%.0f,%.0f,%.0f,%.0f\n",
+                UIView *v = (UIView*)metal;
+                [s appendFormat:@"M=%@\n", NSStringFromClass([v class])];
+                [s appendFormat:@"Mh=%d a=%.2f\n", v.hidden, v.alpha];
+                [s appendFormat:@"Mf=%.0f,%.0f,%.0f,%.0f\n",
                     v.frame.origin.x, v.frame.origin.y,
                     v.frame.size.width, v.frame.size.height];
-                [s appendFormat:@"b=%.0f,%.0f\n",
-                    v.bounds.size.width, v.bounds.size.height];
-                [s appendFormat:@"subs=%lu\n",
-                    (unsigned long)v.subviews.count];
-                [s appendFormat:@"sv=%@\n",
+                [s appendFormat:@"Msv=%@\n",
                     v.superview ? NSStringFromClass([v.superview class]) : @"nil"];
-                [s appendFormat:@"win=%p\n", (__bridge void*)v.window];
+                [s appendFormat:@"Mwin=%p\n", (__bridge void*)v.window];
+                [s appendFormat:@"Msubs=%lu\n", (unsigned long)v.subviews.count];
+            }@catch(NSException*e){ [s appendString:@"Mexc\n"]; }
+        }
 
-                for(int i=0;i<(int)v.subviews.count && i<5;i++){
-                    UIView *sub = v.subviews[i];
-                    [s appendFormat:@"  %d:%@ h=%d a=%.2f\n",
-                        i, NSStringFromClass([sub class]),
-                        sub.hidden, sub.alpha];
-                }
-            }@catch(NSException*e){ [s appendString:@"exc\n"]; }
+        // ---- 图标 (0x3fc330) ----
+        id icon = (__bridge id)(void*)r64(0x3fc000+0x330);
+        if(icon){
+            @try{
+                UIView *v = (UIView*)icon;
+                [s appendFormat:@"I=%@\n", NSStringFromClass([v class])];
+                [s appendFormat:@"If=%.0f,%.0f,%.0f,%.0f\n",
+                    v.frame.origin.x, v.frame.origin.y,
+                    v.frame.size.width, v.frame.size.height];
+                [s appendFormat:@"Isv=%@\n",
+                    v.superview ? NSStringFromClass([v.superview class]) : @"nil"];
+            }@catch(NSException*e){ [s appendString:@"Iexc\n"]; }
         }
     }
-
-    // 扫描所有 window 层级，找 _0x1E6B7A93 / MTKView
-    @try{
-        __block void (^scan)(UIView*, int) = NULL;
-        scan = ^(UIView *v, int depth){
-            if(depth > 4) return;
-            NSString *cls = NSStringFromClass([v class]);
-            if([cls containsString:@"1E6B7A93"] || [cls containsString:@"MTKView"]){
-                [s appendFormat:@"HIT %@ f=%.0f,%.0f,%.0f,%.0f h=%d\n",
-                    cls, v.frame.origin.x, v.frame.origin.y,
-                    v.frame.size.width, v.frame.size.height, v.hidden];
-            }
-            for(UIView *sub in v.subviews) scan(sub, depth+1);
-        };
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        for(UIWindow *win in UIApplication.sharedApplication.windows){
-            scan(win, 0);
-        }
-#pragma clang diagnostic pop
-    }@catch(NSException*e){ [s appendString:@"scan exc\n"]; }
-
     self.lbl.text = s;
 }
 - (void)tap{ [self refresh]; }
