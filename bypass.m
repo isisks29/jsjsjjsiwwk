@@ -237,7 +237,7 @@ static void initBy(void){
             // patchConnectFail();     // 开这行，其他注掉
             // 调 sub_11fa5c            // 开这行，其他注掉
 
-          //  spawnBall();
+            spawnBall();
         });
     }
 }
