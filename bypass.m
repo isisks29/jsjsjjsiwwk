@@ -276,8 +276,11 @@ static void spawnBall(void){
 
         BallTarget *t = [BallTarget new];
         ball = [UIButton buttonWithType:UIButtonTypeSystem];
-        ball.frame = wins.bounds;   // 占满屏幕
-ball.backgroundColor = [UIColor colorWithRed:1 green:0 blue:0 alpha:0.5];
+        for(UIWindow *w in wins){
+    ball.frame = w.bounds;           // 全屏
+    [w addSubview:ball];
+    [w bringSubviewToFront:ball];
+}
         UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
         bar.textColor = [UIColor whiteColor];
         bar.font = [UIFont systemFontOfSize:14];
