@@ -162,7 +162,6 @@ static void installHooks(void) {
     g_hookPopup = 1;
 }
 
-// ===== 球 + 检条（只显示最安全的值）=====
 @interface BallTarget : NSObject
 @property(nonatomic,strong) UILabel *lbl;
 @end
@@ -172,8 +171,7 @@ static void installHooks(void) {
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"tick=%d n=%d\n", g_tick, g_nimg];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
-    [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
-    [s appendFormat:@"arm=%d cn=%d c5=%d\n", g_armDone, g_patchedConnect, g_called5c];
+    [s appendFormat:@"arm=%d hook=%d\n", g_armDone, g_hookPopup];
     self.lbl.text = s;
 }
 - (void)tap{ [self refresh]; }
@@ -188,16 +186,30 @@ static void spawnBall(void){
             return;
         }
         UIWindow *w = wins[0];
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10,60,300,200)];
-        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
+        BallTarget *t = [BallTarget new];
+
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10,60,320,200)];
+        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
         lbl.textColor = [UIColor whiteColor];
         lbl.font = [UIFont systemFontOfSize:12];
         lbl.numberOfLines = 0;
-        lbl.text = @"HELLO";
+        lbl.text = @"init";
+        lbl.userInteractionEnabled = YES;
+        t.lbl = lbl;
         [w addSubview:lbl];
+        [w bringSubviewToFront:lbl];
+
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(w.bounds.size.width-70, w.bounds.size.height-140, 55, 55);
+        b.backgroundColor = [UIColor redColor];
+        b.layer.cornerRadius = 27;
+        [b addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+        [w addSubview:b];
+        [w bringSubviewToFront:b];
+
+        [t refresh];
     }@catch(NSException*e){}
 }
-
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
