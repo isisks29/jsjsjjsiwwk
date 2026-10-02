@@ -182,10 +182,25 @@ static void installHooks(void) {
         if(panel){
             @try{
                 UIView *v = (UIView*)panel;
-                [s appendFormat:@"hidden=%d a=%.2f\n", v.hidden, v.alpha];
-                [s appendFormat:@"frame=%.0f,%.0f\n", v.frame.origin.x, v.frame.origin.y];
-                [s appendFormat:@"sv=%@\n", v.superview ? NSStringFromClass([v.superview class]) : @"nil"];
+                [s appendFormat:@"h=%d a=%.2f\n", v.hidden, v.alpha];
+                [s appendFormat:@"f=%.0f,%.0f,%.0f,%.0f\n",
+                    v.frame.origin.x, v.frame.origin.y,
+                    v.frame.size.width, v.frame.size.height];
+                [s appendFormat:@"b=%.0f,%.0f\n",
+                    v.bounds.size.width, v.bounds.size.height];
+                [s appendFormat:@"subs=%lu\n",
+                    (unsigned long)v.subviews.count];
+                [s appendFormat:@"sv=%@\n",
+                    v.superview ? NSStringFromClass([v.superview class]) : @"nil"];
                 [s appendFormat:@"win=%p\n", (__bridge void*)v.window];
+
+                // 枚举前 5 个子视图
+                for(int i=0;i<(int)v.subviews.count && i<5;i++){
+                    UIView *sub = v.subviews[i];
+                    [s appendFormat:@"  %d:%@ h=%d a=%.2f\n",
+                        i, NSStringFromClass([sub class]),
+                        sub.hidden, sub.alpha];
+                }
             }@catch(NSException*e){ [s appendString:@"exc\n"]; }
         }
     }
