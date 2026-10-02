@@ -16,13 +16,13 @@
 #import <string.h>
 
 static volatile int g_tick = 0;
+static uintptr_t g_targetBase = 0;
 
 // ===== 枚举 image =====
 #define MAX_IMG 256
 typedef struct { char name[256]; uintptr_t hdr; } ImgInfo;
 static ImgInfo g_imgs[MAX_IMG];
 static int g_nimg = 0;
-static uintptr_t g_targetBase = 0;
 
 static void enumerateAllImages(void){
     int cnt = _dyld_image_count();
@@ -38,7 +38,6 @@ static void enumerateAllImages(void){
         g_nimg++;
     }
 }
-
 static uintptr_t findTargetBase(void){
     for(int i=0;i<g_nimg;i++){
         if(strcasestr(g_imgs[i].name, "ballsace")) return g_imgs[i].hdr;
@@ -55,17 +54,12 @@ static inline void w32(uintptr_t f,uint32_t v){ *(volatile uint32_t*)va(f)=v; }
 static inline uint64_t r64(uintptr_t f){ return *(volatile uint64_t*)va(f); }
 static inline uint32_t r32(uintptr_t f){ return *(volatile uint32_t*)va(f); }
 
-// ===== 状态 =====
 static volatile int g_popupCount = 0;
 static volatile int g_hookPopup = 0;
 static volatile int g_armDone = 0;
 static volatile int g_patchedConnect = 0;
 static volatile int g_called5c = 0;
-static volatile int g_crashed = 0;
-static volatile uint64_t g_crashPC = 0, g_crashFAR = 0;
-static volatile int g_crashSig = 0;
 
-// ===== 常量 =====
 static const uintptr_t kSessionBaseFile = 0x3ff000;
 #define CFG_C   0xB75E8052BABD72A6ULL
 #define MIX_K   0xD18DDB25u
@@ -74,27 +68,10 @@ static const uintptr_t kSessionBaseFile = 0x3ff000;
 #define W_A     0x8E4B1395u
 #define W_B     0x1F3D6A71u
 
-// ===== 崩溃抓取 =====
-static void sig_handler(int sig, siginfo_t *si, void *uctx){
-    ucontext_t *uc = (ucontext_t *)uctx;
-    g_crashPC  = uc->uc_mcontext->__ss.__pc;
-    g_crashFAR = (uint64_t)si->si_addr;
-    g_crashSig = sig;
-    g_crashed  = 1;
-}
-static void installSigHandler(void){
-    struct sigaction sa = {0};
-    sa.sa_sigaction = sig_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL);
-}
-
 static uint64_t boot_ms(void){
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     return mach_absolute_time() * tb.numer / tb.denom / 1000000ULL;
 }
-
 static inline uint32_t mix(uint32_t x){
     x ^= x>>15; x *= W_B;
     x ^= x>>11; x *= W_A;
@@ -110,32 +87,27 @@ static void writeGateTriple(uintptr_t seedAddr){
     uint32_t v3 = mix(v2 ^ MIX_K2) ^ hi;
     w32(seedAddr + 0x10, v3);
 }
-
 static void* buildSessionObj(void){
     void *obj = calloc(1, 0x11c6);
     uint64_t b0=0x123456789abcdef0ULL, b8=0xfedcba9876543210ULL;
     uint32_t b16=0x11223344, b24=0x55667788, b32=0x99aabbcc;
     uint64_t *P = (uint64_t*)((uintptr_t)obj + 0x119a);
     P[0]=b0; P[1]=b8; P[2]=b16; P[3]=b24; P[4]=b32;
-
     uint32_t h = ((uint32_t)(b8>>32) ^ (uint32_t)b8) * 0x45D9F3B7u;
     h ^= b16; h *= W_A; h ^= b24; h *= W_B; h ^= b32; h ^= h>>16;
     *(uint32_t*)((uintptr_t)obj + 0x11c2) = h;
-
     *(uint32_t*)((uintptr_t)obj + 0x0)  = (b32 ^ (uint32_t)(b0>>19)) ^ 0x5F8A16E3u;
     *(uint64_t*)((uintptr_t)obj + 0x78) = b0 ^ b8 ^ 0xA5C3E1F7B6D2489AULL;
     *(uint32_t*)((uintptr_t)obj + 0x8e) = (b16 ^ (uint32_t)(b0>>7))  ^ 0x4A9B5206u;
     *(uint32_t*)((uintptr_t)obj + 0x92) = (b24 ^ (uint32_t)(b0>>13)) ^ 0x8C1A73E5u;
     return obj;
 }
-
 static void armFull(void){
     if(!g_targetBase) return;
     @try{
         uintptr_t g = kSessionBaseFile;
         uint64_t now_ms  = boot_ms();
         uint64_t now_sec = now_ms / 1000;
-
         w64(g+0x6a0, CFG_C ^ now_ms);
         writeGateTriple(g+0x6a0);
         w64(g+0x680, CFG_C ^ now_sec);
@@ -144,7 +116,6 @@ static void armFull(void){
         g_armDone = 1;
     }@catch(NSException*e){}
 }
-
 static void patchConnectFail(void){
     if(!g_targetBase) return;
     uint32_t *p = (uint32_t*)va(0xd28d0);
@@ -154,40 +125,33 @@ static void patchConnectFail(void){
     g_patchedConnect = 1;
 }
 
-// ===== 弹窗 hook =====
-static IMP g_origPresent = NULL;
+// ===== 你成功过的 hook =====
 static id (*origPassword)(id, SEL, id, id);
-static id hookPassword(id self, SEL _cmd, id svc, id acct) {
-    return @"A";
-}
-
+static id hookPassword(id self, SEL _cmd, id svc, id acct) { return @"A"; }
 static void (*origSetup)(id, SEL);
 static void hookSetup(id self, SEL _cmd) {}
-
-
+static IMP g_origPresent = NULL;
 static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)) {
     if ([vc isKindOfClass:[UIAlertController class]]) {
+        g_popupCount++;
         if (comp) comp();
         return;
     }
     ((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))g_origPresent)(self, _cmd, vc, anim, comp);
 }
-
-static void installPopupHook(void) {
+static void installHooks(void) {
     Class keychain = objc_getClass("_0xD5A13E79");
     Method mPass = keychain ? class_getClassMethod(keychain, sel_registerName("passwordForService:account:")) : NULL;
     if (mPass) {
         origPassword = (id(*)(id,SEL,id,id))method_getImplementation(mPass);
         method_setImplementation(mPass, (IMP)hookPassword);
     }
-
     Class popup = objc_getClass("_0x6D1C8F45");
     Method mSetup = popup ? class_getInstanceMethod(popup, sel_registerName("setupUI")) : NULL;
     if (mSetup) {
         origSetup = (void(*)(id,SEL))method_getImplementation(mSetup);
         method_setImplementation(mSetup, (IMP)hookSetup);
     }
-
     g_origPresent = class_getMethodImplementation([UIViewController class],
                                                    sel_registerName("presentViewController:animated:completion:"));
     if (g_origPresent) {
@@ -198,7 +162,7 @@ static void installPopupHook(void) {
     g_hookPopup = 1;
 }
 
-// ===== 球 + label =====
+// ===== 球 + 检条（只显示最安全的值）=====
 @interface BallTarget : NSObject
 @property(nonatomic,strong) UILabel *lbl;
 @end
@@ -208,30 +172,8 @@ static void installPopupHook(void) {
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"tick=%d n=%d\n", g_tick, g_nimg];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
-    if(g_targetBase){
-        uintptr_t g = kSessionBaseFile;
-        [s appendFormat:@"348=%u 658=%u\n",
-            r32(0x3fc000+0x348), r32(g+0x658)];
-        [s appendFormat:@"6a0=%llx\n680=%llx\n",
-            r64(g+0x6a0), r64(g+0x680)];
-        [s appendFormat:@"6a8=%08x 688=%08x\n",
-            r32(g+0x6a8), r32(g+0x688)];
-        [s appendFormat:@"obj=%p\n", (void*)r64(g+0x698)];
-        
-        [s appendFormat:@"sc=%llx tc=%llx\n",
-            r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
-        [s appendFormat:@"arm=%d cn=%d c5=%d\n",
-            g_armDone, g_patchedConnect, g_called5c];
-    }
     [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
-    if(g_crashed) [s appendFormat:@"C sig=%d pc=%llx\nfar=%llx\n",
-                    g_crashSig, g_crashPC, g_crashFAR];
-
-    for(int i=0;i<g_nimg && i<10;i++){
-        const char *bn = strrchr(g_imgs[i].name,'/');
-        bn = bn ? bn+1 : g_imgs[i].name;
-        [s appendFormat:@"%d %s\n", i, bn];
-    }
+    [s appendFormat:@"arm=%d cn=%d c5=%d\n", g_armDone, g_patchedConnect, g_called5c];
     self.lbl.text = s;
 }
 - (void)tap{ [self refresh]; }
@@ -248,10 +190,10 @@ static void spawnBall(void){
         UIWindow *w = wins[0];
         BallTarget *t = [BallTarget new];
 
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(5,40,360,600)];
-        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(5,40,340,260)];
+        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
         lbl.textColor = [UIColor whiteColor];
-        lbl.font = [UIFont systemFontOfSize:10];
+        lbl.font = [UIFont systemFontOfSize:12];
         lbl.numberOfLines = 0;
         lbl.text = @"init";
         lbl.userInteractionEnabled = YES;
@@ -280,40 +222,22 @@ static void spawnBall(void){
     }@catch(NSException*e){}
 }
 
-// ============================================================
-// 【测试开关】每次只开一个，跑完告诉我结果
-// ============================================================
-#define STEP_POPUP_HOOK   1   // 弹窗 hook
-#define STEP_ARM          0   // arm guard + 会话对象
-#define STEP_PATCH_CONNECT 0  // patch connect
-#define STEP_CALL_5C      0   // 调 sub_11fa5c
-
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
         enumerateAllImages();
         g_targetBase = findTargetBase();
+        installHooks();
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
-
-#if STEP_POPUP_HOOK
-            installPopupHook();
-#endif
-#if STEP_ARM
             armFull();
-#endif
-#if STEP_PATCH_CONNECT
             patchConnectFail();
-#endif
-#if STEP_CALL_5C
             if(g_targetBase){
                 typedef void(*fn_t)(void);
                 fn_t f = (fn_t)va(0x11fa5c);
                 if(f){ f(); g_called5c = 1; }
             }
-#endif
-            
             spawnBall();
         });
     }
