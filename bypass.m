@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE 1
 #import <Foundation/Foundation.h>
+#import <libkern/OSCacheControl.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -209,8 +210,8 @@ static void manualPatch11ffb0(void){
     p[2] = 0xD61F0200;  // br x16
     p[3] = 0xD503201F;  // nop
 
-    __builtin___clear_cache((char*)p, (char*)p + 16);
-    __builtin___clear_cache((char*)tr, (char*)tr + 48);
+    sys_icache_invalidate(p, 16);
+    sys_icache_invalidate(tr, 48);
 
     g_patched11ffb0 = 1;
 }
@@ -221,7 +222,7 @@ static void patchConnectFail(void){
     uint32_t *p = (uint32_t*)va(0xd28d0);
     if(p[0] == 0xB90B07FF) return;      // already patched
     p[0] = 0xB90B07FF;                  // str wzr, [sp, #0xb04]
-    __builtin___clear_cache((char*)p, (char*)p + 4);
+    sys_icache_invalidate(p, 4);
     g_patchedConnect = 1;
 }
 
