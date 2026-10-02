@@ -233,7 +233,7 @@ static void initBy(void){
                        dispatch_get_main_queue(),^{
 
             // ===== 只开一个 =====
-            // armFull();              // 开这行，其他注掉
+             armFull();              // 开这行，其他注掉
             // patchConnectFail();     // 开这行，其他注掉
             // 调 sub_11fa5c            // 开这行，其他注掉
 
