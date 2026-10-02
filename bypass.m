@@ -259,8 +259,8 @@ static void spawnBall(void){
 // 【测试开关】每次只开一个，跑完告诉我结果
 // ============================================================
 #define STEP_POPUP_HOOK   0   // 弹窗 hook
-#define STEP_ARM          1   // arm guard + 会话对象
-#define STEP_PATCH_CONNECT 0  // patch connect
+#define STEP_ARM          0   // arm guard + 会话对象
+#define STEP_PATCH_CONNECT 1  // patch connect
 #define STEP_CALL_5C      0   // 调 sub_11fa5c
 
 __attribute__((constructor))
