@@ -349,22 +349,10 @@ static void spawnBall(void){
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
-        enumerateAllImages();
-        g_targetBase = findTargetBase();
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
+        // 阶段1：只挂球，别的什么都不做
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
-            installSigHandler();
-            installPopupHook();
-
-            if(g_targetBase){
-                armFull();
-                @try { manualPatch11ffb0(); } @catch(NSException *e) {}
-                @try { patchConnectFail(); }  @catch(NSException *e) {}
-            }
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
-                           dispatch_get_main_queue(),^{ spawnBall(); });
+            spawnBall();
         });
     }
 }
