@@ -250,7 +250,7 @@ static void installPopupHook(void){
          "球=%@ tick=%d\n"
          "crash=%d pc=%llx\n"
          "far=%llx sig=%d",
-         "base=%llx w=%08x\n"
+         "base=%llx w=%08x\n",
         r32(g+0x658), r32(0x3fc000+0x348),
         r64(g+0x6a0), r64(g+0x680),
         r32(g+0x6a8), r32(g+0x688),
