@@ -239,39 +239,34 @@ static void installPopupHook(void){
 
 // ===== 检条 =====
 @interface BallTarget : NSObject
-@property(nonatomic,strong) UILabel *bar;
+@property(nonatomic,strong) UILabel *dbgLabel;
+@property(nonatomic,strong) UIButton *ballBtn;
 @end
 @implementation BallTarget
-- (void)refresh{
-    g_refreshTick++;
++ (NSString *)statusText{
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
     [s appendFormat:@"tick=%d n=%d\n", g_refreshTick, g_nimg];
-
     if(g_targetBase){
         uintptr_t g = kSessionBaseFile;
         [s appendFormat:@"658=%u 348=%u\n",
             r32(g+0x658), r32(0x3fc000+0x348)];
-        [s appendFormat:@"6a8=%08x 688=%08x\n",
-            r32(g+0x6a8), r32(g+0x688)];
         [s appendFormat:@"obj=%p\n", (void*)r64(g+0x698)];
         [s appendFormat:@"v330=%p v328=%p\n",
             (void*)r64(0x3fc000+0x330),
             (void*)r64(0x3fc000+0x328)];
-        [s appendFormat:@"pat=%d cn=%d ins=%d\n",
-            g_patched11ffb0, g_patchedConnect, g_instrCount];
-        [s appendFormat:@"mm=%d arm=%d\n", g_mmapOK, g_armDone];
     }
     [s appendFormat:@"wins=%lu\n",
         (unsigned long)UIApplication.sharedApplication.windows.count];
-    if(g_hookPopup) [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
-    if(g_crashed)   [s appendFormat:@"C sig=%d pc=%llx\nfar=%llx\n",
-                     g_crashSig, g_crashPC, g_crashFAR];
-    self.bar.text = s;
+    if(g_crashed) [s appendFormat:@"C sig=%d pc=%llx\n", g_crashSig, g_crashPC];
+    return s;
+}
+- (void)refresh{
+    g_refreshTick++;
+    self.dbgLabel.text = [BallTarget statusText];
 }
 - (void)tap{ [self refresh]; }
 @end
-
 static UIButton *ball = nil;
 
 static void spawnBall(void){
@@ -287,22 +282,44 @@ static void spawnBall(void){
                            dispatch_get_main_queue(),^{ spawnBall(); });
             return;
         }
+        UIWindow *w = wins[0];
 
-        for(UIWindow *w in wins){
-            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-            b.frame = CGRectMake(10, 50, 200, 100);
-            b.backgroundColor = [UIColor redColor];
-            UILabel *bar = [[UILabel alloc] initWithFrame:b.bounds];
-            bar.textColor = [UIColor whiteColor];
-            bar.font = [UIFont systemFontOfSize:14];
-            bar.text = @"HELLO";
-            [b addSubview:bar];
-            [w addSubview:b];
-            [w bringSubviewToFront:b];
-        }
+        BallTarget *t = [BallTarget new];
+
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 60, 320, 320)];
+        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
+        lbl.textColor = [UIColor whiteColor];
+        lbl.font = [UIFont systemFontOfSize:10];
+        lbl.numberOfLines = 0;
+        lbl.text = @"init";
+        lbl.userInteractionEnabled = YES;
+        t.dbgLabel = lbl;
+        [w addSubview:lbl];
+        [w bringSubviewToFront:lbl];
+
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(w.bounds.size.width - 80, w.bounds.size.height - 150, 60, 60);
+        b.backgroundColor = [UIColor redColor];
+        b.layer.cornerRadius = 30;
+        b.layer.borderWidth = 2;
+        b.layer.borderColor = [UIColor whiteColor].CGColor;
+        t.ballBtn = b;
+        [b addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+        [w addSubview:b];
+        [w bringSubviewToFront:b];
+
+        [t refresh];
+
+        __block BallTarget *bt = t;
+        void (^tick)(void) = ^{
+            [bt refresh];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), tick);
+        };
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), tick);
     }@catch(NSException*e){}
 }
-
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
