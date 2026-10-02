@@ -61,6 +61,9 @@ static volatile int g_hookPopup = 0;
 static volatile int g_armDone = 0;
 static volatile int g_patchedConnect = 0;
 static volatile int g_called5c = 0;
+static volatile int g_crashed = 0;
+static volatile uint64_t g_crashPC = 0, g_crashFAR = 0;
+static volatile int g_crashSig = 0;
 
 // ===== 常量 =====
 static const uintptr_t kSessionBaseFile = 0x3ff000;
@@ -70,6 +73,22 @@ static const uintptr_t kSessionBaseFile = 0x3ff000;
 #define MIX_K2  0x5D41C293u
 #define W_A     0x8E4B1395u
 #define W_B     0x1F3D6A71u
+
+// ===== 崩溃抓取 =====
+static void sig_handler(int sig, siginfo_t *si, void *uctx){
+    ucontext_t *uc = (ucontext_t *)uctx;
+    g_crashPC  = uc->uc_mcontext->__ss.__pc;
+    g_crashFAR = (uint64_t)si->si_addr;
+    g_crashSig = sig;
+    g_crashed  = 1;
+}
+static void installSigHandler(void){
+    struct sigaction sa = {0};
+    sa.sa_sigaction = sig_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+}
 
 static uint64_t boot_ms(void){
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
@@ -168,17 +187,22 @@ static void installPopupHook(void){
         uintptr_t g = kSessionBaseFile;
         [s appendFormat:@"348=%u 658=%u\n",
             r32(0x3fc000+0x348), r32(g+0x658)];
-        [s appendFormat:@"6a0=%llx\n680=%llx\n", r64(g+0x6a0), r64(g+0x680)];
+        [s appendFormat:@"6a0=%llx\n680=%llx\n",
+            r64(g+0x6a0), r64(g+0x680)];
+        [s appendFormat:@"6a8=%08x 688=%08x\n",
+            r32(g+0x6a8), r32(g+0x688)];
         [s appendFormat:@"obj=%p\n", (void*)r64(g+0x698)];
         [s appendFormat:@"v330=%p\n", (void*)r64(0x3fc000+0x330)];
         [s appendFormat:@"sc=%llx tc=%llx\n",
             r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
-        [s appendFormat:@"arm=%d cn=%d c5=%d\n", g_armDone, g_patchedConnect, g_called5c];
+        [s appendFormat:@"arm=%d cn=%d c5=%d\n",
+            g_armDone, g_patchedConnect, g_called5c];
     }
     [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
+    if(g_crashed) [s appendFormat:@"C sig=%d pc=%llx\nfar=%llx\n",
+                    g_crashSig, g_crashPC, g_crashFAR];
 
-    // 列出前 12 个 image
-    for(int i=0;i<g_nimg && i<12;i++){
+    for(int i=0;i<g_nimg && i<10;i++){
         const char *bn = strrchr(g_imgs[i].name,'/');
         bn = bn ? bn+1 : g_imgs[i].name;
         [s appendFormat:@"%d %s\n", i, bn];
@@ -219,8 +243,25 @@ static void spawnBall(void){
         [w bringSubviewToFront:b];
 
         [t refresh];
+
+        __block BallTarget *bt = t;
+        void (^tick)(void) = ^{
+            [bt refresh];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), tick);
+        };
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), tick);
     }@catch(NSException*e){}
 }
+
+// ============================================================
+// 【测试开关】每次只开一个，跑完告诉我结果
+// ============================================================
+#define STEP_POPUP_HOOK   1   // 弹窗 hook
+#define STEP_ARM          0   // arm guard + 会话对象
+#define STEP_PATCH_CONNECT 0  // patch connect
+#define STEP_CALL_5C      0   // 调 sub_11fa5c
 
 __attribute__((constructor))
 static void initBy(void){
@@ -230,16 +271,24 @@ static void initBy(void){
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
-            installPopupHook();
-            armFull();
-            patchConnectFail();
 
-            // 手动调 sub_11fa5c
+#if STEP_POPUP_HOOK
+            installPopupHook();
+#endif
+#if STEP_ARM
+            armFull();
+#endif
+#if STEP_PATCH_CONNECT
+            patchConnectFail();
+#endif
+#if STEP_CALL_5C
             if(g_targetBase){
                 typedef void(*fn_t)(void);
                 fn_t f = (fn_t)va(0x11fa5c);
                 if(f){ f(); g_called5c = 1; }
             }
+#endif
+            installSigHandler();
             spawnBall();
         });
     }
