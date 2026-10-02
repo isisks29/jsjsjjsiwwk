@@ -178,66 +178,21 @@ static void installHooks(void) {
 - (void)refresh{
     g_tick++;
     NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"tick=%d n=%d\n", g_tick, g_nimg];
+    [s appendFormat:@"tick=%d\n", g_tick];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
-    [s appendFormat:@"arm=%d hook=%d c5=%d\n", g_armDone, g_hookPopup, g_called5c];
+    [s appendFormat:@"arm=%d c5=%d\n", g_armDone, g_called5c];
     if(g_targetBase){
-        uintptr_t g = 0x3ff000;
-        [s appendFormat:@"348=%u 6a8=%08x\n", r32(0x3fc000+0x348), r32(g+0x6a8)];
-        [s appendFormat:@"sc=%llx tc=%llx\n", r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
+        [s appendFormat:@"348=%u\n", r32(0x3fc000+0x348)];
         [s appendFormat:@"v328=%p\n", (void*)r64(0x3fc000+0x328)];
-
         id metal = (__bridge id)(void*)r64(0x3fc000+0x328);
         if(metal){
             @try{
                 UIView *v = (UIView*)metal;
-                [s appendFormat:@"M=%@ h=%d a=%.2f\n",
-                    NSStringFromClass([v class]), v.hidden, v.alpha];
+                [s appendFormat:@"M h=%d a=%.2f\n", v.hidden, v.alpha];
             }@catch(NSException*e){}
         }
-
-        // ===== patch 4 条 b.ne -> nop =====
-        if(!g_patchedDraw){
-            g_patchedDraw = 1;
-            uintptr_t addr0 = (uintptr_t)va(0x8d010);
-            uintptr_t page  = addr0 & ~0x3FFFULL;
-            int r = mprotect((void*)page, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
-            if(r == 0){
-                *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
-                *(volatile uint32_t*)va(0x8d038) = 0xD503201F;
-                *(volatile uint32_t*)va(0x8d058) = 0xD503201F;
-                *(volatile uint32_t*)va(0x8d078) = 0xD503201F;
-                sys_icache_invalidate((void*)addr0, 0x100);
-                mprotect((void*)page, 0x4000, PROT_READ|PROT_EXEC);
-                g_patchRet = 1;
-            } else {
-                g_patchRet = -r;
-            }
-        }
-        [s appendFormat:@"pat=%d\n", g_patchRet];
-
-        // ===== patch 0x1210e0 (teardown 门控) =====
-        if(g_patchRet == 1){
-            static int done2 = 0;
-            if(!done2){
-                done2 = 1;
-                uintptr_t a2 = (uintptr_t)va(0x1210e0);
-                uintptr_t pg2 = a2 & ~0x3FFFULL;
-                int r2 = mprotect((void*)pg2, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
-                if(r2 == 0){
-                    *(volatile uint32_t*)a2 = 0x1400001C;
-                    sys_icache_invalidate((void*)a2, 4);
-                    mprotect((void*)pg2, 0x4000, PROT_READ|PROT_EXEC);
-                    g_patchRet = 2;
-                } else {
-                    g_patchRet = -r2;
-                }
-            }
-        }
+        [s appendFormat:@"d10=%08x\n", *(volatile uint32_t*)va(0x8d010)];
         [s appendFormat:@"t20=%08x\n", *(volatile uint32_t*)va(0x1210e0)];
-        [s appendFormat:@"d10=%08x d38=%08x\n",
-            *(volatile uint32_t*)va(0x8d010),
-            *(volatile uint32_t*)va(0x8d038)];
     }
     self.lbl.text = s;
 }
@@ -287,7 +242,24 @@ static void initBy(void){
                        dispatch_get_main_queue(),^{
             armFull();
 
+            // 先 patch 两个，再调 sub_11fa5c
             if(g_targetBase){
+                uintptr_t page0 = ((uintptr_t)va(0x8d010)) & ~0x3FFFULL;
+                if(mprotect((void*)page0, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC) == 0){
+                    *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d038) = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d058) = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d078) = 0xD503201F;
+                    sys_icache_invalidate((void*)va(0x8d010), 0x100);
+                    mprotect((void*)page0, 0x4000, PROT_READ|PROT_EXEC);
+                }
+                uintptr_t page1 = ((uintptr_t)va(0x1210e0)) & ~0x3FFFULL;
+                if(mprotect((void*)page1, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC) == 0){
+                    *(volatile uint32_t*)va(0x1210e0) = 0x1400001C;
+                    sys_icache_invalidate((void*)va(0x1210e0), 4);
+                    mprotect((void*)page1, 0x4000, PROT_READ|PROT_EXEC);
+                }
+
                 typedef void(*fn_t)(void);
                 fn_t f = (fn_t)va(0x11fa5c);
                 if(f){ f(); g_called5c = 1; }
