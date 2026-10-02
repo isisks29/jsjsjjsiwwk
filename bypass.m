@@ -246,6 +246,40 @@ static void installPopupHook(void){
 }
 
 // ===== 检条 =====
+// ===== 检条 =====
+@interface BallTarget : NSObject
+@property(nonatomic,strong) UILabel *bar;
+@end
+@implementation BallTarget
+- (void)refresh{
+    g_refreshTick++;
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"base=%p\n", (void*)g_targetBase];
+    [s appendFormat:@"tick=%d\n", g_refreshTick];
+
+    if(g_targetBase){
+        uintptr_t g = kSessionBaseFile;
+        [s appendFormat:@"658=%u 348=%u\n",
+            r32(g+0x658), r32(0x3fc000+0x348)];
+        [s appendFormat:@"6a8=%08x 688=%08x\n",
+            r32(g+0x6a8), r32(g+0x688)];
+        [s appendFormat:@"obj=%p\n", (void*)r64(g+0x698)];
+        [s appendFormat:@"pat=%d cn=%d ins=%d\n",
+            g_patched11ffb0, g_patchedConnect, g_instrCount];
+        [s appendFormat:@"mm=%d arm=%d\n", g_mmapOK, g_armDone];
+    }
+    [s appendFormat:@"wins=%lu\n",
+        (unsigned long)UIApplication.sharedApplication.windows.count];
+    if(g_hookPopup) [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
+    if(g_crashed)   [s appendFormat:@"C sig=%d pc=%llx\nfar=%llx\n",
+                     g_crashSig, g_crashPC, g_crashFAR];
+    self.bar.text = s;
+}
+- (void)tap{ [self refresh]; }
+@end
+
+static UIButton *ball = nil;
+
 static void spawnBall(void){
     @try{
         NSArray *wins = nil;
