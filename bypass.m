@@ -171,20 +171,12 @@ static void installHooks(void) {
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"tick=%d n=%d\n", g_tick, g_nimg];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
-    [s appendFormat:@"arm=%d hook=%d\n", g_armDone, g_hookPopup];
+    [s appendFormat:@"arm=%d hook=%d c5=%d\n", g_armDone, g_hookPopup, g_called5c];
     if(g_targetBase){
-        uint32_t w = *(volatile uint32_t*)va(0xd28d0);
-        [s appendFormat:@"w0xd28d0=%08x\n", w];
-
-        static int done = 0;
-        if(!done){
-            done = 1;
-            uint32_t *p = (uint32_t*)va(0xd28d0);
-            p[0] = 0xB90B07FF;
-            sys_icache_invalidate(p, 4);
-            uint32_t w2 = *(volatile uint32_t*)va(0xd28d0);
-            [s appendFormat:@"after=%08x\n", w2];
-        }
+        uintptr_t g = 0x3ff000;
+        [s appendFormat:@"348=%u 6a8=%08x\n", r32(0x3fc000+0x348), r32(g+0x6a8)];
+        [s appendFormat:@"sc=%llx tc=%llx\n", r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
+        [s appendFormat:@"v330=%p\n", (void*)r64(0x3fc000+0x330)];
     }
     self.lbl.text = s;
 }
@@ -228,15 +220,17 @@ static void initBy(void){
     @autoreleasepool{
         enumerateAllImages();
         g_targetBase = findTargetBase();
-        installHooks();          // ← 你验证过的，不动
+        installHooks();
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
+            armFull();
 
-            // ===== 只开一个 =====
-             armFull();              // 开这行，其他注掉
-          //   patchConnectFail();     // 开这行，其他注掉
-            // 调 sub_11fa5c            // 开这行，其他注掉
+            if(g_targetBase){
+                typedef void(*fn_t)(void);
+                fn_t f = (fn_t)va(0x11fa5c);
+                if(f){ f(); g_called5c = 1; }
+            }
 
             spawnBall();
         });
