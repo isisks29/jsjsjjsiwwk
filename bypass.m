@@ -215,12 +215,29 @@ static void installHooks(void) {
             }
         }
         [s appendFormat:@"pat=%d\n", g_patchRet];
+
+        // ===== patch 0x1210e0 (teardown 门控) =====
+        if(g_patchRet == 1){
+            static int done2 = 0;
+            if(!done2){
+                done2 = 1;
+                uintptr_t a2 = (uintptr_t)va(0x1210e0);
+                uintptr_t pg2 = a2 & ~0x3FFFULL;
+                int r2 = mprotect((void*)pg2, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
+                if(r2 == 0){
+                    *(volatile uint32_t*)a2 = 0x1400001C;
+                    sys_icache_invalidate((void*)a2, 4);
+                    mprotect((void*)pg2, 0x4000, PROT_READ|PROT_EXEC);
+                    g_patchRet = 2;
+                } else {
+                    g_patchRet = -r2;
+                }
+            }
+        }
+        [s appendFormat:@"t20=%08x\n", *(volatile uint32_t*)va(0x1210e0)];
         [s appendFormat:@"d10=%08x d38=%08x\n",
             *(volatile uint32_t*)va(0x8d010),
             *(volatile uint32_t*)va(0x8d038)];
-        [s appendFormat:@"d58=%08x d78=%08x\n",
-            *(volatile uint32_t*)va(0x8d058),
-            *(volatile uint32_t*)va(0x8d078)];
     }
     self.lbl.text = s;
 }
