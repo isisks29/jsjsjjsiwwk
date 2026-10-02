@@ -243,28 +243,7 @@ static void installPopupHook(void){
 @end
 @implementation BallTarget
 - (void)refresh{
-    g_refreshTick++;
-    NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"base=%p\n", (void*)g_targetBase];
-    [s appendFormat:@"tick=%d n=%d\n", g_refreshTick, g_nimg];
-
-    if(g_targetBase){
-        uintptr_t g = kSessionBaseFile;
-        [s appendFormat:@"658=%u 348=%u\n",
-            r32(g+0x658), r32(0x3fc000+0x348)];
-        [s appendFormat:@"6a8=%08x 688=%08x\n",
-            r32(g+0x6a8), r32(g+0x688)];
-        [s appendFormat:@"obj=%p\n", (void*)r64(g+0x698)];
-        [s appendFormat:@"pat=%d cn=%d ins=%d\n",
-            g_patched11ffb0, g_patchedConnect, g_instrCount];
-        [s appendFormat:@"mm=%d arm=%d\n", g_mmapOK, g_armDone];
-    }
-    [s appendFormat:@"wins=%lu\n",
-        (unsigned long)UIApplication.sharedApplication.windows.count];
-    if(g_hookPopup) [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
-    if(g_crashed)   [s appendFormat:@"C sig=%d pc=%llx\nfar=%llx\n",
-                     g_crashSig, g_crashPC, g_crashFAR];
-    self.bar.text = s;
+    self.bar.text = @"HELLO";
 }
 - (void)tap{ [self refresh]; }
 @end
@@ -287,15 +266,12 @@ static void spawnBall(void){
 
         BallTarget *t = [BallTarget new];
         ball = [UIButton buttonWithType:UIButtonTypeSystem];
-        ball.frame = CGRectMake(20, 120, 280, 280);
-        ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.92];
-        ball.layer.cornerRadius = 10;
-
+        ball.frame = CGRectMake(20, 120, 200, 100);
+        ball.backgroundColor = [UIColor redColor];
         UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
         bar.textColor = [UIColor whiteColor];
-        bar.font = [UIFont systemFontOfSize:10];
-        bar.numberOfLines = 0;
-        bar.text = @"init";
+        bar.font = [UIFont systemFontOfSize:14];
+        bar.text = @"HELLO";
         t.bar = bar;
         [ball addSubview:bar];
         [ball addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
@@ -303,37 +279,16 @@ static void spawnBall(void){
         UIWindow *w = wins[0];
         [w addSubview:ball];
         [w bringSubviewToFront:ball];
-
         [t refresh];
-
-        __block BallTarget *bt = t;
-        void (^tick)(void) = ^{
-            [bt refresh];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), tick);
-        };
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), tick);
     }@catch(NSException*e){}
 }
 
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
-        enumerateAllImages();
-        g_targetBase = findTargetBase();
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
-            installSigHandler();
-            installPopupHook();
-            if(g_targetBase){
-                armFull();
-                @try { manualPatch11ffb0(); } @catch(NSException *e) {}
-                @try { patchConnectFail(); }  @catch(NSException *e) {}
-            }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
-                           dispatch_get_main_queue(),^{ spawnBall(); });
+            spawnBall();
         });
     }
 }
