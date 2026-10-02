@@ -188,37 +188,13 @@ static void spawnBall(void){
             return;
         }
         UIWindow *w = wins[0];
-        BallTarget *t = [BallTarget new];
-
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(5,40,340,260)];
-        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10,60,300,200)];
+        lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
         lbl.textColor = [UIColor whiteColor];
         lbl.font = [UIFont systemFontOfSize:12];
         lbl.numberOfLines = 0;
-        lbl.text = @"init";
-        lbl.userInteractionEnabled = YES;
-        t.lbl = lbl;
+        lbl.text = @"HELLO";
         [w addSubview:lbl];
-        [w bringSubviewToFront:lbl];
-
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-        b.frame = CGRectMake(w.bounds.size.width-70, w.bounds.size.height-140, 55, 55);
-        b.backgroundColor = [UIColor redColor];
-        b.layer.cornerRadius = 27;
-        [b addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
-        [w addSubview:b];
-        [w bringSubviewToFront:b];
-
-        [t refresh];
-
-        __block BallTarget *bt = t;
-        void (^tick)(void) = ^{
-            [bt refresh];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), tick);
-        };
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), tick);
     }@catch(NSException*e){}
 }
 
@@ -233,8 +209,8 @@ static void initBy(void){
                        dispatch_get_main_queue(),^{
 
             // ===== 只开一个 =====
-            // armFull();              // 开这行，其他注掉
-             patchConnectFail();     // 开这行，其他注掉
+             armFull();              // 开这行，其他注掉
+          //   patchConnectFail();     // 开这行，其他注掉
             // 调 sub_11fa5c            // 开这行，其他注掉
 
             spawnBall();
