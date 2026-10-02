@@ -323,10 +323,10 @@ static void spawnBall(void){
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
-        installPopupHook();      // ← 同步
+        enumerateAllImages();               // ← 加这行
+        g_targetBase = findTargetBase();    // ← 加这行
+        installPopupHook();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{
-            spawnBall();
-        });
+                       dispatch_get_main_queue(),^{ spawnBall(); });
     }
 }
