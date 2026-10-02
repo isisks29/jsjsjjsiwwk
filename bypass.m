@@ -278,7 +278,7 @@ static void spawnBall(void){
         BallTarget *t = [BallTarget new];
         ball = [UIButton buttonWithType:UIButtonTypeSystem];
         ball.backgroundColor = [UIColor redColor];
-        UILabel *bar = [[UILabel alloc] initWithFrame:CGRectZero];
+        UILabel *bar = [[UILabel alloc] initWithFrame:CGRectMake(0,0,0,0)];
         bar.textColor = [UIColor whiteColor];
         bar.font = [UIFont systemFontOfSize:14];
         bar.numberOfLines = 0;
