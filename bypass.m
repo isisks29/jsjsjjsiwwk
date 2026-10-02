@@ -106,15 +106,8 @@ static void initBy(void){
     @autoreleasepool{
         enumerateAllImages();
         g_targetBase = findTargetBase();
-
-        dispatch_after(3秒, ^{
-            installPopupHook();
-            armFull();                          // arm guard + 会话对象
-            patchConnectFail();                 // 阻断 connect
-            // 手动调 sub_11fa5c
-            typedef void(*fn_t)(void);
-            fn_t f = (fn_t)va(0x11fa5c);
-            if(f) f();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(),^{
             spawnBall();
         });
     }
