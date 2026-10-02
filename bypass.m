@@ -310,46 +310,32 @@ static UIWindow *findKeyWindow(void){
 
 static void spawnBall(void){
     @try{
-        for(int i=0;i<600;i++){
-            @autoreleasepool{
-                UIWindow *win = findKeyWindow();
-                if(win){
-                    BallTarget *t = [BallTarget new];
-                    ball = [UIButton buttonWithType:UIButtonTypeSystem];
-                    ball.frame = CGRectMake(20,120,300,360);
-                    ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.9];
-                    ball.layer.cornerRadius = 12;
-                    UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
-                    bar.textColor = [UIColor whiteColor];
-                    bar.font = [UIFont systemFontOfSize:9];
-                    bar.numberOfLines = 0;
-                    bar.text = @"—";
-                    t.bar = bar;
-                    [ball addSubview:bar];
-                    [ball addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
-                    [win addSubview:ball];
-                    [win bringSubviewToFront:ball];
-                    [t refresh];
-                    __block BallTarget *bt = t;
-                    void (^tick)(void) = ^{
-                        [bt refresh];
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
-                                       dispatch_get_main_queue(), tick);
-                    };
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), tick);
-                    return;
-                }
-            }
-            usleep(500000);
-        }
+        UIWindow *win = nil;
+        @try { win = UIApplication.sharedApplication.keyWindow; } @catch(NSException *e) {}
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if(!win && UIApplication.sharedApplication.windows.count>0)
+            win = UIApplication.sharedApplication.windows.firstObject;
+#pragma clang diagnostic pop
+
+        if(!win) return;
+
+        UILabel *bar = [[UILabel alloc] initWithFrame:CGRectMake(20,120,300,300)];
+        bar.textColor = [UIColor whiteColor];
+        bar.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.7];
+        bar.font = [UIFont systemFontOfSize:12];
+        bar.numberOfLines = 0;
+        bar.text = @"HELLO";        // 先固定文本，不读任何全局
+        bar.userInteractionEnabled = YES;
+        [win addSubview:bar];
     }@catch(NSException*e){}
+
 }
 
 __attribute__((constructor))
+
 static void initBy(void){
     @autoreleasepool{
-        // 阶段1：只挂球，别的什么都不做
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
             spawnBall();
