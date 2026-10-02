@@ -308,37 +308,50 @@ static UIWindow *findKeyWindow(void){
     return nil;
 }
 
+@interface BallTarget : NSObject
+@property(nonatomic,strong) UILabel *bar;
+@end
+@implementation BallTarget
+- (void)refresh{
+    g_refreshTick++;
+    self.bar.text = [NSString stringWithFormat:@"tick=%d", g_refreshTick];
+}
+- (void)tap{ [self refresh]; }
+@end
+
+static UIButton *ball = nil;
+
 static void spawnBall(void){
     @try{
         UIWindow *win = nil;
-        @try { win = UIApplication.sharedApplication.keyWindow; } @catch(NSException *e) {}
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        win = UIApplication.sharedApplication.keyWindow;
         if(!win && UIApplication.sharedApplication.windows.count>0)
             win = UIApplication.sharedApplication.windows.firstObject;
 #pragma clang diagnostic pop
-
         if(!win) return;
 
-        UILabel *bar = [[UILabel alloc] initWithFrame:CGRectMake(20,120,300,300)];
+        BallTarget *t = [BallTarget new];
+        ball = [UIButton buttonWithType:UIButtonTypeSystem];
+        ball.frame = CGRectMake(20,120,200,100);
+        ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.9];
+        UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
         bar.textColor = [UIColor whiteColor];
-        bar.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.7];
         bar.font = [UIFont systemFontOfSize:12];
         bar.numberOfLines = 0;
-        bar.text = @"HELLO";        // 先固定文本，不读任何全局
-        bar.userInteractionEnabled = YES;
-        [win addSubview:bar];
+        bar.text = @"init";
+        t.bar = bar;
+        [ball addSubview:bar];
+        [ball addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:ball];
+        [t refresh];
     }@catch(NSException*e){}
-
 }
-
 __attribute__((constructor))
-
 static void initBy(void){
     @autoreleasepool{
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{
-            spawnBall();
-        });
+                       dispatch_get_main_queue(),^{ spawnBall(); });
     }
 }
