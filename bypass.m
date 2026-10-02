@@ -267,8 +267,9 @@ static void spawnBall(void){
         wins = UIApplication.sharedApplication.windows;
 #pragma clang diagnostic pop
 
+        NSLog(@"[BALL] wins=%lu", (unsigned long)wins.count);
+
         if(!wins || wins.count == 0){
-            // 没窗口，1 秒后重试
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
                            dispatch_get_main_queue(),^{ spawnBall(); });
             return;
@@ -276,25 +277,23 @@ static void spawnBall(void){
 
         BallTarget *t = [BallTarget new];
         ball = [UIButton buttonWithType:UIButtonTypeSystem];
-        for(UIWindow *w in wins){
-    ball.frame = w.bounds;           // 全屏
-    [w addSubview:ball];
-    [w bringSubviewToFront:ball];
-}
-        UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
+        ball.backgroundColor = [UIColor redColor];
+        UILabel *bar = [[UILabel alloc] initWithFrame:CGRectZero];
         bar.textColor = [UIColor whiteColor];
         bar.font = [UIFont systemFontOfSize:14];
         bar.numberOfLines = 0;
-        bar.text = @"init";
+        bar.text = @"HELLO";
         t.bar = bar;
         [ball addSubview:bar];
         [ball addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
 
-        // 挂到每个 window 上
-        for(UIWindow *w in wins){
-            [w addSubview:ball];
-            [w bringSubviewToFront:ball];
-        }
+        // 用第一个 window，全屏
+        UIWindow *w = wins[0];
+        ball.frame = w.bounds;
+        bar.frame = ball.bounds;
+        [w addSubview:ball];
+        [w bringSubviewToFront:ball];
+
         [t refresh];
     }@catch(NSException*e){}
 }
