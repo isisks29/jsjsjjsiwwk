@@ -1,15 +1,64 @@
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE 1
 #import <Foundation/Foundation.h>
+#import <libkern/OSCacheControl.h>
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <dlfcn.h>
+#import <mach/mach.h>
+#import <mach/mach_time.h>
+#import <signal.h>
+#import <ucontext.h>
+#import <sys/mman.h>
+#import <string.h>
 
 static volatile int g_tick = 0;
 
+// ===== 枚举 image =====
+#define MAX_IMG 256
+typedef struct { char name[256]; uintptr_t hdr; } ImgInfo;
+static ImgInfo g_imgs[MAX_IMG];
+static int g_nimg = 0;
+static uintptr_t g_targetBase = 0;
+
+static void enumerateAllImages(void){
+    int cnt = _dyld_image_count();
+    g_nimg = 0;
+    for(int i=0;i<cnt && g_nimg<MAX_IMG;i++){
+        const char* p  = _dyld_get_image_name(i);
+        const struct mach_header* h = _dyld_get_image_header(i);
+        if(!p || !h) continue;
+        int j = 0;
+        while(p[j] && j < 255){ g_imgs[g_nimg].name[j] = p[j]; j++; }
+        g_imgs[g_nimg].name[j] = 0;
+        g_imgs[g_nimg].hdr = (uintptr_t)h;
+        g_nimg++;
+    }
+}
+
+static uintptr_t findTargetBase(void){
+    for(int i=0;i<g_nimg;i++){
+        if(strcasestr(g_imgs[i].name, "ace") || strcasestr(g_imgs[i].name, "balls"))
+            return g_imgs[i].hdr;
+    }
+    return 0;
+}
+
+// ===== 球 + label =====
 @interface BallTarget : NSObject
 @property(nonatomic,strong) UILabel *lbl;
 @end
 @implementation BallTarget
-- (void)tap{ g_tick++; self.lbl.text = [NSString stringWithFormat:@"tick=%d", g_tick]; }
+- (void)refresh{
+    g_tick++;
+    self.lbl.text = [NSString stringWithFormat:
+        @"tick=%d\nn=%d\nbase=%p",
+        g_tick, g_nimg, (void*)g_targetBase];
+}
+- (void)tap{ [self refresh]; }
 @end
 
 static void spawnBall(void){
@@ -28,7 +77,7 @@ static void spawnBall(void){
         lbl.textColor = [UIColor whiteColor];
         lbl.font = [UIFont systemFontOfSize:12];
         lbl.numberOfLines = 0;
-        lbl.text = @"tick=0";
+        lbl.text = @"init";
         lbl.userInteractionEnabled = YES;
         t.lbl = lbl;
         [w addSubview:lbl];
@@ -41,13 +90,19 @@ static void spawnBall(void){
         [b addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
         [w addSubview:b];
         [w bringSubviewToFront:b];
+
+        [t refresh];
     }@catch(NSException*e){}
 }
 
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
+        enumerateAllImages();
+        g_targetBase = findTargetBase();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{ spawnBall(); });
+                       dispatch_get_main_queue(),^{
+            spawnBall();
+        });
     }
 }
