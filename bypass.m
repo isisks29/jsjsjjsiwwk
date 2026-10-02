@@ -5,6 +5,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
@@ -15,8 +16,6 @@
 
 static const uintptr_t kSessionBaseFile = 0x3ff000;
 static const uintptr_t k11ffb0File      = 0x11ffb0;
-static volatile uint64_t g_dbgBase = 0;
-static volatile uint32_t g_dbgWord = 0;
 
 #define CFG_C   0xB75E8052BABD72A6ULL
 #define MIX_K   0xD18DDB25u
@@ -27,15 +26,52 @@ static volatile uint32_t g_dbgWord = 0;
 
 static uintptr_t g_targetBase = 0;
 
+// ===== 枚举所有 image =====
+#define MAX_IMG 256
+typedef struct { char name[256]; char inst[256]; uintptr_t hdr; } ImgInfo;
+static ImgInfo g_imgs[MAX_IMG];
+static volatile int g_nimg = 0;
+static volatile int g_page = 0;
+
+static const char* image_install_name(const struct mach_header* h){
+    const struct load_command* lc =
+        (const struct load_command*)((const char*)h + sizeof(struct mach_header));
+    for(uint32_t i=0;i<h->ncmds;i++){
+        if(lc->cmd == LC_ID_DYLIB){
+            const struct dylib_command* dc = (const struct dylib_command*)lc;
+            return (const char*)dc + dc->dylib.name.offset;
+        }
+        lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+    }
+    return NULL;
+}
+static void enumerateAllImages(void){
+    int cnt = _dyld_image_count();
+    for(int i=0;i<cnt && g_nimg<MAX_IMG;i++){
+        const char* p  = _dyld_get_image_name(i);
+        const struct mach_header* h = _dyld_get_image_header(i);
+        if(!p || !h) continue;
+        strncpy(g_imgs[g_nimg].name, p, 255);
+        g_imgs[g_nimg].name[255]=0;
+        const char* inst = image_install_name(h);
+        if(inst){ strncpy(g_imgs[g_nimg].inst, inst, 255); g_imgs[g_nimg].inst[255]=0; }
+        else g_imgs[g_nimg].inst[0] = 0;
+        g_imgs[g_nimg].hdr = (uintptr_t)h;
+        g_nimg++;
+    }
+}
+
 static uintptr_t findTargetBase(void){
-    uint32_t n = _dyld_image_count();
-    for(uint32_t i=0;i<n;i++){
-        const char *name = _dyld_get_image_name(i);
-        if(name && (strstr(name,"ace") || strstr(name,"ballsace")))
-            return (uintptr_t)_dyld_get_image_header(i);
+    // 优先：按 install name 子串匹配
+    for(int i=0;i<g_nimg;i++){
+        if(strcasestr(g_imgs[i].inst, "ace") || strcasestr(g_imgs[i].inst, "balls"))
+            return g_imgs[i].hdr;
+        if(strcasestr(g_imgs[i].name, "ace") || strcasestr(g_imgs[i].name, "balls"))
+            return g_imgs[i].hdr;
     }
     return 0;
 }
+
 static inline void *va(uintptr_t f){ return (void*)(g_targetBase+f); }
 static inline void w64(uintptr_t f,uint64_t v){ *(volatile uint64_t*)va(f)=v; }
 static inline void w32(uintptr_t f,uint32_t v){ *(volatile uint32_t*)va(f)=v; }
@@ -129,77 +165,6 @@ static void armFull(void){
     }@catch(NSException*e){}
 }
 
-// ===== 前置声明 =====
-static void armFull_entry(void);
-
-// ===== 手写 patch：入口换成跳板，先 arm 再执行原指令 =====
-static void manualPatch11ffb0(void){
-    if(!g_targetBase) return;
-    g_dbgBase = g_targetBase;
-    uint32_t *p = (uint32_t*)va(k11ffb0File);
-    g_dbgWord = p[0];
-
-    // 检查是否已是 sub sp,sp,#0x150（0xD10043FF）
-    if((p[0] & 0xFFC003FF) != 0xD10043FF) return;
-
-    static uint32_t saved[8];
-    for(int i=0;i<8;i++) saved[i] = p[i];
-
-    // 使用数字常量：0x1000=MAP_ANON, 0x0002=MAP_PRIVATE
-    uint32_t *tr = (uint32_t*)mmap(NULL, 0x1000,
-                                   PROT_READ|PROT_WRITE|PROT_EXEC,
-                                   0x1000|0x0002, -1, 0);
-    if(tr == MAP_FAILED){
-        g_mmapOK = -1;
-        return;
-    }
-    g_mmapOK = 1;
-
-    // trampoline 布局：
-    // [0]  adrp x16, armFull_entry页
-    // [1]  add  x16, x16, #offset
-    // [2]  br   x16
-    // [3..10] 原 8 条指令
-    // [11] b 回 0x11ffb0+32
-    uint64_t entryAddr = (uint64_t)&armFull_entry;
-    uint64_t trAddr    = (uint64_t)tr;
-    uint64_t trPage    = trAddr & ~0xFFFULL;
-    int64_t  adrpImm   = ((int64_t)((entryAddr & ~0xFFFULL) - trPage)) >> 12;
-    uint32_t addImm    = (uint32_t)(entryAddr & 0xFFF);
-
-    tr[0] = 0x90000010 | (((uint32_t)adrpImm & 0x1FFFFF) << 5);
-    tr[1] = 0x91000210 | ((addImm & 0xFFF) << 10);
-    tr[2] = 0xD61F0200;
-
-    for(int i=0;i<8;i++) tr[3+i] = saved[i];
-
-    uint64_t back = (uint64_t)va(k11ffb0File + 32);
-    uint64_t cur  = (uint64_t)&tr[11];
-    int64_t  off  = ((int64_t)(back - cur)) >> 2;
-    tr[11] = 0x14000000 | (off & 0x03FFFFFF);
-
-    // 入口 patch：adrp x16,tr页 ; add x16,x16,off ; br x16 ; nop
-    uint64_t pcPage  = (uint64_t)p & ~0xFFFULL;
-    int64_t  trAdrp  = ((int64_t)(trPage - pcPage)) >> 12;
-    uint32_t trAdd   = (uint32_t)(trAddr & 0xFFF);
-
-    p[0] = 0x90000010 | (((uint32_t)trAdrp & 0x1FFFFF) << 5);
-    p[1] = 0x91000210 | ((trAdd & 0xFFF) << 10);
-    p[2] = 0xD61F0200;
-    p[3] = 0xD503201F; // nop
-
-    __builtin___clear_cache((char*)p, (char*)p + 32);
-    __builtin___clear_cache((char*)tr, (char*)tr + 48);
-
-    g_patched11ffb0 = 1;
-}
-
-// 跳板先执行这个 → arm 一次 → 再走原指令
-static void armFull_entry(void){
-    g_instrCount++;
-    armFull();
-}
-
 // ===== 弹窗 hook =====
 static IMP g_origPresent = NULL;
 static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)){
@@ -226,47 +191,44 @@ static void installPopupHook(void){
 @implementation BallTarget
 - (void)refresh{
     g_refreshTick++;
-    if(!g_targetBase){ self.bar.text = @"[NO BASE]"; return; }
+    NSMutableString *s = [NSMutableString string];
 
-    uintptr_t g = kSessionBaseFile;
-    uint64_t obj = r64(g+0x698);
-    uint64_t sc  = r64(0x3fc000+0x338);
-    uint64_t tc  = r64(0x3fc000+0x340);
+    [s appendFormat:@"n=%d pg=%d tick=%d\n", g_nimg, g_page, g_refreshTick];
+    [s appendFormat:@"base=%p tgt=%p\n", (void*)g_targetBase, (void*)0];
 
-    NSString *ballStr;
-    if(!g_ballTried) ballStr = @"未试";
-    else if(!ball)   ballStr = @"NULL";
-    else if(g_ballAlive) ballStr = @"YES";
-    else             ballStr = @"NO";
+    if(g_targetBase){
+        uintptr_t g = kSessionBaseFile;
+        [s appendFormat:@"658=%u 348=%u\n",
+            r32(g+0x658), r32(0x3fc000+0x348)];
+        [s appendFormat:@"6a0=%llx 680=%llx\n",
+            r64(g+0x6a0), r64(g+0x680)];
+        [s appendFormat:@"6a8=%08x 688=%08x\n",
+            r32(g+0x6a8), r32(g+0x688)];
+        [s appendFormat:@"obj=%p arm=%d\n",
+            (void*)r64(g+0x698), g_armDone];
+        [s appendFormat:@"pat=%d mm=%d ins=%d\n",
+            g_patched11ffb0, g_mmapOK, g_instrCount];
+    }
 
-    self.bar.text = [NSString stringWithFormat:
-        @"658=%u 348=%u\n"
-         "6a0=%llx 680=%llx\n"
-         "6a8=%08x 688=%08x\n"
-         "obj=%p\n"
-         "sc=%llx tc=%llx\n"
-         "hook=%d 弹=%d arm=%d\n"
-         "pat=%d mm=%d ins=%d\n"
-         "球=%@ tick=%d\n"
-         "crash=%d pc=%llx\n"
-         "far=%llx sig=%d",
-         "base=%llx w=%08x\n",
-        r32(g+0x658), r32(0x3fc000+0x348),
-        r64(g+0x6a0), r64(g+0x680),
-        r32(g+0x6a8), r32(g+0x688),
-        (void*)obj,
-        sc, tc,
-        g_hookPopup, g_popupCount, g_armDone,
-        g_patched11ffb0, g_mmapOK, g_instrCount,
-        g_dbgBase, g_dbgWord,
-        ballStr, g_refreshTick,
-        g_crashed, g_crashPC,
-        g_crashFAR, g_crashSig];
+    // 显示 image 列表（每页 8 个）
+    int start = g_page * 8;
+    for(int i=start; i<start+8 && i<g_nimg; i++){
+        const char *full = g_imgs[i].name;
+        const char *base = strrchr(full, '/');
+        base = base ? base+1 : full;
+        [s appendFormat:@"%d %p %s\n", i, (void*)g_imgs[i].hdr, base];
+    }
+
+    if(g_hookPopup) [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
+    if(g_crashed)   [s appendFormat:@"CRASH sig=%d pc=%llx far=%llx\n",
+                     g_crashSig, g_crashPC, g_crashFAR];
+
+    self.bar.text = s;
 }
 - (void)tap{
-    armFull();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.5*NSEC_PER_SEC)),
-                   dispatch_get_main_queue(),^{ [self refresh]; });
+    g_page++;
+    if(g_page * 8 >= g_nimg) g_page = 0;
+    [self refresh];
 }
 @end
 
@@ -302,7 +264,7 @@ static void spawnBall(void){
                 if(win){
                     BallTarget *t = [BallTarget new];
                     ball = [UIButton buttonWithType:UIButtonTypeSystem];
-                    ball.frame = CGRectMake(20,120,270,260);
+                    ball.frame = CGRectMake(20,120,300,320);
                     ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.9];
                     ball.layer.cornerRadius = 12;
                     UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
@@ -336,15 +298,16 @@ static void spawnBall(void){
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
+        enumerateAllImages();
         g_targetBase = findTargetBase();
-        installSigHandler();
-        installPopupHook();
-        armFull();
-
-        @try { manualPatch11ffb0(); }
-        @catch(NSException *e) { }
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{ spawnBall(); });
+                       dispatch_get_main_queue(),^{
+            installSigHandler();
+            installPopupHook();
+            if(g_targetBase) armFull();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+                           dispatch_get_main_queue(),^{ spawnBall(); });
+        });
     }
 }
