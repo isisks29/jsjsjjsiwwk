@@ -226,10 +226,10 @@ static void spawnBall(void){
         UIWindow *w = wins[0];
         BallTarget *t = [BallTarget new];
 
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10,60,320,200)];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(5,40,180,100)];
         lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
         lbl.textColor = [UIColor whiteColor];
-        lbl.font = [UIFont systemFontOfSize:12];
+        lbl.font = [UIFont systemFontOfSize:8];
         lbl.numberOfLines = 0;
         lbl.text = @"init";
         lbl.userInteractionEnabled = YES;
@@ -238,7 +238,7 @@ static void spawnBall(void){
         [w bringSubviewToFront:lbl];
 
         UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-        b.frame = CGRectMake(w.bounds.size.width-70, w.bounds.size.height-140, 55, 55);
+        b.frame = CGRectMake(5, 5, 36, 36);
         b.backgroundColor = [UIColor redColor];
         b.layer.cornerRadius = 27;
         [b addTarget:t action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
