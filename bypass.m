@@ -51,8 +51,7 @@ static void enumerateAllImages(void){
         const char* p  = _dyld_get_image_name(i);
         const struct mach_header* h = _dyld_get_image_header(i);
         if(!p || !h) continue;
-        strncpy(g_imgs[g_nimg].name, p, 255);
-        g_imgs[g_nimg].name[255]=0;
+        strncpy(g_imgs[g_nimg].name, p, 255); g_imgs[g_nimg].name[255]=0;
         const char* inst = image_install_name(h);
         if(inst){ strncpy(g_imgs[g_nimg].inst, inst, 255); g_imgs[g_nimg].inst[255]=0; }
         else g_imgs[g_nimg].inst[0] = 0;
@@ -62,7 +61,6 @@ static void enumerateAllImages(void){
 }
 
 static uintptr_t findTargetBase(void){
-    // 优先：按 install name 子串匹配
     for(int i=0;i<g_nimg;i++){
         if(strcasestr(g_imgs[i].inst, "ace") || strcasestr(g_imgs[i].inst, "balls"))
             return g_imgs[i].hdr;
@@ -81,11 +79,10 @@ static inline uint32_t r32(uintptr_t f){ return *(volatile uint32_t*)va(f); }
 // ===== 状态 =====
 static volatile int g_popupCount = 0;
 static volatile int g_hookPopup = 0;
-static volatile int g_ballAlive = 0;
-static volatile int g_ballTried = 0;
 static volatile int g_refreshTick = 0;
 static volatile int g_armDone = 0;
 static volatile int g_patched11ffb0 = 0;
+static volatile int g_patchedConnect = 0;
 static volatile int g_mmapOK = 0;
 static volatile int g_instrCount = 0;
 static UIButton *ball = nil;
@@ -165,6 +162,69 @@ static void armFull(void){
     }@catch(NSException*e){}
 }
 
+// ===== patch 0x11ffb0 =====
+static void manualPatch11ffb0(void){
+    if(!g_targetBase) return;
+    uint32_t *p = (uint32_t*)va(k11ffb0File);
+
+    if((p[0] & 0xFFC003FF) != 0xD10043FF) return;
+
+    static uint32_t saved[8];
+    for(int i=0;i<8;i++) saved[i] = p[i];
+
+    uint32_t *tr = (uint32_t*)mmap(NULL, 0x1000,
+                                   PROT_READ|PROT_WRITE|PROT_EXEC,
+                                   0x1000|0x0002, -1, 0);
+    if(tr == MAP_FAILED){ g_mmapOK = -1; return; }
+    g_mmapOK = 1;
+
+    uint64_t armAddr = (uint64_t)&armFull;
+    uint64_t trAddr  = (uint64_t)tr;
+    uint64_t trPC    = trAddr;
+    uint64_t trPage  = trAddr & ~0xFFFULL;
+    uint64_t back    = (uint64_t)va(k11ffb0File + 32);
+
+    // [0] stp x29, x30, [sp, #-0x10]!
+    tr[0] = 0xA9BF7BFD;
+    // [1] bl armFull
+    uint64_t pc1 = trPC + 4;
+    int64_t  off1 = ((int64_t)(armAddr - pc1)) >> 2;
+    tr[1] = 0x94000000 | ((uint32_t)off1 & 0x03FFFFFF);
+    // [2] ldp x29, x30, [sp], #0x10
+    tr[2] = 0xA8C17BFD;
+    // [3..10] 原 8 条指令
+    for(int i=0;i<8;i++) tr[3+i] = saved[i];
+    // [11] b 回 0x11ffd0
+    uint64_t pc11 = trPC + 44;
+    int64_t  off11 = ((int64_t)(back - pc11)) >> 2;
+    tr[11] = 0x14000000 | ((uint32_t)off11 & 0x03FFFFFF);
+
+    // 入口 patch: adrp x16, trPage ; add x16, x16, #off ; br x16 ; nop
+    uint64_t pcPage = (uint64_t)p & ~0xFFFULL;
+    int64_t  adrpOff = ((int64_t)(trPage - pcPage)) >> 12;
+    uint32_t addOff  = (uint32_t)(trAddr & 0xFFF);
+
+    p[0] = 0x90000010 | (((uint32_t)adrpOff & 0x1FFFFF) << 5);
+    p[1] = 0x91000210 | ((addOff & 0xFFF) << 10);
+    p[2] = 0xD61F0200;  // br x16
+    p[3] = 0xD503201F;  // nop
+
+    __builtin___clear_cache((char*)p, (char*)p + 16);
+    __builtin___clear_cache((char*)tr, (char*)tr + 48);
+
+    g_patched11ffb0 = 1;
+}
+
+// ===== patch connect IP（0xd28d0）=====
+static void patchConnectFail(void){
+    if(!g_targetBase) return;
+    uint32_t *p = (uint32_t*)va(0xd28d0);
+    if(p[0] == 0xB90B07FF) return;      // already patched
+    p[0] = 0xB90B07FF;                  // str wzr, [sp, #0xb04]
+    __builtin___clear_cache((char*)p, (char*)p + 4);
+    g_patchedConnect = 1;
+}
+
 // ===== 弹窗 hook =====
 static IMP g_origPresent = NULL;
 static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)){
@@ -193,41 +253,38 @@ static void installPopupHook(void){
     g_refreshTick++;
     NSMutableString *s = [NSMutableString string];
 
-    [s appendFormat:@"n=%d pg=%d tick=%d\n", g_nimg, g_page, g_refreshTick];
-    [s appendFormat:@"base=%p tgt=%p\n", (void*)g_targetBase, (void*)0];
-
-    if(g_targetBase){
-        uintptr_t g = kSessionBaseFile;
-        [s appendFormat:@"658=%u 348=%u\n",
-            r32(g+0x658), r32(0x3fc000+0x348)];
-        [s appendFormat:@"6a0=%llx 680=%llx\n",
-            r64(g+0x6a0), r64(g+0x680)];
-        [s appendFormat:@"6a8=%08x 688=%08x\n",
-            r32(g+0x6a8), r32(g+0x688)];
-        [s appendFormat:@"obj=%p arm=%d\n",
-            (void*)r64(g+0x698), g_armDone];
-        [s appendFormat:@"pat=%d mm=%d ins=%d\n",
-            g_patched11ffb0, g_mmapOK, g_instrCount];
+    if(!g_targetBase){
+        [s appendFormat:@"NO BASE n=%d pg=%d\n", g_nimg, g_page];
+        int start = g_page * 10;
+        for(int i=start; i<start+10 && i<g_nimg; i++){
+            const char *full = g_imgs[i].name;
+            const char *base = strrchr(full, '/');
+            base = base ? base+1 : full;
+            [s appendFormat:@"%d %p %s\n", i, (void*)g_imgs[i].hdr, base];
+        }
+        if(g_crashed) [s appendFormat:@"C sig=%d pc=%llx\n", g_crashSig, g_crashPC];
+        self.bar.text = s;
+        return;
     }
 
-    // 显示 image 列表（每页 8 个）
-    int start = g_page * 8;
-    for(int i=start; i<start+8 && i<g_nimg; i++){
-        const char *full = g_imgs[i].name;
-        const char *base = strrchr(full, '/');
-        base = base ? base+1 : full;
-        [s appendFormat:@"%d %p %s\n", i, (void*)g_imgs[i].hdr, base];
-    }
-
+    uintptr_t g = kSessionBaseFile;
+    [s appendFormat:@"base=%p pg=%d\n", (void*)g_targetBase, g_page];
+    [s appendFormat:@"658=%u 348=%u\n", r32(g+0x658), r32(0x3fc000+0x348)];
+    [s appendFormat:@"6a0=%llx\n680=%llx\n", r64(g+0x6a0), r64(g+0x680)];
+    [s appendFormat:@"6a8=%08x\n688=%08x\n", r32(g+0x6a8), r32(g+0x688)];
+    [s appendFormat:@"obj=%p arm=%d\n", (void*)r64(g+0x698), g_armDone];
+    [s appendFormat:@"pat=%d cn=%d ins=%d\n",
+        g_patched11ffb0, g_patchedConnect, g_instrCount];
+    [s appendFormat:@"mm=%d tick=%d\n", g_mmapOK, g_refreshTick];
     if(g_hookPopup) [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
-    if(g_crashed)   [s appendFormat:@"CRASH sig=%d pc=%llx far=%llx\n",
+    if(g_crashed)   [s appendFormat:@"C sig=%d pc=%llx\nfar=%llx\n",
                      g_crashSig, g_crashPC, g_crashFAR];
 
     self.bar.text = s;
 }
 - (void)tap{
     g_page++;
-    if(g_page * 8 >= g_nimg) g_page = 0;
+    if(g_page > 8) g_page = 0;
     [self refresh];
 }
 @end
@@ -250,13 +307,7 @@ static UIWindow *findKeyWindow(void){
     return nil;
 }
 
-static void updateBallAlive(void){
-    if(!ball){ g_ballAlive = 0; return; }
-    g_ballAlive = (ball.window != nil || ball.superview != nil) ? 1 : 0;
-}
-
 static void spawnBall(void){
-    g_ballTried = 1;
     @try{
         for(int i=0;i<600;i++){
             @autoreleasepool{
@@ -264,7 +315,7 @@ static void spawnBall(void){
                 if(win){
                     BallTarget *t = [BallTarget new];
                     ball = [UIButton buttonWithType:UIButtonTypeSystem];
-                    ball.frame = CGRectMake(20,120,300,320);
+                    ball.frame = CGRectMake(20,120,300,360);
                     ball.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.9];
                     ball.layer.cornerRadius = 12;
                     UILabel *bar = [[UILabel alloc] initWithFrame:ball.bounds];
@@ -281,7 +332,6 @@ static void spawnBall(void){
                     __block BallTarget *bt = t;
                     void (^tick)(void) = ^{
                         [bt refresh];
-                        updateBallAlive();
                         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
                                        dispatch_get_main_queue(), tick);
                     };
@@ -301,12 +351,18 @@ static void initBy(void){
         enumerateAllImages();
         g_targetBase = findTargetBase();
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
             installSigHandler();
             installPopupHook();
-            if(g_targetBase) armFull();
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),
+
+            if(g_targetBase){
+                armFull();
+                @try { manualPatch11ffb0(); } @catch(NSException *e) {}
+                @try { patchConnectFail(); }  @catch(NSException *e) {}
+            }
+
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
                            dispatch_get_main_queue(),^{ spawnBall(); });
         });
     }
