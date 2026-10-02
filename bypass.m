@@ -164,7 +164,7 @@ static id hookPassword(id self, SEL _cmd, id svc, id acct) {
 static void (*origSetup)(id, SEL);
 static void hookSetup(id self, SEL _cmd) {}
 
-static IMP g_origPresent = NULL;
+
 static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)) {
     if ([vc isKindOfClass:[UIAlertController class]]) {
         if (comp) comp();
