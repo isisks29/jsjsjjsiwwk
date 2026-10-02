@@ -189,7 +189,7 @@ static void installHooks(void) {
             [s appendFormat:@"win=%p\n", (__bridge void*)v.window];
         }@catch(NSException*e){ [s appendString:@"exc\n"]; }
     }
-}
+
 - (void)tap{ [self refresh]; }
 @end
 static void spawnBall(void){
