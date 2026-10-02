@@ -196,7 +196,7 @@ static void installHooks(void) {
             }@catch(NSException*e){}
         }
 
-        // ===== patch 4 条 b.ne → nop =====
+        // ===== patch 4 条 b.ne -> nop =====
         if(!g_patchedDraw){
             g_patchedDraw = 1;
             uintptr_t addr0 = (uintptr_t)va(0x8d010);
