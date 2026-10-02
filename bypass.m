@@ -258,7 +258,10 @@ static void spawnBall(void){
 // ============================================================
 // 【测试开关】每次只开一个，跑完告诉我结果
 // ============================================================
-
+#define STEP_POPUP_HOOK   1   // 弹窗 hook
+#define STEP_ARM          0   // arm guard + 会话对象
+#define STEP_PATCH_CONNECT 0  // patch connect
+#define STEP_CALL_5C      0   // 调 sub_11fa5c
 
 __attribute__((constructor))
 static void initBy(void){
@@ -269,20 +272,23 @@ static void initBy(void){
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
 
-
+#if STEP_POPUP_HOOK
             installPopupHook();
-
-           // armFull();
-
-        //    patchConnectFail();
-
-         //   if(g_targetBase){
-             //   typedef void(*fn_t)(void);
-            //    fn_t f = (fn_t)va(0x11fa5c);
-             //   if(f){ f(); g_called5c = 1; }
-          //  }
-
-            installSigHandler();
+#endif
+#if STEP_ARM
+            armFull();
+#endif
+#if STEP_PATCH_CONNECT
+            patchConnectFail();
+#endif
+#if STEP_CALL_5C
+            if(g_targetBase){
+                typedef void(*fn_t)(void);
+                fn_t f = (fn_t)va(0x11fa5c);
+                if(f){ f(); g_called5c = 1; }
+            }
+#endif
+            
             spawnBall();
         });
     }
