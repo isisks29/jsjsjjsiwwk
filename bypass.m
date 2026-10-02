@@ -54,9 +54,15 @@ static uintptr_t findTargetBase(void){
 @implementation BallTarget
 - (void)refresh{
     g_tick++;
-    self.lbl.text = [NSString stringWithFormat:
-        @"tick=%d\nn=%d\nbase=%p",
-        g_tick, g_nimg, (void*)g_targetBase];
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"tick=%d n=%d\n", g_tick, g_nimg];
+    [s appendFormat:@"base=%p\n", (void*)g_targetBase];
+    for(int i=0;i<g_nimg && i<12;i++){
+        const char *bn = strrchr(g_imgs[i].name,'/');
+        bn = bn ? bn+1 : g_imgs[i].name;
+        [s appendFormat:@"%d %s\n", i, bn];
+    }
+    self.lbl.text = s;
 }
 - (void)tap{ [self refresh]; }
 @end
@@ -72,7 +78,7 @@ static void spawnBall(void){
         UIWindow *w = wins[0];
         BallTarget *t = [BallTarget new];
 
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10,60,300,200)];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10,60,340,500)];
         lbl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
         lbl.textColor = [UIColor whiteColor];
         lbl.font = [UIFont systemFontOfSize:12];
@@ -100,8 +106,15 @@ static void initBy(void){
     @autoreleasepool{
         enumerateAllImages();
         g_targetBase = findTargetBase();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{
+
+        dispatch_after(3秒, ^{
+            installPopupHook();
+            armFull();                          // arm guard + 会话对象
+            patchConnectFail();                 // 阻断 connect
+            // 手动调 sub_11fa5c
+            typedef void(*fn_t)(void);
+            fn_t f = (fn_t)va(0x11fa5c);
+            if(f) f();
             spawnBall();
         });
     }
