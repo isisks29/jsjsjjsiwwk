@@ -172,6 +172,10 @@ static void installHooks(void) {
     [s appendFormat:@"tick=%d n=%d\n", g_tick, g_nimg];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
     [s appendFormat:@"arm=%d hook=%d\n", g_armDone, g_hookPopup];
+    if(g_targetBase){
+        uint32_t w = *(volatile uint32_t*)va(0xd28d0);
+        [s appendFormat:@"w0xd28d0=%08x\n", w];
+    }
     self.lbl.text = s;
 }
 - (void)tap{ [self refresh]; }
