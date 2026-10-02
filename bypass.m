@@ -32,7 +32,6 @@ static uintptr_t g_targetBase = 0;
 typedef struct { char name[256]; char inst[256]; uintptr_t hdr; } ImgInfo;
 static ImgInfo g_imgs[MAX_IMG];
 static volatile int g_nimg = 0;
-static volatile int g_page = 0;
 
 static const char* image_install_name(const struct mach_header* h){
     const struct load_command* lc =
@@ -86,7 +85,6 @@ static volatile int g_patched11ffb0 = 0;
 static volatile int g_patchedConnect = 0;
 static volatile int g_mmapOK = 0;
 static volatile int g_instrCount = 0;
-
 
 // ===== 崩溃抓取 =====
 static volatile uint64_t g_crashPC = 0, g_crashFAR = 0;
@@ -185,30 +183,24 @@ static void manualPatch11ffb0(void){
     uint64_t trPage  = trAddr & ~0xFFFULL;
     uint64_t back    = (uint64_t)va(k11ffb0File + 32);
 
-    // [0] stp x29, x30, [sp, #-0x10]!
-    tr[0] = 0xA9BF7BFD;
-    // [1] bl armFull
+    tr[0] = 0xA9BF7BFD;  // stp x29, x30, [sp, #-0x10]!
     uint64_t pc1 = trPC + 4;
     int64_t  off1 = ((int64_t)(armAddr - pc1)) >> 2;
-    tr[1] = 0x94000000 | ((uint32_t)off1 & 0x03FFFFFF);
-    // [2] ldp x29, x30, [sp], #0x10
-    tr[2] = 0xA8C17BFD;
-    // [3..10] 原 8 条指令
+    tr[1] = 0x94000000 | ((uint32_t)off1 & 0x03FFFFFF);  // bl armFull
+    tr[2] = 0xA8C17BFD;  // ldp x29, x30, [sp], #0x10
     for(int i=0;i<8;i++) tr[3+i] = saved[i];
-    // [11] b 回 0x11ffd0
     uint64_t pc11 = trPC + 44;
     int64_t  off11 = ((int64_t)(back - pc11)) >> 2;
-    tr[11] = 0x14000000 | ((uint32_t)off11 & 0x03FFFFFF);
+    tr[11] = 0x14000000 | ((uint32_t)off11 & 0x03FFFFFF);  // b 0x11ffd0
 
-    // 入口 patch: adrp x16, trPage ; add x16, x16, #off ; br x16 ; nop
     uint64_t pcPage = (uint64_t)p & ~0xFFFULL;
     int64_t  adrpOff = ((int64_t)(trPage - pcPage)) >> 12;
     uint32_t addOff  = (uint32_t)(trAddr & 0xFFF);
 
     p[0] = 0x90000010 | (((uint32_t)adrpOff & 0x1FFFFF) << 5);
     p[1] = 0x91000210 | ((addOff & 0xFFF) << 10);
-    p[2] = 0xD61F0200;  // br x16
-    p[3] = 0xD503201F;  // nop
+    p[2] = 0xD61F0200;
+    p[3] = 0xD503201F;
 
     sys_icache_invalidate(p, 16);
     sys_icache_invalidate(tr, 48);
@@ -216,12 +208,12 @@ static void manualPatch11ffb0(void){
     g_patched11ffb0 = 1;
 }
 
-// ===== patch connect IP（0xd28d0）=====
+// ===== patch connect IP =====
 static void patchConnectFail(void){
     if(!g_targetBase) return;
     uint32_t *p = (uint32_t*)va(0xd28d0);
-    if(p[0] == 0xB90B07FF) return;      // already patched
-    p[0] = 0xB90B07FF;                  // str wzr, [sp, #0xb04]
+    if(p[0] == 0xB90B07FF) return;
+    p[0] = 0xB90B07FF;  // str wzr, [sp, #0xb04]
     sys_icache_invalidate(p, 4);
     g_patchedConnect = 1;
 }
@@ -246,7 +238,6 @@ static void installPopupHook(void){
 }
 
 // ===== 检条 =====
-// ===== 检条 =====
 @interface BallTarget : NSObject
 @property(nonatomic,strong) UILabel *bar;
 @end
@@ -255,7 +246,7 @@ static void installPopupHook(void){
     g_refreshTick++;
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
-    [s appendFormat:@"tick=%d\n", g_refreshTick];
+    [s appendFormat:@"tick=%d n=%d\n", g_refreshTick, g_nimg];
 
     if(g_targetBase){
         uintptr_t g = kSessionBaseFile;
@@ -266,10 +257,11 @@ static void installPopupHook(void){
         [s appendFormat:@"obj=%p\n", (void*)r64(g+0x698)];
         [s appendFormat:@"pat=%d cn=%d ins=%d\n",
             g_patched11ffb0, g_patchedConnect, g_instrCount];
-        [s appendFormat:@"mm=%d arm=%d\n", g_mmapOK, g_armDone];
+        [s appendBaseFormat:@"mm=%d arm=%d\n", g){
+_mmapOK, g_armDone];
     }
-    [s appendFormat:@"wins=%lu\n",
-        (unsigned long)UIApplication.sharedApplication.windows.count];
+    [               s appendFormat:@"wins=%lu\n",
+        arm (unsigned long)UIApplication.sharedApplication.windows.countFull];
     if(g_hookPopup) [s appendFormat:@"hook=%d 弹=%d\n", g_hookPopup, g_popupCount];
     if(g_crashed)   [s appendFormat:@"C sig=%d pc=%llx\nfar=%llx\n",
                      g_crashSig, g_crashPC, g_crashFAR];
@@ -325,10 +317,23 @@ static void spawnBall(void){
                        dispatch_get_main_queue(), tick);
     }@catch(NSException*e){}
 }
+
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{ spawnBall(); });
+        enumerateAllImages();
+        g_targetBase = findTargetBase();
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(),^{
+            installSigHandler();
+            installPopupHook();
+            if(g_target();
+                @try { manualPatch11ffb0(); } @catch(NSException *e) {}
+                @try { patchConnectFail(); }  @catch(NSException *e) {}
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2*NSEC_PER_SEC)),
+                           dispatch_get_main_queue(),^{ spawnBall(); });
+        });
     }
 }
