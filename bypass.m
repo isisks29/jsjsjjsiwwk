@@ -86,7 +86,7 @@ static volatile int g_patched11ffb0 = 0;
 static volatile int g_patchedConnect = 0;
 static volatile int g_mmapOK = 0;
 static volatile int g_instrCount = 0;
-static UIButton *ball = nil;
+
 
 // ===== 崩溃抓取 =====
 static volatile uint64_t g_crashPC = 0, g_crashFAR = 0;
