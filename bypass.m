@@ -260,8 +260,8 @@ static void spawnBall(void){
 // ============================================================
 #define STEP_POPUP_HOOK   0   // 弹窗 hook
 #define STEP_ARM          0   // arm guard + 会话对象
-#define STEP_PATCH_CONNECT 1  // patch connect
-#define STEP_CALL_5C      0   // 调 sub_11fa5c
+#define STEP_PATCH_CONNECT 0  // patch connect
+#define STEP_CALL_5C      1   // 调 sub_11fa5c
 
 __attribute__((constructor))
 static void initBy(void){
