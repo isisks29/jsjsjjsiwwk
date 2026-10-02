@@ -14,7 +14,8 @@
 #import <ucontext.h>
 #import <sys/mman.h>
 #import <string.h>
-
+static volatile int g_patchedDraw = 0;
+static volatile uint32_t g_drawW0 = 0, g_drawW1 = 0;
 static volatile int g_tick = 0;
 static uintptr_t g_targetBase = 0;
 
@@ -166,6 +167,9 @@ static void installHooks(void) {
 @property(nonatomic,strong) UILabel *lbl;
 @end
 @implementation BallTarget
+// 全局（放在文件顶部，其他 static 旁边）
+
+
 - (void)refresh{
     g_tick++;
     NSMutableString *s = [NSMutableString string];
@@ -180,36 +184,32 @@ static void installHooks(void) {
             (void*)r64(0x3fc000+0x328),
             (void*)r64(0x3fc000+0x330)];
 
-        // ---- Metal 面板 (0x3fc328) ----
         id metal = (__bridge id)(void*)r64(0x3fc000+0x328);
         if(metal){
             @try{
                 UIView *v = (UIView*)metal;
-                [s appendFormat:@"M=%@\n", NSStringFromClass([v class])];
-                [s appendFormat:@"Mh=%d a=%.2f\n", v.hidden, v.alpha];
-                [s appendFormat:@"Mf=%.0f,%.0f,%.0f,%.0f\n",
-                    v.frame.origin.x, v.frame.origin.y,
-                    v.frame.size.width, v.frame.size.height];
-                [s appendFormat:@"Msv=%@\n",
-                    v.superview ? NSStringFromClass([v.superview class]) : @"nil"];
-                [s appendFormat:@"Mwin=%p\n", (__bridge void*)v.window];
-                [s appendFormat:@"Msubs=%lu\n", (unsigned long)v.subviews.count];
-            }@catch(NSException*e){ [s appendString:@"Mexc\n"]; }
+                [s appendFormat:@"M=%@ h=%d a=%.2f\n",
+                    NSStringFromClass([v class]), v.hidden, v.alpha];
+            }@catch(NSException*e){}
         }
 
-        // ---- 图标 (0x3fc330) ----
-        id icon = (__bridge id)(void*)r64(0x3fc000+0x330);
-        if(icon){
-            @try{
-                UIView *v = (UIView*)icon;
-                [s appendFormat:@"I=%@\n", NSStringFromClass([v class])];
-                [s appendFormat:@"If=%.0f,%.0f,%.0f,%.0f\n",
-                    v.frame.origin.x, v.frame.origin.y,
-                    v.frame.size.width, v.frame.size.height];
-                [s appendFormat:@"Isv=%@\n",
-                    v.superview ? NSStringFromClass([v.superview class]) : @"nil"];
-            }@catch(NSException*e){ [s appendString:@"Iexc\n"]; }
+        // ===== 测试 patch 0x8d0b4 =====
+        if(!g_patchedDraw){
+            g_patchedDraw = 1;
+            uintptr_t addr = (uintptr_t)va(0x8d0b4);
+            g_drawW0 = *(volatile uint32_t*)addr;
+            uintptr_t page = addr & ~0x3FFFULL;
+            int r = mprotect((void*)page, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
+            if(r == 0){
+                *(volatile uint32_t*)addr = 0x1400001E;
+                sys_icache_invalidate((void*)addr, 4);
+                g_drawW1 = *(volatile uint32_t*)addr;
+                mprotect((void*)page, 0x4000, PROT_READ|PROT_EXEC);
+            } else {
+                g_drawW1 = 0xDEAD0000u | (uint32_t)(-r);
+            }
         }
+        [s appendFormat:@"draw w0=%08x w1=%08x\n", g_drawW0, g_drawW1];
     }
     self.lbl.text = s;
 }
