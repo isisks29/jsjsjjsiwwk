@@ -156,21 +156,46 @@ static void patchConnectFail(void){
 
 // ===== 弹窗 hook =====
 static IMP g_origPresent = NULL;
-static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)){
-    if([vc isKindOfClass:[UIAlertController class]]){
-        g_popupCount++;
+static id (*origPassword)(id, SEL, id, id);
+static id hookPassword(id self, SEL _cmd, id svc, id acct) {
+    return @"A";
+}
+
+static void (*origSetup)(id, SEL);
+static void hookSetup(id self, SEL _cmd) {}
+
+static IMP g_origPresent = NULL;
+static void hookPresent(id self, SEL _cmd, UIViewController *vc, BOOL anim, void (^comp)(void)) {
+    if ([vc isKindOfClass:[UIAlertController class]]) {
+        if (comp) comp();
         return;
     }
-    ((void(*)(id,SEL,UIViewController*,BOOL,void(^)(void)))g_origPresent)(self,_cmd,vc,anim,comp);
+    ((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))g_origPresent)(self, _cmd, vc, anim, comp);
 }
-static void installPopupHook(void){
-    Method m = class_getInstanceMethod([UIViewController class],
-                                       sel_registerName("presentViewController:animated:completion:"));
-    if(m){
-        g_origPresent = method_getImplementation(m);
-        method_setImplementation(m, (IMP)hookPresent);
-        g_hookPopup = 1;
+
+static void installPopupHook(void) {
+    Class keychain = objc_getClass("_0xD5A13E79");
+    Method mPass = keychain ? class_getClassMethod(keychain, sel_registerName("passwordForService:account:")) : NULL;
+    if (mPass) {
+        origPassword = (id(*)(id,SEL,id,id))method_getImplementation(mPass);
+        method_setImplementation(mPass, (IMP)hookPassword);
     }
+
+    Class popup = objc_getClass("_0x6D1C8F45");
+    Method mSetup = popup ? class_getInstanceMethod(popup, sel_registerName("setupUI")) : NULL;
+    if (mSetup) {
+        origSetup = (void(*)(id,SEL))method_getImplementation(mSetup);
+        method_setImplementation(mSetup, (IMP)hookSetup);
+    }
+
+    g_origPresent = class_getMethodImplementation([UIViewController class],
+                                                   sel_registerName("presentViewController:animated:completion:"));
+    if (g_origPresent) {
+        Method mPres = class_getInstanceMethod([UIViewController class],
+                                               sel_registerName("presentViewController:animated:completion:"));
+        method_setImplementation(mPres, (IMP)hookPresent);
+    }
+    g_hookPopup = 1;
 }
 
 // ===== 球 + label =====
@@ -192,7 +217,7 @@ static void installPopupHook(void){
         [s appendFormat:@"6a8=%08x 688=%08x\n",
             r32(g+0x6a8), r32(g+0x688)];
         [s appendFormat:@"obj=%p\n", (void*)r64(g+0x698)];
-        [s appendFormat:@"v330=%p\n", (void*)r64(0x3fc000+0x330)];
+        
         [s appendFormat:@"sc=%llx tc=%llx\n",
             r64(0x3fc000+0x338), r64(0x3fc000+0x340)];
         [s appendFormat:@"arm=%d cn=%d c5=%d\n",
