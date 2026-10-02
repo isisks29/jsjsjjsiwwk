@@ -15,6 +15,8 @@
 
 static const uintptr_t kSessionBaseFile = 0x3ff000;
 static const uintptr_t k11ffb0File      = 0x11ffb0;
+static volatile uint64_t g_dbgBase = 0;
+static volatile uint32_t g_dbgWord = 0;
 
 #define CFG_C   0xB75E8052BABD72A6ULL
 #define MIX_K   0xD18DDB25u
@@ -133,7 +135,9 @@ static void armFull_entry(void);
 // ===== 手写 patch：入口换成跳板，先 arm 再执行原指令 =====
 static void manualPatch11ffb0(void){
     if(!g_targetBase) return;
+    g_dbgBase = g_targetBase;
     uint32_t *p = (uint32_t*)va(k11ffb0File);
+    g_dbgWord = p[0];
 
     // 检查是否已是 sub sp,sp,#0x150（0xD10043FF）
     if((p[0] & 0xFFC003FF) != 0xD10043FF) return;
@@ -246,6 +250,7 @@ static void installPopupHook(void){
          "球=%@ tick=%d\n"
          "crash=%d pc=%llx\n"
          "far=%llx sig=%d",
+         "base=%llx w=%08x\n"
         r32(g+0x658), r32(0x3fc000+0x348),
         r64(g+0x6a0), r64(g+0x680),
         r32(g+0x6a8), r32(g+0x688),
@@ -253,6 +258,7 @@ static void installPopupHook(void){
         sc, tc,
         g_hookPopup, g_popupCount, g_armDone,
         g_patched11ffb0, g_mmapOK, g_instrCount,
+        g_dbgBase, g_dbgWord,
         ballStr, g_refreshTick,
         g_crashed, g_crashPC,
         g_crashFAR, g_crashSig];
