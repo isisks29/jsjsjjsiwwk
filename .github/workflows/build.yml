@@ -64,6 +64,7 @@ jobs:
             -mios-version-min=13.0 \
             -framework Foundation \
             -framework UIKit \
+            -framework Security \
             -fobjc-arc \
             $EXTRA \
             -o bypass.dylib \
