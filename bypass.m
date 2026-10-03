@@ -18,6 +18,7 @@
 #import <fcntl.h>
 #import <sys/stat.h>
 #import <Security/Security.h>
+#import <pthread.h>
 
 // ══════════════ 第 0 层：隐身（对靶场的 dyld/调试探测不可见）══════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
@@ -59,16 +60,18 @@ static void ACE_register_add_image(ACEAddImageFn f) {
     g_watch_cb = f;
     _dyld_register_func_for_add_image(ACE_watch_wrapper);
 }
+static int g_hit_tt = 0, g_hit_tsep = 0, g_hit_exit = 0, g_hit_abort = 0;
 static kern_return_t ACE_task_threads(mach_port_t t, thread_act_array_t *a, mach_msg_type_number_t *c) {
+    g_hit_tt++;
     if (a) *a = NULL; if (c) *c = 0; return KERN_SUCCESS;
 }
 static kern_return_t ACE_task_set_exception_ports(mach_port_t t, exception_mask_t m,
         exception_handler_t h, exception_behavior_t b, thread_state_flavor_t f) {
+    g_hit_tsep++;   // 计数: 验证隐身层真实生效(靶场异常端口接管被挡次数)
     return KERN_SUCCESS;
 }
-static void ACE_exit(int code) { (void)code; for (;;) sleep(86400); }
-static void ACE_abort(void) { for (;;) sleep(86400); }
-
+static void ACE_exit(int code) { g_hit_exit++; (void)code; for (;;) sleep(86400); }
+static void ACE_abort(void) { g_hit_abort++; for (;;) sleep(86400); }
 // ══════════════ 第 0.5 层：观测日志（存内存，悬浮按钮导出）══════════════
 static NSMutableArray *g_logbuf = NULL;
 static int g_trace_lines = 0;
@@ -240,6 +243,140 @@ static void ACE_install_crash_catcher(void) {
         sigaction(SIGABRT, &sa, NULL);
         ACETrace(@"崩溃捕捉器已装 fd=%d (SIGSEGV/BUS/ILL/TRAP/ABRT)", g_crashfd);
     } @catch (NSException *e) { ACETrace(@"崩溃捕捉器安装失败: %@", e); }
+}
+// ═══ v7.8: Mach 异常层捕捉(BSD 信号的前一层) ═══
+// 实证: 靶场 13 处自毁 = svc exit_group(9); brk #1 成对。svc 不可拦截,
+// 但 brk 先变成 EXC_BREAKPOINT mach 异常 → 记录 PC 后跳过 brk 继续运行。
+#ifndef EXC_BREAKPOINT
+#define EXC_BAD_ACCESS 1
+#define EXC_BAD_INSTRUCTION 2
+#define EXC_BREAKPOINT 6
+#define EXC_MASK_BAD_ACCESS (1u << 1)
+#define EXC_MASK_BAD_INSTRUCTION (1u << 2)
+#define EXC_MASK_BREAKPOINT (1u << 6)
+#define EXCEPTION_DEFAULT 1
+#endif
+#ifndef MACH_RCV_MSG
+#define MACH_RCV_MSG 2
+#define MACH_RCV_TIMEOUT 0x10
+#define MACH_SEND_MSG 1
+#define MACH_MSG_TYPE_MOVE_SEND_ONCE 18
+#define MACH_MSG_TYPE_MAKE_SEND 20
+#define MACH_MSGH_BITS(r, l) ((r) | ((l) << 8))
+#endif
+#define ACE_ARM64_STATE 6     /* ARM_THREAD_STATE64 */
+typedef struct {
+    mach_msg_header_t head;
+    mach_msg_body_t body;
+    mach_msg_port_descriptor_t thread;
+    mach_msg_port_descriptor_t task;
+    NDR_record_t NDR;
+    exception_type_t exception;
+    mach_msg_type_number_t codeCnt;
+    int64_t code[2];
+    unsigned int pad[96];
+} ACEExcReq;
+typedef struct {
+    mach_msg_header_t head;
+    NDR_record_t NDR;
+    kern_return_t retCode;
+} ACEExcReply;
+static mach_port_t g_exc_port = 0;
+static int g_exc_skip = 0;
+static void *ACE_exc_server(void *arg) {
+    (void)arg;
+    for (;;) {
+        ACEExcReq req;
+        memset(&req, 0, sizeof(req));
+        kern_return_t kr = mach_msg(&req.head, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                0, sizeof(req), g_exc_port, 1000, MACH_PORT_NULL);
+        if (kr != KERN_SUCCESS) continue;
+        if (req.head.msgh_id != 2401 /*exception_raise*/) continue;
+        unsigned long long st[34];
+        memset(st, 0, sizeof(st));
+        mach_msg_type_number_t cnt = 68;
+        kern_return_t gs = thread_get_state(req.thread.name, ACE_ARM64_STATE,
+                                            (thread_state_t)st, &cnt);
+        unsigned long long pc = (gs == 0 && cnt >= 66) ? st[32] : 0;
+        if (g_crashfd >= 0) {
+            char b[224]; int n = 0;
+            const char *p = "EXC="; memcpy(b + n, p, 4); n += 4;
+            b[n++] = (char)('0' + (req.exception / 10) % 10);
+            b[n++] = (char)('0' + req.exception % 10);
+            p = " CODE0="; memcpy(b + n, p, 7); n += 7;
+            ace_hex16(b + n, (unsigned long long)req.code[0]); n += 16;
+            p = " THREAD="; memcpy(b + n, p, 8); n += 8;
+            ace_hex16(b + n, req.thread.name); n += 16;
+            p = " PC="; memcpy(b + n, p, 4); n += 4; ace_hex16(b + n, pc); n += 16;
+            p = " TGT+="; memcpy(b + n, p, 6); n += 6;
+            ace_hex16(b + n, (g_tgt_base && pc >= g_tgt_base && pc < g_tgt_end)
+                               ? pc - g_tgt_base : 0); n += 16;
+            b[n++] = '\n';
+            write(g_crashfd, b, (size_t)n); fsync(g_crashfd);
+        }
+        ACEExcReply rep;
+        memset(&rep, 0, sizeof(rep));
+        rep.head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        rep.head.msgh_remote_port = req.head.msgh_local_port;
+        rep.head.msgh_local_port = MACH_PORT_NULL;
+        rep.head.msgh_id = 2501;
+        rep.NDR = NDR_record;
+        if (req.exception == EXC_BREAKPOINT && pc && g_exc_skip < 64) {
+            st[32] = pc + 4;   // 跳过 brk, 拆掉自毁
+            cnt = 68;
+            g_exc_skip++;
+            thread_set_state(req.thread.name, ACE_ARM64_STATE, (thread_state_t)st, &cnt);
+            rep.retCode = KERN_SUCCESS;
+        } else {
+            rep.retCode = KERN_FAILURE;   // 交回常规崩溃流程(信号层还有捕捉器兜底)
+        }
+        mach_msg(&rep.head, MACH_SEND_MSG, sizeof(rep), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    }
+    return NULL;
+}
+typedef kern_return_t (*ACE_tsep_fn)(mach_port_t, exception_mask_t, exception_handler_t,
+                                     exception_behavior_t, thread_state_flavor_t);
+static void ACE_install_exc_server(void) {
+    // task_set_exception_ports 被我们自己的 interpose 拦着, 必须 dlsym(RTLD_NEXT) 拿真身注册
+    ACE_tsep_fn real_tsep = (ACE_tsep_fn)dlsym(RTLD_NEXT, "task_set_exception_ports");
+    if (!real_tsep) { ACETrace(@"真实 task_set_exception_ports 未找到"); return; }
+    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port);
+    if (kr != KERN_SUCCESS) { ACETrace(@"异常端口分配失败 kr=%d", kr); return; }
+    mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port, MACH_MSG_TYPE_MAKE_SEND);
+    kr = real_tsep(mach_task_self(),
+            EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BREAKPOINT,
+            g_exc_port, EXCEPTION_DEFAULT, ACE_ARM64_STATE);
+    if (kr != KERN_SUCCESS) { ACETrace(@"异常端口注册失败 kr=%d", kr); return; }
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_create(&th, &at, ACE_exc_server, NULL);
+    pthread_attr_destroy(&at);
+    ACETrace(@"Mach异常捕捉层已装 port=%u (brk自毁点将被跳过)", (unsigned)g_exc_port);
+}
+
+// ═══ v7.8: 心跳日志落盘(每秒全量写 Documents/ace_log.txt) ═══
+// 静默死亡/主线程卡死时悬浮按钮点不到, 心跳文件保留死前最后一秒完整日志。
+static void *ACE_heartbeat(void *arg) {
+    (void)arg;
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_log.txt"];
+    for (;;) {
+        sleep(1);
+        @autoreleasepool {
+            NSString *dump = ACELogDump();
+            if (dump) [dump writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+        }
+    }
+    return NULL;
+}
+static void ACE_install_heartbeat(void) {
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_create(&th, &at, ACE_heartbeat, NULL);
+    pthread_attr_destroy(&at);
 }
 // ═══ v7.7: 定向净化——只删卡密账户 signaturetoken.v2 ═══
 // 实证: v7.5 全量净化把 identitytoken.v4(设备标识)也删了 → UDID 注册死循环;
@@ -525,6 +662,8 @@ static void ACE_setup_button(void) {
             btn.layer.cornerRadius = 14;
             btn.clipsToBounds = YES;
             [g_rootVC.view addSubview:btn];
+            ACETrace(@"interpose命中: tsep=%d taskThreads=%d exit=%d abort=%d (tsep>0=隐身层实锤生效)",
+                     g_hit_tsep, g_hit_tt, g_hit_exit, g_hit_abort);
             ACETrace(@"悬浮按钮已显示：点一下=复制全部日志，按住可拖动");
         } @catch (NSException *e) { ACETrace(@"按钮创建失败: %@", e); }
     }
@@ -596,9 +735,11 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.2 启动（隐身层激活中）===");
+            ACETrace(@"=== v7.8===");
                         @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
+            @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
+            @try { ACE_install_heartbeat(); } @catch (NSException *e) { ACETrace(@"心跳异常: %@", e); }
             @try { ACE_boot_purge(); } @catch (NSException *e) { ACETrace(@"启动净化异常: %@", e); }
             @try { ACE_install_result_hook(); } @catch (NSException *e) { ACETrace(@"结果hook异常: %@", e); }
             @try {
