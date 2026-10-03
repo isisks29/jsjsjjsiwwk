@@ -218,6 +218,16 @@ static void ACE_report_last_crash(void) {
         } else {
             ACETrace(@"上次崩溃文件为空: 若上次确实闪退, 说明是【裸svc exit_group】类不可捕获自毁");
         }
+        NSData *td2 = [NSData dataWithContentsOfFile:
+            [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_trace.txt"]];
+        if (td2 && [td2 length]) {
+            NSString *ts = [[NSString alloc] initWithData:td2 encoding:NSUTF8StringEncoding];
+            if (ts) {
+                ACETrace(@"上次死前线程指纹(靶场内偏移):\n%@", ts);
+                [UIPasteboard generalPasteboard].string =
+                    [NSString stringWithFormat:@"[ace死前指纹]\n%@", ts];
+            }
+        }
     } @catch (NSException *e) {}
 }
 static void ACE_install_crash_catcher(void) {
@@ -355,8 +365,9 @@ static void ACE_install_exc_server(void) {
     pthread_attr_destroy(&at);
     ACETrace(@"Mach异常捕捉层已装 port=%u (brk自毁点将被跳过)", (unsigned)g_exc_port);
 }
-
-// ═══ v7.8: 心跳日志落盘(每秒全量写 Documents/ace_log.txt) ═══
+// v7.9 飞行记录器环形缓冲(心跳线程要用, 先前置声明)
+static char g_ring[8][240];
+static volatile int g_ring_i = 0, g_ring_n = 0;
 // 静默死亡/主线程卡死时悬浮按钮点不到, 心跳文件保留死前最后一秒完整日志。
 static void *ACE_heartbeat(void *arg) {
     (void)arg;
@@ -366,6 +377,14 @@ static void *ACE_heartbeat(void *arg) {
         @autoreleasepool {
             NSString *dump = ACELogDump();
             if (dump) [dump writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+            NSMutableString *tr = [NSMutableString string];
+            int start = (g_ring_i - g_ring_n + 8) & 7;
+            for (int k = 0; k < g_ring_n; k++) {
+                [tr appendString:[NSString stringWithUTF8String:g_ring[(start + k) & 7]]];
+                [tr appendString:@"\n"];
+            }
+            NSString *tp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_trace.txt"];
+            [tr writeToFile:tp atomically:NO encoding:NSUTF8StringEncoding error:NULL];
         }
     }
     return NULL;
@@ -377,6 +396,74 @@ static void ACE_install_heartbeat(void) {
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_create(&th, &at, ACE_heartbeat, NULL);
     pthread_attr_destroy(&at);
+}
+// ═══ v7.9: 飞行记录器——每150ms采样全线程PC, 只记靶场范围内偏移 ═══
+// 静默死亡(裸svc exit_group/SIGKILL)无异常无信号可捕; 死前最后一拍采样
+// = 凶手检测函数的指纹。环形8拍, 心跳线程每秒落盘 Documents/ace_trace.txt。
+typedef kern_return_t (*ACE_tt_fn)(mach_port_t, thread_act_array_t *, mach_msg_type_number_t *);
+static void *ACE_flight_recorder(void *arg) {
+    (void)arg;
+    ACE_tt_fn real_tt = (ACE_tt_fn)dlsym(RTLD_NEXT, "task_threads");   // 绕过自家 interpose
+    if (!real_tt) return NULL;
+    for (;;) {
+        usleep(150000);
+        if (!g_tgt_base) continue;
+        thread_act_array_t list = NULL;
+        mach_msg_type_number_t n = 0;
+        if (real_tt(mach_task_self(), &list, &n) != KERN_SUCCESS || !list) continue;
+        char line[240]; int p = 0;
+        memcpy(line, "PC:", 3); p = 3;
+        for (unsigned i = 0; i < n && p < 200; i++) {
+            unsigned long long stt[34];
+            memset(stt, 0, sizeof(stt));
+            mach_msg_type_number_t c = 68;
+            if (thread_get_state(list[i], ACE_ARM64_STATE, (thread_state_t)stt, &c) == 0 && c >= 66) {
+                unsigned long long pc = stt[32];
+                if (pc >= g_tgt_base && pc < g_tgt_end) {
+                    static const char *hd = "0123456789abcdef";
+                    unsigned long long off = pc - g_tgt_base;
+                    line[p++] = ' ';
+                    for (int k = 28; k >= 0; k -= 4) line[p++] = hd[(off >> k) & 0xf];
+                }
+            }
+        }
+        line[p] = 0;
+        vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
+        strcpy(g_ring[g_ring_i], line);
+        g_ring_i = (g_ring_i + 1) & 7;
+        if (g_ring_n < 8) g_ring_n++;
+    }
+    return NULL;
+}
+
+// ═══ v7.9: EndTime 持续补喂——每50ms把 ctx+0x78 顶回 2100 ═══
+// 实证(v7.8日志): prime 写入后"到期时间"仍空白 → 成功路径里有代码事后清零;
+// 清零后过期检测读到 0 → 判过期 → 裸svc自毁(与"授权成功弹窗瞬间闪退"吻合)。
+// 只写堆上数据(非.text), 安全面与 v7.4 prime 相同。
+static void *ACE_endtime_keeper(void *arg) {
+    (void)arg;
+    for (;;) {
+        usleep(50000);
+        @try {
+            if (!g_tgt_base) continue;
+            uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
+            if (ctx < 0x100000000ULL) continue;
+            volatile double *endp = (volatile double *)(ctx + 0x78);
+            double now = (double)time(NULL);
+            if (*endp < now + 86400.0) *endp = 4102444800.0;
+        } @catch (NSException *e) {}
+    }
+    return NULL;
+}
+static void ACE_install_v79_threads(void) {
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_create(&th, &at, ACE_flight_recorder, NULL);
+    pthread_create(&th, &at, ACE_endtime_keeper, NULL);
+    pthread_attr_destroy(&at);
+    ACETrace(@"v7.9 飞行记录器+EndTime守护已启动");
 }
 // ═══ v7.7: 定向净化——只删卡密账户 signaturetoken.v2 ═══
 // 实证: v7.5 全量净化把 identitytoken.v4(设备标识)也删了 → UDID 注册死循环;
@@ -735,11 +822,12 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.8===");
+            ACETrace(@"=== v7.9===");
                         @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
             @try { ACE_install_heartbeat(); } @catch (NSException *e) { ACETrace(@"心跳异常: %@", e); }
+            @try { ACE_install_v79_threads(); } @catch (NSException *e) { ACETrace(@"v7.9线程异常: %@", e); }
             @try { ACE_boot_purge(); } @catch (NSException *e) { ACETrace(@"启动净化异常: %@", e); }
             @try { ACE_install_result_hook(); } @catch (NSException *e) { ACETrace(@"结果hook异常: %@", e); }
             @try {
