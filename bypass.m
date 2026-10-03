@@ -1,6 +1,4 @@
 
-
-
 #define ACE_TRACE          1   // 1=观测探针（本轮用这个）
 #define ACE_ENABLE_OBJC_LAYER 0 // 本轮必须为 0：不干扰原始校验流程
 
@@ -135,8 +133,8 @@ void ACELogExternal(const char *utf8) {
     g_ace_busy = 0;
 }
 
-// 记录闸门：就绪且不重入才记，记完立刻交还
-#define ACE_G(...) do { if (g_ace_ready && !g_ace_busy) { g_ace_busy = 1; ACETrace(__VA_ARGS__); g_ace_busy = 0; } } while (0)
+// 记录闸门：就绪且不重入才记，记完立刻交还（对外来对象取文本可能抛异常，@try 护住）
+#define ACE_G(...) do { if (g_ace_ready && !g_ace_busy) { g_ace_busy = 1; @try { ACETrace(__VA_ARGS__); } @catch (NSException *e) {} g_ace_busy = 0; } } while (0)
 
 // 截断对象文本（%@ 不允许带精度，超长截断必须手动做）
 static NSString *ACETrimStr(id obj, NSUInteger n) {
@@ -406,49 +404,49 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "v@:")) {
         void (^b)(id, SEL) = ^(id s, SEL c) {
             ((void (*)(id, SEL))orig)(s, c);
-            ACE_G(@"核心·%@()", sn);
+            ACE_G(@"跟踪·%@()", sn);
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:@")) {
         void (^b)(id, SEL, id) = ^(id s, SEL c, id a) {
             ((void (*)(id, SEL, id))orig)(s, c, a);
-            ACE_G(@"核心·%@(%@)", sn, ACETrimStr(a, 120));
+            ACE_G(@"跟踪·%@(%@)", sn, ACETrimStr(a, 120));
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:c")) {
         void (^b)(id, SEL, char) = ^(id s, SEL c, char a) {
             ((void (*)(id, SEL, char))orig)(s, c, a);
-            ACE_G(@"核心·%@(%d)", sn, (int)a);
+            ACE_G(@"跟踪·%@(%d)", sn, (int)a);
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:i")) {
         void (^b)(id, SEL, int) = ^(id s, SEL c, int a) {
             ((void (*)(id, SEL, int))orig)(s, c, a);
-            ACE_G(@"核心·%@(%d)", sn, a);
+            ACE_G(@"跟踪·%@(%d)", sn, a);
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:q")) {
         void (^b)(id, SEL, long long) = ^(id s, SEL c, long long a) {
             ((void (*)(id, SEL, long long))orig)(s, c, a);
-            ACE_G(@"核心·%@(%lld)", sn, a);
+            ACE_G(@"跟踪·%@(%lld)", sn, a);
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:Q")) {
         void (^b)(id, SEL, unsigned long long) = ^(id s, SEL c, unsigned long long a) {
             ((void (*)(id, SEL, unsigned long long))orig)(s, c, a);
-            ACE_G(@"核心·%@(%llu)", sn, a);
+            ACE_G(@"跟踪·%@(%llu)", sn, a);
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:d")) {
         void (^b)(id, SEL, double) = ^(id s, SEL c, double a) {
             ((void (*)(id, SEL, double))orig)(s, c, a);
-            ACE_G(@"核心·%@(%f)", sn, a);
+            ACE_G(@"跟踪·%@(%f)", sn, a);
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
@@ -456,7 +454,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "c@:") || !strcmp(enc, "B@:")) {
         char (^b)(id, SEL) = ^char(id s, SEL c) {
             char r = ((char (*)(id, SEL))orig)(s, c);
-            ACE_G(@"核心·%@()=%d", sn, (int)r);
+            ACE_G(@"跟踪·%@()=%d", sn, (int)r);
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -464,7 +462,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "c@:@") || !strcmp(enc, "B@:@")) {
         char (^b)(id, SEL, id) = ^char(id s, SEL c, id a) {
             char r = ((char (*)(id, SEL, id))orig)(s, c, a);
-            ACE_G(@"核心·%@(%@)=%d", sn, ACETrimStr(a, 120), (int)r);
+            ACE_G(@"跟踪·%@(%@)=%d", sn, ACETrimStr(a, 120), (int)r);
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -472,7 +470,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "i@:")) {
         int (^b)(id, SEL) = ^int(id s, SEL c) {
             int r = ((int (*)(id, SEL))orig)(s, c);
-            ACE_G(@"核心·%@()=%d", sn, r);
+            ACE_G(@"跟踪·%@()=%d", sn, r);
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -480,7 +478,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "q@:")) {
         long long (^b)(id, SEL) = ^long long(id s, SEL c) {
             long long r = ((long long (*)(id, SEL))orig)(s, c);
-            ACE_G(@"核心·%@()=%lld", sn, r);
+            ACE_G(@"跟踪·%@()=%lld", sn, r);
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -488,7 +486,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "q@:@")) {
         long long (^b)(id, SEL, id) = ^long long(id s, SEL c, id a) {
             long long r = ((long long (*)(id, SEL, id))orig)(s, c, a);
-            ACE_G(@"核心·%@(%@)=%lld", sn, ACETrimStr(a, 120), r);
+            ACE_G(@"跟踪·%@(%@)=%lld", sn, ACETrimStr(a, 120), r);
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -496,7 +494,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "d@:")) {
         double (^b)(id, SEL) = ^double(id s, SEL c) {
             double r = ((double (*)(id, SEL))orig)(s, c);
-            ACE_G(@"核心·%@()=%f", sn, r);
+            ACE_G(@"跟踪·%@()=%f", sn, r);
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -504,7 +502,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "i@:@")) {
         int (^b)(id, SEL, id) = ^int(id s, SEL c, id a) {
             int r = ((int (*)(id, SEL, id))orig)(s, c, a);
-            ACE_G(@"核心·%@(%@)=%d", sn, ACETrimStr(a, 120), r);
+            ACE_G(@"跟踪·%@(%@)=%d", sn, ACETrimStr(a, 120), r);
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -512,7 +510,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "d@:@")) {
         double (^b)(id, SEL, id) = ^double(id s, SEL c, id a) {
             double r = ((double (*)(id, SEL, id))orig)(s, c, a);
-            ACE_G(@"核心·%@(%@)=%f", sn, ACETrimStr(a, 120), r);
+            ACE_G(@"跟踪·%@(%@)=%f", sn, ACETrimStr(a, 120), r);
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -520,7 +518,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "@@:")) {
         id (^b)(id, SEL) = ^id(id s, SEL c) {
             id r = ((id (*)(id, SEL))orig)(s, c);
-            ACE_G(@"核心·%@()=%@", sn, ACETrimStr(r, 120));
+            ACE_G(@"跟踪·%@()=%@", sn, ACETrimStr(r, 120));
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
@@ -528,21 +526,23 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
     if (!strcmp(enc, "@@:@")) {
         id (^b)(id, SEL, id) = ^id(id s, SEL c, id a) {
             id r = ((id (*)(id, SEL, id))orig)(s, c, a);
-            ACE_G(@"核心·%@(%@)=%@", sn, ACETrimStr(a, 120), ACETrimStr(r, 120));
+            ACE_G(@"跟踪·%@(%@)=%@", sn, ACETrimStr(a, 120), ACETrimStr(r, 120));
             return r;
         };
         ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     return NULL; // 没见过的编码：宁可跳过也不瞎包
 }
-// v5.7 普查：列出授权核心全部方法/成员，并把能识别编码的方法都套上记录壳
+// v5.7/v5.8 普查：列出授权核心全部方法/成员并套壳。此处日志必须用 ACETrace——
+// 普查跑在 +load 保护区（busy=1）里，ACE_G 会被闸门吞掉（v5.7 的坑）。
 static void ACE_sweepCore(Class core) {
     Class sup = class_getSuperclass(core);
-    ACE_G(@"核心父类: %s", sup ? class_getName(sup) : "?");
+    ACETrace(@"核心父类: %s", sup ? class_getName(sup) : "?");
+    const char *cn = class_getName(core);
     unsigned int ic = 0;
     Ivar *ivs = class_copyIvarList(core, &ic);
     for (unsigned int k = 0; k < ic; k++)
-        ACE_G(@"成员 %u/%u: %s [%s]", k + 1, ic, ivar_getName(ivs[k]) ?: "?", ivar_getTypeEncoding(ivs[k]) ?: "?");
+        ACETrace(@"成员 %u/%u: %s [%s]", k + 1, ic, ivar_getName(ivs[k]) ?: "?", ivar_getTypeEncoding(ivs[k]) ?: "?");
     free(ivs);
     unsigned int mc = 0;
     Method *ms = class_copyMethodList(core, &mc);
@@ -551,9 +551,10 @@ static void ACE_sweepCore(Class core) {
         SEL sel = method_getName(ms[k]);
         const char *enc = method_getTypeEncoding(ms[k]) ?: "?";
         NSString *sn = NSStringFromSelector(sel);
-        ACE_G(@"实例方法 %u/%u: %@ [%s]", k + 1, mc, sn, enc);
+        ACETrace(@"实例方法 %u/%u: %@ [%s]", k + 1, mc, sn, enc);
         if (ACE_isSpecial(sel)) continue;
-        IMP imp = ACE_makeWrap(method_getImplementation(ms[k]), sn, enc);
+        NSString *tag = [NSString stringWithFormat:@"%s·%@", cn, sn];
+        IMP imp = ACE_makeWrap(method_getImplementation(ms[k]), tag, enc);
         if (imp) { method_setImplementation(ms[k], imp); swept++; }
         else { skipped++; }
     }
@@ -563,12 +564,55 @@ static void ACE_sweepCore(Class core) {
     for (unsigned int k = 0; k < cmc; k++) {
         SEL sel = method_getName(cms[k]);
         const char *enc = method_getTypeEncoding(cms[k]) ?: "?";
-        ACE_G(@"类方法 %u/%u: %@ [%s]", k + 1, cmc, NSStringFromSelector(sel), enc);
-        IMP imp = ACE_makeWrap(method_getImplementation(cms[k]), NSStringFromSelector(sel), enc);
+        NSString *sn = NSStringFromSelector(sel);
+        ACETrace(@"类方法 %u/%u: %@ [%s]", k + 1, cmc, sn, enc);
+        NSString *tag = [NSString stringWithFormat:@"类·%@", sn];
+        IMP imp = ACE_makeWrap(method_getImplementation(cms[k]), tag, enc);
         if (imp) method_setImplementation(cms[k], imp);
     }
     free(cms);
-    ACE_G(@"普查完成: 实例包 %d / 跳过 %d / 类方法 %d", swept, skipped, cmc);
+    ACETrace(@"普查完成: 实例包 %d / 跳过 %d / 类方法 %d", swept, skipped, cmc);
+}
+// v5.8 广域普查：给一个类里「恰好一个对象参数」的方法（编码 x@:@）套记录壳。
+// 收卡密/回调类方法都是这个形状；drawRect:/坐标类参数编码不符自动跳过，不产逐帧噪音。
+static int ACE_sweepOneArgMethodsIn(Class c) {
+    const char *nm = class_getName(c);
+    int w = 0;
+    Class targets[2] = { c, object_getClass(c) };
+    for (int t = 0; t < 2; t++) {
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(targets[t], &mc);
+        for (unsigned int k = 0; k < mc; k++) {
+            SEL sel = method_getName(ms[k]);
+            const char *enc = method_getTypeEncoding(ms[k]);
+            if (!enc || enc[3] != '@' || enc[4] != '\0') continue;   // 只要 "x@:@"
+            if (!strchr("vciqB@", enc[0])) continue;                 // 返回值认得清才包
+            if (t == 0 && ACE_isSpecial(sel) && strstr(nm, "7D3B5E28")) continue; // 核心 8 个专用壳不叠加
+            NSString *tag = [NSString stringWithFormat:@"%s·%@", nm, NSStringFromSelector(sel)];
+            IMP imp = ACE_makeWrap(method_getImplementation(ms[k]), tag, enc);
+            if (imp) { method_setImplementation(ms[k], imp); w++; }
+        }
+        free(ms);
+    }
+    if (w) ACETrace(@"广域: %s 包 %d", nm, w);
+    return w;
+}
+static void ACE_wideSweepClasses(void) {
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    int hit = 0, tot = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = class_getName(list[i]);
+        if (!nm || !strstr(nm, "_0x")) continue;                 // 靶场类全是 _0x 开头
+        char *img = class_getImageName(list[i]);                  // 归属镜像确认，避免误包游戏/系统类
+        BOOL mine = (img != NULL) && (strstr(img, "ballsace") != NULL);
+        free(img);
+        if (!mine) continue;
+        hit++;
+        tot += ACE_sweepOneArgMethodsIn(list[i]);
+    }
+    free(list);
+    ACETrace(@"广域普查完成: 靶场类 %d 个 / 方法共包 %d 个", hit, tot);
 }
 #endif
 
@@ -623,6 +667,7 @@ static void ACE_sweepCore(Class core) {
                 } else {
                     ACETrace(@"授权核心类缺失！IPA 内 dylib 与 GitHub 版不一致");
                 }
+                ACE_wideSweepClasses();
             } @catch (NSException *e) { ACETrace(@"探针挂设异常: %@", e); }
             g_ace_busy = 0;
             // 按钮晚 1 秒再建，避开启动早期最脆弱的阶段
