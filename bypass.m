@@ -1,4 +1,4 @@
-#define ACE_ENABLE_OBJC_LAYER 0
+#define ACE_ENABLE_OBJC_LAYER 1
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
