@@ -271,6 +271,6 @@ static void initBy(void){
                 if(f){ f(); g_called5c = 1; }
             }
             spawnBall();
-        });
+        };
     }
 }
