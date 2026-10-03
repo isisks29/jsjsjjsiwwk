@@ -447,6 +447,34 @@ static void *ACE_flight_recorder(void *arg) {
     ACE_tt_fn real_tt = ACE_real_task_threads();
     if (!real_tt) { ACETrace(@"[rec] 真实task_threads解析失败, 线程采样不可用"); return NULL; }
     ACETrace(@"[rec] 采样启动 real_tt=%p", (void *)real_tt);
+    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
+        int hadTarget = (p > 3);
+        strcpy(g_ring[g_ring_i], line);
+        g_ring_i = (g_ring_i + 1) & 7;
+        if (g_ring_n < 8) g_ring_n++;
+        // v7.16: 记录器自落盘(不依赖心跳), 只在采到靶场PC时写, 死前指纹必达
+        if (hadTarget) {
+            static NSString *tp = nil;
+            static dispatch_once_t onceTok;
+            dispatch_once(&onceTok, ^{
+                tp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_trace.txt"];
+            });
+            NSMutableString *tr = [NSMutableString string];
+            int st2 = (g_ring_i - g_ring_n + 8) & 7;
+            for (int k = 0; k < g_ring_n; k++) {
+                [tr appendString:[NSString stringWithUTF8String:g_ring[(st2 + k) & 7]]];
+                [tr appendString:@"\n"];
+            }
+            [tr writeToFile:tp atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+            static int logged_once = 0;
+            if (!logged_once) {
+                logged_once = 1;
+                ACETrace(@"[rec] 首拍命中靶场PC, 指纹落盘已激活");
+            }
+        }
+    }
+    return NULL;
+}
 }
 
 // ═══ v7.9: EndTime 持续补喂——每50ms把 ctx+0x78 顶回 2100 ═══
