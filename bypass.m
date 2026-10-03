@@ -81,7 +81,7 @@ static int g_ace_busy = 0;
 static int g_ace_ready = 0;
 
 static void ACETraceLine(NSString *line) {
-    if (g_trace_lines > 5000) return; // 总量封顶
+    if (g_trace_lines > 20000) return; // 总量封顶
     g_trace_lines++;
     @autoreleasepool { NSLog(@"%@", line); }
     @synchronized ([NSMutableArray class]) {
@@ -219,6 +219,18 @@ static void ACE_report_last_crash(void) {
             });
         } else {
             ACETrace(@"上次崩溃文件为空: 若上次确实闪退, 说明是【裸svc exit_group】类不可捕获自毁");
+        }
+        NSData *ld3 = [NSData dataWithContentsOfFile:
+            [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_log.txt"]];
+        if (ld3 && [ld3 length]) {
+            NSString *ls = [[NSString alloc] initWithData:ld3 encoding:NSUTF8StringEncoding];
+            if (ls) {
+                NSUInteger L = [ls length];
+                NSString *tail = (L > 2600) ? [ls substringFromIndex:L - 2600] : ls;
+                ACETrace(@"===== 上次运行最后日志(心跳落盘, 末尾=死前瞬间) =====\n%@", tail);
+                [UIPasteboard generalPasteboard].string =
+                    [NSString stringWithFormat:@"[ace死前日志尾]\n%@", tail];
+            }
         }
         NSData *td2 = [NSData dataWithContentsOfFile:
             [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_trace.txt"]];
@@ -603,7 +615,8 @@ static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
             uintptr_t inv = (uintptr_t)hdrp[2];           // block 布局: invoke 在 +16
             if (inv >= g_tgt_base && inv < g_tgt_end) {
                 uintptr_t off = inv - g_tgt_base;
-                if (off == 0xef0c8ULL) {                   // 弹窗验卡结果: capture+0x38 → 0
+                ACETrace(@"[disp] +0x%lx", (unsigned long)off);   // v7.11 面包屑: 死前最后几行=凶手
+                if (off == 0xef0c8ULL) {                // 弹窗验卡结果: capture+0x38 → 0
                     volatile int32_t *slot = (volatile int32_t *)((uintptr_t)(__bridge void *)blk + 0x38);
                     if (*slot != 0) {
                         ACETrace(@"[hook] 弹窗验卡结果 %d → 0（强制成功路径）", *slot);
@@ -824,7 +837,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.9===");
+            ACETrace(@"=== v7.11 启动（隐身层激活中）===");
                         @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
