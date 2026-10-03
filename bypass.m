@@ -53,8 +53,10 @@ static const struct mach_header *ACE_image_header(uint32_t i) {
 static ACEAddImageFn g_watch_cb = NULL;
 static void ACE_watch_wrapper(const struct mach_header *mh, intptr_t slide) {
     if (!g_watch_cb) return;
-    if (mh && mh == ACE_self_header()) g_watch_cb(_dyld_get_image_header(0), slide);
-    else g_watch_cb(mh, slide);
+    // v7.10: 自己的镜像绝不转发。旧版换成 image0 的头配我们的 slide 转发,
+    // 靶场解密引擎(pm_poolmin_prepare)拿到错配组合算出野指针 → 启动随机 SIGSEGV
+    if (mh && mh == ACE_self_header()) return;
+    g_watch_cb(mh, slide);
 }
 static void ACE_register_add_image(ACEAddImageFn f) {
     g_watch_cb = f;
