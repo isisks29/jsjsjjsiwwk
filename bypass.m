@@ -16,6 +16,8 @@
 #import <math.h>
 #import <signal.h>
 #import <fcntl.h>
+#import <sys/stat.h>
+#import <Security/Security.h>
 
 // ══════════════ 第 0 层：隐身（对靶场的 dyld/调试探测不可见）══════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
@@ -188,20 +190,40 @@ static void ACE_crash_handler(int sig, siginfo_t *info, void *uctx) {
 static NSString *ACE_crash_path(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_crash.txt"];
 }
+static UIViewController *ACE_topVC(void);   // 前置声明(定义在悬浮按钮段)
 static void ACE_report_last_crash(void) {
     @try {
         NSData *d = [NSData dataWithContentsOfFile:ACE_crash_path()];
         if (d && [d length]) {
             NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-            ACETrace(@"上次崩溃现场: %@", s ?: @"(解析失败)");
+            if (!s) s = @"(解析失败)";
+            ACETrace(@"上次崩溃现场: %@", s);
+            [UIPasteboard generalPasteboard].string =
+                [NSString stringWithFormat:@"[ace崩溃现场]\n%@", s];
+            dispatch_after(dispatch_time(0, 300000000), dispatch_get_main_queue(), ^{
+                @try {
+                    NSString *body = [s length] > 500 ? [s substringToIndex:500] : s;
+                    UIAlertController *a = [UIAlertController
+                        alertControllerWithTitle:@"上次崩溃现场(已复制到剪贴板)"
+                        message:body preferredStyle:UIAlertControllerStyleAlert];
+                    [a addAction:[UIAlertAction actionWithTitle:@"知道了"
+                        style:UIAlertActionStyleDefault handler:nil]];
+                    UIViewController *host = ACE_topVC();
+                    if (host) [host presentViewController:a animated:YES completion:nil];
+                } @catch (NSException *e3) {}
+            });
+        } else {
+            ACETrace(@"上次崩溃文件为空: 若上次确实闪退, 说明是【裸svc exit_group】类不可捕获自毁");
         }
     } @catch (NSException *e) {}
 }
 static void ACE_install_crash_catcher(void) {
     @try {
         g_self_base = (uintptr_t)ACE_self_header();
-        g_crashfd = open(ACE_crash_path().fileSystemRepresentation,
-                         O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        struct stat fsb;
+        int oflags = O_CREAT | O_WRONLY | ((stat(ACE_crash_path().fileSystemRepresentation, &fsb) == 0
+                                            && fsb.st_size < 4096) ? O_APPEND : O_TRUNC);
+        g_crashfd = open(ACE_crash_path().fileSystemRepresentation, oflags, 0644);
         static stack_t ss;                 // 备用信号栈(栈溢出时也能记)
         static char altbuf[128 * 1024];
         ss.ss_sp = altbuf; ss.ss_size = sizeof(altbuf); ss.ss_flags = 0;
@@ -218,6 +240,38 @@ static void ACE_install_crash_catcher(void) {
         sigaction(SIGABRT, &sa, NULL);
         ACETrace(@"崩溃捕捉器已装 fd=%d (SIGSEGV/BUS/ILL/TRAP/ABRT)", g_crashfd);
     } @catch (NSException *e) { ACETrace(@"崩溃捕捉器安装失败: %@", e); }
+}
+// ═══ v7.5 新增: 启动净化——清掉本 app 的钥匙串条目与 UserDefaults ═══
+// 实证: iOS 卸载不清钥匙串(SAMKeychain 用自身 access group, 删除重装仍在),
+// 首轮强制成功写入的 TEST123/半初始化状态会毒化后续每次启动(你遇到的启动即闪退死循环)。
+#define ACE_VIRGIN_PURGE 1
+static void ACE_boot_purge(void) {
+#if ACE_VIRGIN_PURGE
+    @try {
+        NSMutableDictionary *q = [NSMutableDictionary dictionary];
+        [q setObject:(__bridge id)kSecClassGenericPassword forKey:(__bridge id)kSecClass];
+        [q setObject:(__bridge id)kSecMatchLimitAll forKey:(__bridge id)kSecMatchLimit];
+        [q setObject:[NSNumber numberWithBool:YES] forKey:(__bridge id)kSecReturnAttributes];
+        CFTypeRef res = NULL;
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
+        int n = 0;
+        if (st == errSecSuccess && res && CFGetTypeID(res) == CFArrayGetTypeID()) {
+            NSArray *items = (__bridge_transfer NSArray *)res;
+            for (id item in items) {
+                NSMutableDictionary *del = [NSMutableDictionary dictionary];
+                [del setObject:(__bridge id)kSecClassGenericPassword forKey:(__bridge id)kSecClass];
+                id svc = [(NSDictionary *)item objectForKey:(__bridge id)kSecAttrService];
+                id acct = [(NSDictionary *)item objectForKey:(__bridge id)kSecAttrAccount];
+                if (svc) [del setObject:svc forKey:(__bridge id)kSecAttrService];
+                if (acct) [del setObject:acct forKey:(__bridge id)kSecAttrAccount];
+                if (SecItemDelete((__bridge CFDictionaryRef)del) == errSecSuccess) n++;
+            }
+        } else if (res) { CFRelease(res); }
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+        [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
+        ACETrace(@"启动净化: 钥匙串删 %d 条, UserDefaults 已清 (%@)", n, bid);
+    } @catch (NSException *e) { ACETrace(@"启动净化异常: %@", e); }
+#endif
 }
 
 
@@ -539,6 +593,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             ACETrace(@"=== v7.2 启动（隐身层激活中）===");
                         @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
+            @try { ACE_boot_purge(); } @catch (NSException *e) { ACETrace(@"启动净化异常: %@", e); }
             @try { ACE_install_result_hook(); } @catch (NSException *e) { ACETrace(@"结果hook异常: %@", e); }
             @try {
                 Class kc = NSClassFromString(@"_0xD5A13E79");   // 靶场内 SAMKeychain 封装类
