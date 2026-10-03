@@ -17,7 +17,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-// ══════════════ 第 0 层：隐身（保持不变）══════════════════════════
+// ══════════════ 第 0 层：隐身（按名字过滤模块）════════════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
 
 static const struct mach_header *ACE_self_header(void) {
@@ -26,32 +26,60 @@ static const struct mach_header *ACE_self_header(void) {
         return (const struct mach_header *)info.dli_fbase;
     return NULL;
 }
-static int g_our_index = -1;
-static int ACE_find_our_index(void) {
-    if (g_our_index >= 0) return g_our_index;
-    const struct mach_header *self = ACE_self_header();
-    if (!self) return -1;
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++)
-        if (_dyld_get_image_header(i) == self) { g_our_index = (int)i; return g_our_index; }
-    return -1;
+// ASCII 大小写不敏感子串
+static int ACE_stristr(const char *hay, const char *needle) {
+    if (!hay || !needle || !*needle) return hay && !*needle;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i]) {
+            char a = p[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return 1;
+    }
+    return 0;
 }
+// 命中任一关键词的动态库，对目标程序“不存在”
+static int ACE_name_hidden(const char *n) {
+    if (!n) return 0;
+    static const char *kws[] = { "libacepatch", "frida", "cycript", "substrate",
+                                 "tweakinject", "liberty", "sileo", "ellekit" };
+    for (int k = 0; k < 8; k++)
+        if (ACE_stristr(n, kws[k])) return 1;
+    return 0;
+}
+static int ACE_hidden_at(uint32_t i) { return ACE_name_hidden(_dyld_get_image_name(i)); }
 static uint32_t ACE_image_count(void) {
-    return (uint32_t)((int)_dyld_image_count() - (ACE_find_our_index() >= 0 ? 1 : 0));
+    uint32_t n = _dyld_image_count(), h = 0;
+    for (uint32_t i = 0; i < n; i++) if (ACE_hidden_at(i)) h++;
+    return n - h;
 }
 static const char *ACE_image_name(uint32_t i) {
-    int o = ACE_find_our_index();
-    return _dyld_get_image_name((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+    uint32_t n = _dyld_image_count();
+    for (uint32_t j = 0; j < n; j++)
+        if (!ACE_hidden_at(j)) { if (i == 0) return _dyld_get_image_name(j); i--; }
+    return NULL;
 }
 static const struct mach_header *ACE_image_header(uint32_t i) {
-    int o = ACE_find_our_index();
-    return _dyld_get_image_header((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+    uint32_t n = _dyld_image_count();
+    for (uint32_t j = 0; j < n; j++)
+        if (!ACE_hidden_at(j)) { if (i == 0) return _dyld_get_image_header(j); i--; }
+    return NULL;
 }
 static ACEAddImageFn g_watch_cb = NULL;
 static void ACE_watch_wrapper(const struct mach_header *mh, intptr_t slide) {
     if (!g_watch_cb) return;
-    if (mh && mh == ACE_self_header()) g_watch_cb(_dyld_get_image_header(0), slide);
-    else g_watch_cb(mh, slide);
+    const struct mach_header *m2 = mh;
+    Dl_info di;
+    // 新加载的库若命中隐藏名单（含自家补丁、frida gadget），回调里报主程序头
+    if (mh && dladdr(mh, &di) &&
+        (di.dli_fbase == ACE_self_header() || ACE_name_hidden(di.dli_fname)))
+        m2 = _dyld_get_image_header(0);
+    g_watch_cb(m2, slide);
 }
 static void ACE_register_add_image(ACEAddImageFn f) {
     g_watch_cb = f;
@@ -71,6 +99,9 @@ static void ACE_abort(void) { for (;;) sleep(86400); }
 #if ACE_TRACE
 static NSMutableArray *g_logbuf = NULL;
 static int g_trace_lines = 0;
+// 关键：日志自身的 Foundation 调用会再次命中被接管的 strcmp/strstr，
+// 用线程局部闸门挡住第二层，否则无限递归栈溢出（v5.2 闪退根因）。
+static __thread int g_ace_busy = 0;
 
 static void ACETraceLine(NSString *line) {
     if (g_trace_lines > 5000) return; // 总量封顶，防噪音撑爆内存
@@ -89,6 +120,14 @@ static NSString *ACELogDump(void) {
     if (!snap || ![snap count]) return @"(暂无日志：探针没记录到任何内容)";
     NSString *head = [NSString stringWithFormat:@"=== ace 探针日志 · %lu 行 ===\n", (unsigned long)[snap count]];
     return [head stringByAppendingString:[snap componentsJoinedByString:@"\n"]];
+}
+// 供将来的 FridaGadget JS 脚本直写日志（导出符号，JS 用 NativeFunction 调）
+__attribute__((visibility("default")))
+void ACELogExternal(const char *utf8) {
+    if (g_ace_busy) return;
+    g_ace_busy = 1;
+    @autoreleasepool { ACETraceLine(utf8 ? [NSString stringWithUTF8String:utf8] : @"(null)"); }
+    g_ace_busy = 0;
 }
 
 // 判断内存块像不像可打印文本（过滤系统级海量比对噪音）
@@ -117,52 +156,74 @@ static NSString *ACETrimStr(id obj, NSUInteger n) {
     return s;
 }
 
-// —— 探针 interpose：只记录、原样放行，不改变任何行为 ——
+// —— 探针 interpose：只记录、原样放行；记录前后开关闸门防套娃 ——
 static void ACE_SHA256_wrap(const void *data, CC_LONG len, unsigned char *md) {
     CC_SHA256(data, len, md);
-    if (len <= 1024)
+    if (!g_ace_busy && len <= 1024 && ACELooksText(data, len)) {
+        g_ace_busy = 1;
         ACETrace(@"SHA256 in(len=%u)[%.256s] digest=%s", len, (const char *)data, ACE_hex(md, 32));
+        g_ace_busy = 0;
+    }
 }
 static int ACE_memcmp_wrap(const void *a, const void *b, size_t n) {
     int r = memcmp(a, b, n);
-    if (n >= 16 && (ACELooksText(a, n) || ACELooksText(b, n)))
+    if (!g_ace_busy && n >= 16 && (ACELooksText(a, n) || ACELooksText(b, n))) {
+        g_ace_busy = 1;
         ACETrace(@"memcmp n=%zu A=[%.48s] B=[%.48s] equal=%d", n, (const char *)a, (const char *)b, r == 0);
+        g_ace_busy = 0;
+    }
     return r;
 }
 static int ACE_strcmp_wrap(const char *a, const char *b) {
     int r = strcmp(a, b);
-    if (a && b && (strlen(a) >= 8 || strlen(b) >= 8))
+    if (!g_ace_busy && a && b && (strlen(a) >= 8 || strlen(b) >= 8)) {
+        g_ace_busy = 1;
         ACETrace(@"strcmp A=[%.64s] B=[%.64s] eq=%d", a, b, r == 0);
+        g_ace_busy = 0;
+    }
     return r;
 }
 static int ACE_strncmp_wrap(const char *a, const char *b, size_t n) {
     int r = strncmp(a, b, n);
-    if (a && b && n >= 6 && (strlen(a) >= 8 || strlen(b) >= 8))
+    if (!g_ace_busy && a && b && n >= 6 && (strlen(a) >= 8 || strlen(b) >= 8)) {
+        g_ace_busy = 1;
         ACETrace(@"strncmp n=%zu A=[%.64s] B=[%.64s]", n, a, b);
+        g_ace_busy = 0;
+    }
     return r;
 }
 static char *ACE_strstr_wrap(const char *hay, const char *needle) {
     char *r = strstr(hay, needle);
-    if (needle && hay && strlen(needle) >= 4)
+    if (!g_ace_busy && needle && hay && strlen(needle) >= 4) {
+        g_ace_busy = 1;
         ACETrace(@"strstr needle=[%.64s] hit=%d hay=[%.96s]", needle, r != NULL, hay);
+        g_ace_busy = 0;
+    }
     return r;
 }
 static OSStatus ACE_SecItemCopyMatching_wrap(const CFDictionaryRef query, CFTypeRef *result) {
     OSStatus s = SecItemCopyMatching(query, result);
-    @autoreleasepool {
-        NSString *qd = (__bridge_transfer NSString *)CFCopyDescription((const void *)query);
-        ACETrace(@"SecItemCopyMatching status=%d query=%@", (int)s, ACETrimStr(qd, 300));
-        if (s == 0 && result && *result) {
-            NSString *rd = (__bridge_transfer NSString *)CFCopyDescription(*result);
-            ACETrace(@"  -> item=%@", ACETrimStr(rd, 300));
+    if (!g_ace_busy) {
+        g_ace_busy = 1;
+        @autoreleasepool {
+            NSString *qd = (__bridge_transfer NSString *)CFCopyDescription((const void *)query);
+            ACETrace(@"SecItemCopyMatching status=%d query=%@", (int)s, ACETrimStr(qd, 300));
+            if (s == 0 && result && *result) {
+                NSString *rd = (__bridge_transfer NSString *)CFCopyDescription(*result);
+                ACETrace(@"  -> item=%@", ACETrimStr(rd, 300));
+            }
         }
+        g_ace_busy = 0;
     }
     return s;
 }
 static FILE *ACE_fopen_wrap(const char *path, const char *mode) {
     FILE *f = fopen(path, mode);
-    if (path && strncmp(path, "/System/", 8) && strncmp(path, "/usr/lib", 8))
+    if (!g_ace_busy && path && strncmp(path, "/System/", 8) && strncmp(path, "/usr/lib", 8)) {
+        g_ace_busy = 1;
         ACETrace(@"fopen [%.128s] mode=[%.8s] ok=%d", path, mode ?: "", f != NULL);
+        g_ace_busy = 0;
+    }
     return f;
 }
 #else  // ACE_TRACE=0 时的静默版本
@@ -325,25 +386,41 @@ static void ACE_setup_button(void) {
 static IMP g_pwGet_imp = NULL;
 static id ACE_pw_get(id cls, SEL _cmd, id svc, id acct) {
     id r = ((id (*)(id, SEL, id, id))g_pwGet_imp)(cls, _cmd, svc, acct);
-    ACETrace(@"Keychain GET svc=%@ acct=%@ -> %@", svc, acct, r ?: @"(nil)");
+    if (!g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"Keychain GET svc=%@ acct=%@ -> %@", svc, acct, r ?: @"(nil)");
+        g_ace_busy = 0;
+    }
     return r;
 }
 static IMP g_pwSet_imp = NULL;
 static BOOL ACE_pw_set(id cls, SEL _cmd, id pw, id svc, id acct) {
     BOOL r = ((BOOL (*)(id, SEL, id, id, id))g_pwSet_imp)(cls, _cmd, pw, svc, acct);
-    ACETrace(@"Keychain SET svc=%@ acct=%@ pw=%@ ok=%d", svc, acct, ACETrimStr(pw, 64), r);
+    if (!g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"Keychain SET svc=%@ acct=%@ pw=%@ ok=%d", svc, acct, ACETrimStr(pw, 64), r);
+        g_ace_busy = 0;
+    }
     return r;
 }
 static IMP g_start_imp = NULL;
 static void ACE_start_loading(id self, SEL _cmd) {
     id (*msgSendReq)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
     id req = msgSendReq(self, NSSelectorFromString(@"request"));
-    ACETrace(@"MITM startLoading req=%@", req);
+    if (!g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"MITM startLoading req=%@", ACETrimStr(req, 300));
+        g_ace_busy = 0;
+    }
     ((void (*)(id, SEL))g_start_imp)(self, _cmd);
 }
 static IMP g_alert_imp = NULL;
 static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
-    ACETrace(@"UIAlert title=[%@] msg=[%@]", title, msg);
+    if (!g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"UIAlert title=[%@] msg=[%@]", ACETrimStr(title, 96), ACETrimStr(msg, 160));
+        g_ace_busy = 0;
+    }
     return ((id (*)(id, SEL, id, id, NSInteger))g_alert_imp)(cls, _cmd, title, msg, style);
 }
 #endif
@@ -352,6 +429,7 @@ static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
     dispatch_async(dispatch_get_main_queue(), ^{
 #if ACE_TRACE
         @autoreleasepool {
+            g_ace_busy = 1;
             ACETrace(@"=== 探针启动（隐身层激活中）===");
             @try {
                 Class kc = NSClassFromString(@"_0xD5A13E79");
@@ -375,7 +453,9 @@ static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
                     ACETrace(@"Alert 探针已挂");
                 }
             } @catch (NSException *e) { ACETrace(@"探针挂设异常: %@", e); }
-            ACE_setup_button();
+            g_ace_busy = 0;
+            // 按钮晚 1 秒再建，避开启动早期最脆弱的阶段
+            dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
         }
 #endif
 #if ACE_ENABLE_OBJC_LAYER
