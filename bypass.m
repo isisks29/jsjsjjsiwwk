@@ -441,39 +441,12 @@ static void ACE_install_heartbeat(void) {
 // 静默死亡(裸svc exit_group/SIGKILL)无异常无信号可捕; 死前最后一拍采样
 // = 凶手检测函数的指纹。环形8拍, 心跳线程每秒落盘 Documents/ace_trace.txt。
 typedef kern_return_t (*ACE_tt_fn)(mach_port_t, thread_act_array_t *, mach_msg_type_number_t *);
+static ACE_tt_fn ACE_real_task_threads(void);   // v7.15 前置声明(定义在 v7.14 段)
 static void *ACE_flight_recorder(void *arg) {
     (void)arg;
-    ACE_tt_fn real_tt = (ACE_tt_fn)dlsym(RTLD_NEXT, "task_threads");   // 绕过自家 interpose
-    if (!real_tt) return NULL;
-    for (;;) {
-        usleep(150000);
-        if (!g_tgt_base) continue;
-        thread_act_array_t list = NULL;
-        mach_msg_type_number_t n = 0;
-        if (real_tt(mach_task_self(), &list, &n) != KERN_SUCCESS || !list) continue;
-        char line[240]; int p = 0;
-        memcpy(line, "PC:", 3); p = 3;
-        for (unsigned i = 0; i < n && p < 200; i++) {
-            unsigned long long stt[34];
-            memset(stt, 0, sizeof(stt));
-            mach_msg_type_number_t c = 68;
-            if (thread_get_state(list[i], ACE_ARM64_STATE, (thread_state_t)stt, &c) == 0 && c >= 66) {
-                unsigned long long pc = stt[32];
-                if (pc >= g_tgt_base && pc < g_tgt_end) {
-                    static const char *hd = "0123456789abcdef";
-                    unsigned long long off = pc - g_tgt_base;
-                    line[p++] = ' ';
-                    for (int k = 28; k >= 0; k -= 4) line[p++] = hd[(off >> k) & 0xf];
-                }
-            }
-        }
-        line[p] = 0;
-        vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
-        strcpy(g_ring[g_ring_i], line);
-        g_ring_i = (g_ring_i + 1) & 7;
-        if (g_ring_n < 8) g_ring_n++;
-    }
-    return NULL;
+    ACE_tt_fn real_tt = ACE_real_task_threads();
+    if (!real_tt) { ACETrace(@"[rec] 真实task_threads解析失败, 线程采样不可用"); return NULL; }
+    ACETrace(@"[rec] 采样启动 real_tt=%p", (void *)real_tt);
 }
 
 // ═══ v7.9: EndTime 持续补喂——每50ms把 ctx+0x78 顶回 2100 ═══
@@ -520,15 +493,58 @@ static const unsigned long long g_kill_sites[16] = {
     0xae820ULL, 0xc2e34ULL, 0xefe40ULL, 0xf1744ULL, 0xf1768ULL, 0xf1774ULL,
     0xf958cULL, 0xf8308ULL, 0xf831cULL, 0xf83d0ULL };
 static int g_bp_logged = 0;
+// v7.15: dlsym 会被 dyld interpose 折回自家空壳(实证), 改为直接解析
+// libsystem_kernel 镜像的符号表拿裸指针——interpose 只改绑定表, 不改真身。
 static ACE_tt_fn ACE_real_task_threads(void) {
-    ACE_tt_fn f = NULL;
-    void *h = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_NOW);
-    if (h) f = (ACE_tt_fn)dlsym(h, "task_threads");
-    if (!f || f == (ACE_tt_fn)&ACE_task_threads)
-        f = (ACE_tt_fn)dlsym(RTLD_NEXT, "task_threads");
-    if (f == (ACE_tt_fn)&ACE_task_threads) return NULL;
-    return f;
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm || !strstr(nm, "libsystem_kernel")) continue;
+        const struct mach_header_64 *mh =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if (!mh) continue;
+        const struct symtab_command *st = NULL;
+        uintptr_t p = (uintptr_t)mh + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const ACESegCmd64 *lc = (const ACESegCmd64 *)p;
+            if (lc->cmd == 0x2 /*LC_SYMTAB*/) { st = (const struct symtab_command *)p; break; }
+            p += lc->cmdsize;
+        }
+        if (!st) continue;
+        uintptr_t le_va = 0; uint64_t le_off = 0;
+        p = (uintptr_t)mh + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const ACESegCmd64 *sg = (const ACESegCmd64 *)p;
+            if (sg->cmd == 0x19 /*LC_SEGMENT_64*/ && !strcmp(sg->segname, "__LINKEDIT")) {
+                le_va = (uintptr_t)(sg->vmaddr + slide);
+                le_off = sg->fileoff;
+                break;
+            }
+            p += sg->cmdsize;
+        }
+        if (!le_va) continue;
+        const uint8_t *le = (const uint8_t *)le_va;
+        const ACENlist64 *syms = (const ACENlist64 *)(le + (st->symoff - le_off));
+        const char *strs = (const char *)(le + (st->stroff - le_off));
+        for (uint32_t k = 0; k < st->nsyms; k++) {
+            uint32_t so = syms[k].n_strx;
+            if (so == 0 || so >= st->strsize) continue;
+            const char *snm = strs + so;
+            if (snm[0] == '_') snm++;
+            if (!strcmp(snm, "task_threads") && syms[k].n_value) {
+                ACE_tt_fn f = (ACE_tt_fn)(uintptr_t)(syms[k].n_value + slide);
+                if (f != (ACE_tt_fn)&ACE_task_threads) {
+                    ACETrace(@"[bp] 真实task_threads=%p (符号表解析)", (void *)f);
+                    return f;
+                }
+            }
+        }
+    }
+    ACETrace(@"[bp] 符号表解析失败, 哨兵无法安装");
+    return NULL;
 }
+
 static void *ACE_bp_installer(void *arg) {
     (void)arg;
     ACE_tt_fn real_tt = ACE_real_task_threads();
@@ -1037,7 +1053,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.12 启动 ===");
+            ACETrace(@"=== v7.15 启动 ===");
                         @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
