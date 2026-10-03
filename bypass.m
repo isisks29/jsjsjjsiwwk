@@ -172,23 +172,25 @@ ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
 
-// ══════════════ 第 0.6 层：v6.1 定点绕过补丁 ══════════════
-// 原理见文件头 v6.0/v6.1 注释（全部实证）。运行期按镜像名找靶场基址，
-// 每条补丁先核对 4 字节原指令签名，匹配才写；不匹配只记日志绝不动手。
-// 只写 .text 立即数/单指令，不改任何导入符号（避开 v5.4/5.5 自毁触发面）。
-#define ACE_FORCE_SUCCESS    1   // 1=主补丁: 结果判定强制成功 (0xef0fc)
-#define ACE_FASTFAIL_CONNECT 0   // 1=可选: connect 改 127.0.0.1:1 秒失败 (服务器死时免等超时)
+// ══════════════ 第 0.6 层：v6.2 定点补丁（默认关闭！）══════════════
+// v6.1 教训（实测一进就崩）：运行期改 __text 这条路在当前环境不可行——
+//   ① csops 给自己打 CS_DEBUGGED 正是反调试扫描的典型特征，等于自报"被调试"；
+//   ② 对已签名镜像 __text 写入会被代码签名机制直接 SIGKILL（W^X/CS_KILL）。
+// v6.2 起绕过改走「离线静态补丁」：在 GitHub Actions 里重签名之前直接改
+// target dylib 文件字节（偏移==虚拟地址已实证，__text offset==va），
+// 运行时 dylib 只保留 v5.9 观测探针。下方运行期补丁代码默认双 0 关闭、
+// 且已删除 csops 退路；仅当确认运行环境允许改写(越狱+CS_PLATFORMED 等)才可试开。
+#define ACE_FORCE_SUCCESS    0   // v6.2 默认 0（静态补丁替代）；1=运行期强改 0xef0fc
+#define ACE_FASTFAIL_CONNECT 0   // 1=可选: connect 改 127.0.0.1:1 秒失败
 
+#if ACE_FORCE_SUCCESS || ACE_FASTFAIL_CONNECT
 typedef struct { uint32_t off; uint32_t expect; uint32_t patch; const char *what; } ACEPatchEnt;
 static const ACEPatchEnt g_ace_patches[] = {
 #if ACE_FORCE_SUCCESS
-    // ldr w8,[x0,#0x38] (0xB9403808, 文件字节 08 38 40 b9 实锤) → mov w8,#0 (0x52800008)
     { 0xef0fcu, 0xB9403808u, 0x52800008u, "结果判定强制成功(w8=0)" },
 #endif
 #if ACE_FASTFAIL_CONNECT
-    // sockaddr: [sp+0xb00]=0x37250210 (len/family + port BE 0x3725=9527) → port 0x0100(=1)
     { 0xd2884u, 0x72A6E4A8u, 0x72A02008u, "connect 端口 9527→1" },
-    // 地址=w1^w2 混淆: w1(0x76284cce)^w2(0xd7b3e6a1)=0x0100007f → w1'=w2^0x0100007f=0xd6b3e6de
     { 0xd288cu, 0x528999C8u, 0x529CDBC8u, "connect IP 低半 4cce→e6de" },
     { 0xd2890u, 0x72AEC508u, 0x72BAD668u, "connect IP 高半 7628→d6b3" },
 #endif
@@ -205,50 +207,26 @@ static uintptr_t ACE_target_base(void) {
 static void ACE_apply_patches(void) {
     uintptr_t base = ACE_target_base();
     if (!base) { ACETrace(@"未找到靶场镜像(名字含 ballsace)，跳过定点补丁"); return; }
-    ACETrace(@"靶场基址=%p，定点补丁 %zu 条", (void *)base,
-             sizeof(g_ace_patches) / sizeof(g_ace_patches[0]));
     for (size_t k = 0; k < sizeof(g_ace_patches) / sizeof(g_ace_patches[0]); k++) {
         const ACEPatchEnt *p = &g_ace_patches[k];
         volatile uint32_t *slot = (volatile uint32_t *)(base + p->off);
         if (*slot == p->patch) { ACETrace(@"补丁[%s] 已是目标值，跳过", p->what); continue; }
         if (*slot != p->expect) {
-            ACETrace(@"补丁[%s] 签名不符: +0x%x 处=0x%08x 期望=0x%08x —— 不动手(靶场版本可能不同)",
-                     p->what, p->off, *slot, p->expect);
+            ACETrace(@"补丁[%s] 签名不符: +0x%x 处=0x%08x —— 不动手", p->what, p->off, *slot);
             continue;
         }
-        uintptr_t addr = (uintptr_t)slot;
-        vm_prot_t cur = VM_PROT_READ | VM_PROT_EXECUTE;
-        mach_port_t objname = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t icnt = VM_REGION_BASIC_INFO_COUNT_64;
-        vm_address_t ra = (vm_address_t)addr;
-        vm_size_t rsz = 0;
-        // 先查当前保护，写完恢复原样，缩小可写窗口（vm_region_64 由 mach/mach.h 保证可见）
-        kern_return_t krq = vm_region_64(mach_task_self(), &ra, &rsz, VM_REGION_BASIC_INFO_64,
-                                         (vm_region_info_t)&info, &icnt, &objname);
-        if (krq == KERN_SUCCESS) cur = info.protection;
-        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)addr, 4, 0,
+        // 注意：不再有 csops/CS_DEBUGGED 退路（v6.1 实测触发反调试自毁）
+        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)slot, 4, 0,
                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-        if (kr != KERN_SUCCESS) {
-            // 退路：iOS 对已签名镜像 __text 改 RWX 会被 W^X 拒绝(KERN_PROTECTION_FAILURE)。
-            // 给进程打上 CS_DEBUGGED 标志(调试态进程允许改写)后重试一次。
-            uint32_t flags = 0, mask = 0;
-            pid_t pid = getpid();
-            if (csops(pid, CS_OPS_STATUS, &flags, 0) == 0) {
-                mask = flags | CS_DEBUGGED;
-                if (csops(pid, CS_OPS_SET_STATUS, &mask, 0) == 0)
-                    kr = vm_protect(mach_task_self(), (vm_address_t)addr, 4, 0,
-                                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-            }
-        }
         if (kr != KERN_SUCCESS) { ACETrace(@"补丁[%s] vm_protect 失败 kr=%d", p->what, kr); continue; }
         *slot = p->patch;
-        sys_icache_invalidate((void *)addr, 4);
-        vm_protect(mach_task_self(), (vm_address_t)addr, 4, 0, cur);   // 恢复原保护(失败也不影响)
+        sys_icache_invalidate((void *)(uintptr_t)slot, 4);
         ACETrace(@"补丁[%s] +0x%x: 0x%08x -> 0x%08x 完成", p->what, p->off, p->expect, p->patch);
     }
 }
-
+#else
+static void ACE_apply_patches(void) { /* v6.2: 运行期补丁已关闭，绕过走离线静态补丁 */ }
+#endif
 // ══════════════ 第 1 层：授权核心 hook（本轮默认关闭）══════════════
 #if ACE_ENABLE_OBJC_LAYER
 static IMP ACEReplace(Class cls, SEL sel, IMP newImp) {
