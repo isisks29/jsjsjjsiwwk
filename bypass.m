@@ -15,6 +15,8 @@
 #import <string.h>
 #import <stdio.h>
 #import <math.h>
+#import <time.h>
+#import <stdarg.h>
 #import <signal.h>
 #import <fcntl.h>
 #import <pthread.h>
@@ -91,7 +93,15 @@ static void ACETraceLine(NSString *line) {
         [g_logbuf addObject:line];
     }
 }
-#define ACETrace(fmt, ...) ACETraceLine([NSString stringWithFormat:(@"[ace] " fmt), ##__VA_ARGS__)
+// v7.17b: ACETrace 由宏改为函数——彻底避开 ##__VA_ARGS__ 宏展开的解析级联错误
+static void ACETrace(NSString *fmt, ...) {
+    if (g_trace_lines > 20000) return;
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    ACETraceLine([NSString stringWithFormat:@"[ace] %@", body]);
+}
 static uintptr_t g_tgt_base, g_tgt_end;      // 前置声明(定义在第 2 段)
 static uintptr_t g_self_base;                // 前置声明(定义在第 2 段)
 static int g_ace_ready, g_ace_busy;
@@ -379,7 +389,7 @@ static void *ACE_exc_server(void *arg) {
             st[32] = pc + 4;   // 跳过 brk, 拆掉自毁
             cnt = 68;
             g_exc_skip++;
-            thread_set_state(req.thread.name, ACE_ARM64_STATE, (thread_state_t)st, &cnt);
+            thread_set_state(req.thread.name, ACE_ARM64_STATE, (thread_state_t)st, cnt);
             rep.retCode = KERN_SUCCESS;
         } else {
             rep.retCode = KERN_FAILURE;   // 交回常规崩溃流程(信号层还有捕捉器兜底)
@@ -640,7 +650,7 @@ static void *ACE_bp_installer(void *arg) {
             }
             mach_msg_type_number_t c = 128;
             kern_return_t kr = thread_set_state(list[i], ACE_ARM_DEBUG64,
-                                                (thread_state_t)&ds, &c);
+                                                (thread_state_t)&ds, c);
             if (kr == KERN_SUCCESS) ok++; else fail++;
         }
         if (!g_bp_logged && (ok || fail)) {
