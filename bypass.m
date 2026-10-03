@@ -15,6 +15,16 @@
 #import <string.h>
 #import <stdio.h>
 #import <math.h>
+#import <libkern/OSCacheControl.h>   // sys_icache_invalidate
+// csops 是 XNU SPI，不在公开 iOS SDK 头文件里（真机 SDK 云编译需自行声明）
+#ifndef CS_OPS_STATUS
+#define CS_OPS_STATUS     0
+#define CS_OPS_SET_STATUS 1
+#endif
+#ifndef CS_DEBUGGED
+#define CS_DEBUGGED 0x10000000
+#endif
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 
 // ══════════════ 第 0 层：隐身（按名字过滤模块）════════════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
@@ -133,7 +143,7 @@ void ACELogExternal(const char *utf8) {
     g_ace_busy = 0;
 }
 
-// 记录闸门：就绪且不重入才记，记完立刻交还（对外来对象取文本可能抛异常，@try 护住）
+// 记录闸门：就绪且不重入才记，记完立刻交还
 #define ACE_G(...) do { if (g_ace_ready && !g_ace_busy) { g_ace_busy = 1; @try { ACETrace(__VA_ARGS__); } @catch (NSException *e) {} g_ace_busy = 0; } } while (0)
 
 // 截断对象文本（%@ 不允许带精度，超长截断必须手动做）
@@ -161,6 +171,83 @@ ACE_INTERPOSE(ACE_task_threads,         task_threads)
 ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
+
+// ══════════════ 第 0.6 层：v6.1 定点绕过补丁 ══════════════
+// 原理见文件头 v6.0/v6.1 注释（全部实证）。运行期按镜像名找靶场基址，
+// 每条补丁先核对 4 字节原指令签名，匹配才写；不匹配只记日志绝不动手。
+// 只写 .text 立即数/单指令，不改任何导入符号（避开 v5.4/5.5 自毁触发面）。
+#define ACE_FORCE_SUCCESS    1   // 1=主补丁: 结果判定强制成功 (0xef0fc)
+#define ACE_FASTFAIL_CONNECT 0   // 1=可选: connect 改 127.0.0.1:1 秒失败 (服务器死时免等超时)
+
+typedef struct { uint32_t off; uint32_t expect; uint32_t patch; const char *what; } ACEPatchEnt;
+static const ACEPatchEnt g_ace_patches[] = {
+#if ACE_FORCE_SUCCESS
+    // ldr w8,[x0,#0x38] (0xB9403808, 文件字节 08 38 40 b9 实锤) → mov w8,#0 (0x52800008)
+    { 0xef0fcu, 0xB9403808u, 0x52800008u, "结果判定强制成功(w8=0)" },
+#endif
+#if ACE_FASTFAIL_CONNECT
+    // sockaddr: [sp+0xb00]=0x37250210 (len/family + port BE 0x3725=9527) → port 0x0100(=1)
+    { 0xd2884u, 0x72A6E4A8u, 0x72A02008u, "connect 端口 9527→1" },
+    // 地址=w1^w2 混淆: w1(0x76284cce)^w2(0xd7b3e6a1)=0x0100007f → w1'=w2^0x0100007f=0xd6b3e6de
+    { 0xd288cu, 0x528999C8u, 0x529CDBC8u, "connect IP 低半 4cce→e6de" },
+    { 0xd2890u, 0x72AEC508u, 0x72BAD668u, "connect IP 高半 7628→d6b3" },
+#endif
+};
+static uintptr_t ACE_target_base(void) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "ballsace"))
+            return (uintptr_t)_dyld_get_image_header(i);
+    }
+    return 0;
+}
+static void ACE_apply_patches(void) {
+    uintptr_t base = ACE_target_base();
+    if (!base) { ACETrace(@"未找到靶场镜像(名字含 ballsace)，跳过定点补丁"); return; }
+    ACETrace(@"靶场基址=%p，定点补丁 %zu 条", (void *)base,
+             sizeof(g_ace_patches) / sizeof(g_ace_patches[0]));
+    for (size_t k = 0; k < sizeof(g_ace_patches) / sizeof(g_ace_patches[0]); k++) {
+        const ACEPatchEnt *p = &g_ace_patches[k];
+        volatile uint32_t *slot = (volatile uint32_t *)(base + p->off);
+        if (*slot == p->patch) { ACETrace(@"补丁[%s] 已是目标值，跳过", p->what); continue; }
+        if (*slot != p->expect) {
+            ACETrace(@"补丁[%s] 签名不符: +0x%x 处=0x%08x 期望=0x%08x —— 不动手(靶场版本可能不同)",
+                     p->what, p->off, *slot, p->expect);
+            continue;
+        }
+        uintptr_t addr = (uintptr_t)slot;
+        vm_prot_t cur = VM_PROT_READ | VM_PROT_EXECUTE;
+        mach_port_t objname = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t icnt = VM_REGION_BASIC_INFO_COUNT_64;
+        vm_address_t ra = (vm_address_t)addr;
+        vm_size_t rsz = 0;
+        // 先查当前保护，写完恢复原样，缩小可写窗口（vm_region_64 由 mach/mach.h 保证可见）
+        kern_return_t krq = vm_region_64(mach_task_self(), &ra, &rsz, VM_REGION_BASIC_INFO_64,
+                                         (vm_region_info_t)&info, &icnt, &objname);
+        if (krq == KERN_SUCCESS) cur = info.protection;
+        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)addr, 4, 0,
+                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) {
+            // 退路：iOS 对已签名镜像 __text 改 RWX 会被 W^X 拒绝(KERN_PROTECTION_FAILURE)。
+            // 给进程打上 CS_DEBUGGED 标志(调试态进程允许改写)后重试一次。
+            uint32_t flags = 0, mask = 0;
+            pid_t pid = getpid();
+            if (csops(pid, CS_OPS_STATUS, &flags, 0) == 0) {
+                mask = flags | CS_DEBUGGED;
+                if (csops(pid, CS_OPS_SET_STATUS, &mask, 0) == 0)
+                    kr = vm_protect(mach_task_self(), (vm_address_t)addr, 4, 0,
+                                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+            }
+        }
+        if (kr != KERN_SUCCESS) { ACETrace(@"补丁[%s] vm_protect 失败 kr=%d", p->what, kr); continue; }
+        *slot = p->patch;
+        sys_icache_invalidate((void *)addr, 4);
+        vm_protect(mach_task_self(), (vm_address_t)addr, 4, 0, cur);   // 恢复原保护(失败也不影响)
+        ACETrace(@"补丁[%s] +0x%x: 0x%08x -> 0x%08x 完成", p->what, p->off, p->expect, p->patch);
+    }
+}
 
 // ══════════════ 第 1 层：授权核心 hook（本轮默认关闭）══════════════
 #if ACE_ENABLE_OBJC_LAYER
@@ -331,6 +418,49 @@ static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
         g_ace_busy = 0;
     }
     return ((id (*)(id, SEL, id, id, NSInteger))g_alert_imp)(cls, _cmd, title, msg, style);
+}
+// —— v5.9 关键探针：UIAlertAction 构造点直收 handler block ——
+// v5.7/v5.8 实锤：卡密校验不经过 _0x7D3B5E28 的任何 ObjC 方法，广域 ObjC 普查也全空，
+// 说明验卡逻辑在「弹窗按钮的 handler block」直链的 C/C++ 函数里。block 的 invoke 指针
+// 就在对象头偏移 16 处（isa/flags/reserved 之后），dladdr 换算出靶场镜像内偏移后，
+// 直接等于静态文件虚拟地址（dylib 首选地址 0）。日志点名 0xXXXXX 后：
+//   python3 ida.py dis 0xXXXXX 80
+// 即可看到验卡真身。前面静态已把弹窗构造点收敛到 4 个函数：
+//   0xa7860 / 0xa865c / 0xab518 / 0xaeb84（最后一个带输入框=请输入卡密）
+struct ACEBlockLiteral {
+    Class isa;
+    int flags;
+    int reserved;
+    void *invoke;
+    void *descriptor;
+};
+static IMP g_actionInit_imp = NULL;
+static id ACE_action_init(id cls, SEL _cmd, id title, NSInteger style, id handler) {
+    if (g_ace_ready && !g_ace_busy && handler) {
+        g_ace_busy = 1;
+        @try {
+#if __has_feature(objc_arc)
+            struct ACEBlockLiteral *bl = (__bridge struct ACEBlockLiteral *)handler;
+#else
+            struct ACEBlockLiteral *bl = (struct ACEBlockLiteral *)(void *)handler;
+#endif
+            void *inv = bl->invoke;
+            Dl_info di; memset(&di, 0, sizeof(di));
+            int ok = dladdr(inv, &di);
+            unsigned char bytes[64]; memcpy(bytes, inv, 64);
+            char hex[3 * 64 + 1]; int hp = 0;
+            for (int k = 0; k < 64; k++) hp += sprintf(hex + hp, "%s%02x", (k && k % 4 == 0) ? " " : "", bytes[k]);
+            ACETrace(@"Action[%@] style=%ld handler isa=%s flags=0x%x invoke=%p%s%@ fbase=%p -> 靶场内偏移=0x%llx",
+                     ACETrimStr(title, 64), (long)style,
+                     bl->isa ? class_getName(bl->isa) : "?", bl->flags, inv,
+                     ok ? " (" : "", ok ? (di.dli_fname ? di.dli_fname : "?") : "",
+                     ok ? (di.dli_fname ? ")" : "") : "", di.dli_fbase,
+                     ok ? (unsigned long long)((uintptr_t)inv - (uintptr_t)di.dli_fbase) : 0ULL);
+            ACETrace(@"Action[%@] invoke 前64字节: %s", ACETrimStr(title, 64), hex);
+        } @catch (NSException *e) {}
+        g_ace_busy = 0;
+    }
+    return ((id (*)(id, SEL, id, NSInteger, id))g_actionInit_imp)(cls, _cmd, title, style, handler);
 }
 static IMP g_addAct_imp = NULL;
 static void ACE_addAct(id self, SEL _cmd, id action) {
@@ -546,7 +676,7 @@ static void ACE_sweepCore(Class core) {
     free(ivs);
     unsigned int mc = 0;
     Method *ms = class_copyMethodList(core, &mc);
-    int swept = 0, skipped = 0;
+        int swept = 0, skipped = 0;
     for (unsigned int k = 0; k < mc; k++) {
         SEL sel = method_getName(ms[k]);
         const char *enc = method_getTypeEncoding(ms[k]) ?: "?";
@@ -626,6 +756,7 @@ static void ACE_wideSweepClasses(void) {
         @autoreleasepool {
             g_ace_busy = 1;
             ACETrace(@"=== 探针启动（隐身层激活中）===");
+            @try { ACE_apply_patches(); } @catch (NSException *e) { ACETrace(@"定点补丁异常: %@", e); }
             @try {
                 Class kc = NSClassFromString(@"_0xD5A13E79");
                 if (kc) {
@@ -647,6 +778,12 @@ static void ACE_wideSweepClasses(void) {
                     if (m4) g_alert_imp = method_setImplementation(m4, (IMP)ACE_alert_init);
                     Method m5 = class_getInstanceMethod(alert, NSSelectorFromString(@"addAction:"));
                     if (m5) g_addAct_imp = method_setImplementation(m5, (IMP)ACE_addAct);
+                    Class act = NSClassFromString(@"UIAlertAction");
+                    if (act) {
+                        Method m6 = class_getClassMethod(act, NSSelectorFromString(@"actionWithTitle:style:handler:"));
+                        if (m6) g_actionInit_imp = method_setImplementation(m6, (IMP)ACE_action_init);
+                        ACETrace(@"UIAlertAction 构造探针已挂 %s", g_actionInit_imp ? "✓" : "✗");
+                    }
                     ACETrace(@"Alert 探针已挂（含按钮）");
                 }
                 Class core = NSClassFromString(@"_0x7D3B5E28");
