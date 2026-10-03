@@ -263,16 +263,13 @@ static void initBy(void){
                 }
 
                 // patch 0x1210e0 -> b 0x121150
-                uintptr_t page1 = ((uintptr_t)va(0x1210e0)) & ~0x3FFFULL;
-                int r1 = mprotect((void*)page1, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
-                if(r1 == 0){
-                    *(volatile uint32_t*)va(0x1210e0) = 0x1400001C;
-                    sys_icache_invalidate((void*)va(0x1210e0), 4);
-                    mprotect((void*)page1, 0x4000, PROT_READ|PROT_EXEC);
-                    if(g_patchRet == 1) g_patchRet = 2;
-                } else {
-                    g_patchRet = -r1;
-                }
+                uintptr_t page0 = ((uintptr_t)va(0x8d010)) & ~0x3FFFULL;
+int r0 = mprotect((void*)page0, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
+if(r0 == 0){
+    *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
+    sys_icache_invalidate((void*)va(0x8d010), 4);
+    mprotect((void*)page0, 0x4000, PROT_READ|PROT_EXEC);
+}
 
                 typedef void(*fn_t)(void);
                 fn_t f = (fn_t)va(0x11fa5c);
