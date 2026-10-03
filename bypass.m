@@ -72,6 +72,25 @@ static kern_return_t ACE_task_set_exception_ports(mach_port_t t, exception_mask_
     g_hit_tsep++;   // 计数: 验证隐身层真实生效(靶场异常端口接管被挡次数)
     return KERN_SUCCESS;
 }
+
+static void ACE_exit(int code) { g_hit_exit++; (void)code; for (;;) sleep(86400); }
+static void ACE_abort(void) { g_hit_abort++; for (;;) sleep(86400); }
+// ══════════════ 第 0.5 层：观测日志（存内存，悬浮按钮导出）══════════════
+static NSMutableArray *g_logbuf = NULL;
+static int g_trace_lines = 0;
+static int g_ace_busy = 0;
+static int g_ace_ready = 0;
+
+static void ACETraceLine(NSString *line) {
+    if (g_trace_lines > 20000) return; // 总量封顶
+    g_trace_lines++;
+    @autoreleasepool { NSLog(@"%@", line); }
+    @synchronized ([NSMutableArray class]) {
+        if (!g_logbuf) g_logbuf = [[NSMutableArray alloc] init];
+        [g_logbuf addObject:line];
+    }
+}
+#define ACETrace(fmt, ...) ACETraceLine([NSString stringWithFormat:(@"[ace] " fmt), ##__VA_ARGS__])
 // v7.13 前置声明(nanosleep 探针提前引用; 定义在下方原位置)
 static uintptr_t g_tgt_base, g_tgt_end;
 static uintptr_t g_self_base;
@@ -91,24 +110,6 @@ static int ACE_nanosleep(const struct timespec *rqtp, struct timespec *rmtp) {
     }
     return nanosleep(rqtp, rmtp);   // interpose 不影响本镜像内部调用, 这里直达真身
 }
-static void ACE_exit(int code) { g_hit_exit++; (void)code; for (;;) sleep(86400); }
-static void ACE_abort(void) { g_hit_abort++; for (;;) sleep(86400); }
-// ══════════════ 第 0.5 层：观测日志（存内存，悬浮按钮导出）══════════════
-static NSMutableArray *g_logbuf = NULL;
-static int g_trace_lines = 0;
-static int g_ace_busy = 0;
-static int g_ace_ready = 0;
-
-static void ACETraceLine(NSString *line) {
-    if (g_trace_lines > 20000) return; // 总量封顶
-    g_trace_lines++;
-    @autoreleasepool { NSLog(@"%@", line); }
-    @synchronized ([NSMutableArray class]) {
-        if (!g_logbuf) g_logbuf = [[NSMutableArray alloc] init];
-        [g_logbuf addObject:line];
-    }
-}
-#define ACETrace(fmt, ...) ACETraceLine([NSString stringWithFormat:(@"[ace] " fmt), ##__VA_ARGS__])
 static NSString *ACELogDump(void) {
     NSMutableArray *snap = nil;
     @synchronized ([NSMutableArray class]) { snap = [g_logbuf mutableCopy]; }
