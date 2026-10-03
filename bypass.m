@@ -1,83 +1,163 @@
+#define ACE_ENABLE_OBJC_LAYER 0
+
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach/mach.h>
+#import <dlfcn.h>
+#import <unistd.h>
+#import <stdlib.h>
 
-// ── 工具：替换实例/类方法，返回旧 IMP 便于对照 ──────────────────────
+// ══════════ 第 0 层：dyld 拦截（先于所有 +load/构造函数生效）══════
+typedef void (*ACEAddImageFn)(const void *mh, intptr_t slide);
+
+static const void *ACE_self_header(void) {
+    Dl_info info;
+    if (dladdr((const void *)&ACE_self_header, &info)) return info.dli_fbase;
+    return NULL;   // 取不到就放弃隐身，其余功能照常工作
+}
+
+static int g_our_index = -1;
+static int ACE_find_our_index(void) {
+    if (g_our_index >= 0) return g_our_index;
+    const void *self = ACE_self_header();
+    if (!self) return -1;
+    uint32_t n = __dyld_image_count();          // 本镜像内的调用不受本表影响
+    for (uint32_t i = 0; i < n; i++)
+        if (__dyld_get_image_header(i) == self) { g_our_index = (int)i; return g_our_index; }
+    return -1;
+}
+
+// 把补丁从模块枚举里摘掉（watchdog 的扫描循环失明）
+static uint32_t ACE_image_count(void) {
+    return (uint32_t)((int)__dyld_image_count() - (ACE_find_our_index() >= 0 ? 1 : 0));
+}
+static const char *ACE_image_name(uint32_t i) {
+    int o = ACE_find_our_index();
+    return __dyld_get_image_name((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+}
+static const void *ACE_image_header(uint32_t i) {
+    int o = ACE_find_our_index();
+    return __dyld_get_image_header((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+}
+
+// 接管监视器注册：转发给靶场回调，但把“补丁镜像”伪装成“主程序镜像”。
+// 监视器 @0x44bc 对主程序直接放行（跳过匹配），其余镜像原样喂入。
+static ACEAddImageFn g_watch_cb = NULL;
+static void ACE_watch_wrapper(const void *mh, intptr_t slide) {
+    if (!g_watch_cb) return;
+    if (mh && mh == ACE_self_header())
+        g_watch_cb(__dyld_get_image_header(0), slide);   // 伪装成主程序
+    else
+        g_watch_cb(mh, slide);
+}
+static void ACE_register_add_image(ACEAddImageFn f) {
+    g_watch_cb = f;
+    __dyld_register_func_for_add_image(ACE_watch_wrapper);
+}
+
+// 反调试/异常劫持关闭（返回成功但不给数据 → 扫描循环自然空转）
+static kern_return_t ACE_task_threads(mach_port_t task, thread_act_array_t *arr,
+                                      mach_msg_type_number_t *cnt) {
+    if (arr) *arr = NULL;
+    if (cnt) *cnt = 0;
+    return KERN_SUCCESS;
+}
+static kern_return_t ACE_task_set_exception_ports(mach_port_t task,
+                                                  exception_mask_t mask,
+                                                  exception_handler_t handler,
+                                                  exception_behavior_t behavior,
+                                                  thread_state_flavor_t flavor) {
+    return KERN_SUCCESS;   // 不安装它的异常处理器
+}
+
+// kill 路径兜底：不返回（保持进程存活，便于继续观察）
+static void ACE_exit(int code) {
+    NSLog(@"[ace] 拦截 exit(%d) —— kill 路径已熔断", code);
+    for (;;) sleep(86400);
+}
+static void ACE_abort(void) {
+    NSLog(@"[ace] 拦截 abort() —— kill 路径已熔断");
+    for (;;) sleep(86400);
+}
+
+#define ACE_INTERPOSE(rep, orig) \
+    const struct { const void *r, *o; } _ace_ip_##orig \
+    __attribute__((used, section("__DATA,__interpose"))) = { (const void *)(rep), (const void *)(orig) };
+
+ACE_INTERPOSE(ACE_register_add_image,   __dyld_register_func_for_add_image)
+ACE_INTERPOSE(ACE_image_count,          __dyld_image_count)
+ACE_INTERPOSE(ACE_image_name,           __dyld_get_image_name)
+ACE_INTERPOSE(ACE_image_header,         __dyld_get_image_header)
+ACE_INTERPOSE(ACE_task_threads,         task_threads)
+ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
+ACE_INTERPOSE(ACE_exit,                 exit)
+ACE_INTERPOSE(ACE_abort,                abort)
+
+#if ACE_ENABLE_OBJC_LAYER
+// ══════════ 第 1 层：授权核心 hook（带完整防御）══════════════════════
 static IMP ACEReplace(Class cls, SEL sel, IMP newImp) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) m = class_getClassMethod(cls, sel);
-    if (!m) { NSLog(@"[ace] 方法缺失: %@", NSStringFromSelector(sel)); return NULL; }
+    if (!m) return NULL;
     return method_setImplementation(m, newImp);
 }
-
-// BOOL getter：恒真
 static BOOL ACEAlwaysYes(id self, SEL _cmd) { return YES; }
-// void 方法：空转（停心跳/停到期判断/停信封校验）
 static void ACENoop(id self, SEL _cmd, ...) {}
-// setter：吞掉写入，防止心跳把 q2/q13 复位
-static void ACESetterSwallow(id self, SEL _cmd, id a, id b, id c) {}
-
-// +q0: 是单例入口（selector 带冒号但实现按无参读取 —— 靶场的 arity 伪装）。
-static id core_get_singleton(Class core) {
-    id (*msgSend0)(id, SEL) = (id(*)(id, SEL))objc_msgSend;
-    return msgSend0((id)core, NSSelectorFromString(@"q0:"));
-}
+static void ACESetterSwallow(id self, SEL _cmd, ...) {}
+#endif
 
 @interface ACELicensePatch : NSObject
 @end
 
 @implementation ACELicensePatch
 
-// 靶场加载后由宿主注入本类，+load 后转主队列，此时靶场 dylib 的
-// __mod_init_func 已执行完，类已注册、单例已建。
 + (void)load {
+    // 主队列异步：此时 interpose 已生效、靶场构造函数已跑完、类已全部注册
     dispatch_async(dispatch_get_main_queue(), ^{
-        Class core = NSClassFromString(@"_0x7D3B5E28");
-        if (!core) { NSLog(@"[ace] 未找到授权核心类"); return; }
+#if ACE_ENABLE_OBJC_LAYER
+        @try {
+            Class core = NSClassFromString(@"_0x7D3B5E28");
+            if (!core) { NSLog(@"[ace] 授权核心类缺席（版本不符?）"); return; }
 
-        // ① 标志位强制为真（q2 授权 / q13 二次标志）
-        ACEReplace(core, NSSelectorFromString(@"q2"),  (IMP)ACEAlwaysYes);
-        ACEReplace(core, NSSelectorFromString(@"q13"), (IMP)ACEAlwaysYes);
+            // ① 标志位强制 + setter 吞写
+            ACEReplace(core, NSSelectorFromString(@"q2"),  (IMP)ACEAlwaysYes);
+            ACEReplace(core, NSSelectorFromString(@"q13"), (IMP)ACEAlwaysYes);
+            ACEReplace(core, NSSelectorFromString(@"setQ2:"),  (IMP)ACESetterSwallow);
+            ACEReplace(core, NSSelectorFromString(@"setQ13:"), (IMP)ACESetterSwallow);
 
-        // ② 吞掉 setter：心跳 q5 里 setQ2:NO / setQ13:NO 全部失效
-        ACEReplace(core, NSSelectorFromString(@"setQ2:"),  (IMP)ACESetterSwallow);
-        ACEReplace(core, NSSelectorFromString(@"setQ13:"), (IMP)ACESetterSwallow);
+            // ② 校验链空转（心跳/到期/重排/信封校验）
+            for (NSString *s in @[@"q5", @"q17", @"q18:", @"q20:", @"q21:", @"q22:"])
+                ACEReplace(core, NSSelectorFromString(s), (IMP)ACENoop);
 
-        // ③ 停掉验证链：心跳 q5、到期 q17、信封校验 q21:/q22:/q20:、
-        //    重排定时器 q18:。q4 保留（它初始化单例状态，只断后续心跳）。
-        ACEReplace(core, NSSelectorFromString(@"q5"),   (IMP)ACENoop);
-        ACEReplace(core, NSSelectorFromString(@"q17"),  (IMP)ACENoop);
-        ACEReplace(core, NSSelectorFromString(@"q18:"), (IMP)ACENoop);
-        ACEReplace(core, NSSelectorFromString(@"q20:"), (IMP)ACENoop);
-        ACEReplace(core, NSSelectorFromString(@"q21:"), (IMP)ACENoop);
-        ACEReplace(core, NSSelectorFromString(@"q22:"), (IMP)ACENoop);
+            // ③ 兜底停 timer（确认 selector 存在，防 unrecognized selector）
+            SEL q0s = NSSelectorFromString(@"q0:");
+            if ([core respondsToSelector:q0s]) {
+                id inst = ((id (*)(id, SEL))objc_msgSend)((id)core, q0s);
+                if (inst) {
+                    id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+                    for (NSString *t in @[@"q8", @"q12"]) {
+                        SEL g = NSSelectorFromString(t);
+                        if ([inst respondsToSelector:g]) {
+                            id tm = get(inst, g);
+                            if ([tm isKindOfClass:[NSTimer class]]) [tm invalidate];
+                        }
+                    }
+                }
+            }
 
-        // ④ 已经排上的 NSTimer 兜底 invalidate（防止 q5 残帧再跑一次）
-        id (*get)(id, SEL) = (id(*)(id, SEL))objc_msgSend;
-        for (NSString *t in @[@"q8", @"q12"]) {
-            id timer = get((id)core_get_singleton(core), NSSelectorFromString(t));
-            if ([timer respondsToSelector:@selector(invalidate)]) [timer invalidate];
+            // ④ 注销网络拦截器（响应改写通路）
+            Class mitm = NSClassFromString(@"_0xE4A91C73");
+            if (mitm) [NSURLProtocol unregisterClass:mitm];
+
+            NSLog(@"[ace] 完整补丁生效：隐身 + 授权链空转 + 拦截器注销");
+        } @catch (NSException *e) {
+            NSLog(@"[ace] 补丁异常(不影响 interpose 层): %@", e);
         }
-
-        // ⑤ 注销 NSURLProtocol 拦截器 _0xE4A91C73（切断响应改写通路）
-        Class mitm = NSClassFromString(@"_0xE4A91C73");
-        if (mitm) [NSURLProtocol unregisterClass:mitm];
-
-        NSLog(@"[ace] 授权链已失效：标志位强制 + 心跳/到期/信封校验全部空转");
+#else
+        NSLog(@"[ace] 诊断模式：仅 interpose 隐身层生效");
+#endif
     });
 }
 
 @end
-
-// ── 对照解法 B：“用靶场自己的引擎打靶场” ──────────────────────────
-// dylib 导出 Dobby 完整 API，可在 C 层直接 inline hook 同一批函数。
-// extern "C" int DobbyInstrument(void *addr, void (*callback)(void *, void **));
-// extern "C" int DobbyDestroy(void *addr);
-// 思路：对 -[q5]/-[q17] 的 IMP（class-dump 得 0x9f840/0xa67b4，运行时
-// 加 slide：header + __dyld_get_image_vmaddr_slide）调 DobbyInstrument
-// 把入口改成 ret。
-//
-// ── 对照解法 C：钥匙串投毒（仅作分析认知）──────────────────────────
-// setPassword:forService:account: 明文写钥匙串（无二次签名）；
-// “信封加密”只防中间人、不防端点 —— 端点即密钥保管者。
-// ────────────────────────────────────────────────────────────────────
