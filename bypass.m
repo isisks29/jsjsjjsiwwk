@@ -14,6 +14,8 @@
 #import <string.h>
 #import <stdio.h>
 #import <math.h>
+#import <signal.h>
+#import <fcntl.h>
 
 // ══════════════ 第 0 层：隐身（对靶场的 dyld/调试探测不可见）══════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
@@ -129,6 +131,95 @@ typedef struct { uint32_t n_strx; uint8_t n_type; uint8_t n_sect; uint16_t n_des
 static uintptr_t g_tgt_base = 0, g_tgt_end = 0;
 static void *g_saved_slot_val = NULL;
 static int g_rw_dialog = 0, g_rw_boot = 0;
+// ═══ v7.4 新增①: EndTime 补喂 ═══
+// 实证: 靶场有时间跳变/过期检测, 自毁走【裸 svc exit_group(9)+brk】(0xc2e2c 等),
+// libc exit/abort interpose 拦不住。无服务器配置时 ctx+0x78(EndTime double)=0
+// → "授权成功(到期1970)" 弹出瞬间被判过期 → 秒杀。
+// 修复: 结果改写时把过期/空的 EndTime 补成 2100-01-01(只动 < now+1天 的值, 真卡不碰)。
+static void ACE_prime_endtime(void) {
+    @try {
+        if (!g_tgt_base) return;
+        uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);   // 全局 ctx 指针(实证)
+        if (ctx < 0x100000000ULL) return;                        // 未建/异常则跳过
+        double *endp = (double *)(ctx + 0x78);                   // 成功弹窗到期时间就读它(实证)
+        double now = (double)time(NULL);
+        if (*endp < now + 86400.0) {
+            ACETrace(@"[prime] EndTime %.0f → 4102444800 (2100-01-01, 避开时间检测裸svc自毁)", *endp);
+            *endp = 4102444800.0;
+        }
+    } @catch (NSException *e) {}
+}
+
+// ═══ v7.4 新增②: 自带崩溃现场捕捉器（解决"系统里找不到崩溃日志"）═══
+// 靶场接管过 mach 异常端口且自毁走裸 svc, 系统崩溃报告基本无望。
+// 自己装 BSD 信号处理器: 崩溃瞬间把 信号/PC/靶场内偏移/自身内偏移/出错地址
+// 用 write(2)(async-signal-safe) 写进 Documents/ace_crash.txt, 下次启动读进悬浮日志。
+static int g_crashfd = -1;
+static uintptr_t g_self_base = 0;
+static void ace_hex16(char *d, uint64_t v) {   // 16位十六进制, 信号安全
+    const char *hd = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) { d[i] = hd[v & 0xf]; v >>= 4; }
+}
+static void ACE_crash_handler(int sig, siginfo_t *info, void *uctx) {
+    if (g_crashfd >= 0) {
+        ucontext_t *uc = (ucontext_t *)uctx;
+        uintptr_t pc = 0;
+#if defined(__arm64__) || defined(__aarch64__)
+        if (uc && uc->uc_mcontext) pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+#endif
+        uintptr_t fa = (uintptr_t)info->si_addr;
+        char buf[224]; int n = 0;
+        const char *p1 = "SIG="; memcpy(buf+n, p1, 4); n+=4;
+        buf[n++] = (char)('0' + (sig/10)%10); buf[n++] = (char)('0' + sig%10);
+        const char *p2 = " PC="; memcpy(buf+n, p2, 4); n+=4;
+        ace_hex16(buf+n, pc); n+=16;
+        const char *p3 = " TGT+="; memcpy(buf+n, p3, 6); n+=6;
+        ace_hex16(buf+n, (g_tgt_base && pc>=g_tgt_base && pc<g_tgt_end) ? pc-g_tgt_base : 0); n+=16;
+        const char *p4 = " SELF+="; memcpy(buf+n, p4, 7); n+=7;
+        ace_hex16(buf+n, (g_self_base && pc>=g_self_base) ? pc-g_self_base : 0); n+=16;
+        const char *p5 = " FAULT="; memcpy(buf+n, p5, 7); n+=7;
+        ace_hex16(buf+n, fa); n+=16;
+        buf[n++] = '\n';
+        write(g_crashfd, buf, (size_t)n);
+        fsync(g_crashfd);
+    }
+    signal(sig, SIG_DFL);   // 恢复默认处置, 不改变崩溃行为本身
+}
+static NSString *ACE_crash_path(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_crash.txt"];
+}
+static void ACE_report_last_crash(void) {
+    @try {
+        NSData *d = [NSData dataWithContentsOfFile:ACE_crash_path()];
+        if (d && [d length]) {
+            NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+            ACETrace(@"上次崩溃现场: %@", s ?: @"(解析失败)");
+        }
+    } @catch (NSException *e) {}
+}
+static void ACE_install_crash_catcher(void) {
+    @try {
+        g_self_base = (uintptr_t)ACE_self_header();
+        g_crashfd = open(ACE_crash_path().fileSystemRepresentation,
+                         O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        static stack_t ss;                 // 备用信号栈(栈溢出时也能记)
+        static char altbuf[128 * 1024];
+        ss.ss_sp = altbuf; ss.ss_size = sizeof(altbuf); ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = ACE_crash_handler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS,  &sa, NULL);
+        sigaction(SIGILL,  &sa, NULL);
+        sigaction(SIGTRAP, &sa, NULL);   // brk #1 = SIGTRAP, 靶场自毁点全覆盖
+        sigaction(SIGABRT, &sa, NULL);
+        ACETrace(@"崩溃捕捉器已装 fd=%d (SIGSEGV/BUS/ILL/TRAP/ABRT)", g_crashfd);
+    } @catch (NSException *e) { ACETrace(@"崩溃捕捉器安装失败: %@", e); }
+}
+
 
 static int ACE_addr_mapped(uintptr_t base, const uint64_t *segs, unsigned nseg,
                            uintptr_t addr, size_t len) {
@@ -245,12 +336,14 @@ static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
                         ACETrace(@"[hook] 弹窗验卡结果 %d → 0（强制成功路径）", *slot);
                         *slot = 0; g_rw_dialog++;
                     }
+                    ACE_prime_endtime();
                 } else if (off == 0xdcf68ULL) {            // 启动复核结果: capture+0x30 → 非0
                     volatile int32_t *slot = (volatile int32_t *)((uintptr_t)(__bridge void *)blk + 0x30);
                     if (*slot == 0) {
-                        ACETrace(@"[hook] 启动复核结果 0 → 1（强制成功路径）");
+                        ACETrace(@"[hook] 启动复核结果 0 → 1（强制成功路径）", *slot);
                         *slot = 1; g_rw_boot++;
                     }
+                    ACE_prime_endtime();
                 }
             }
         }
@@ -444,6 +537,8 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
             g_ace_busy = 1;
             ACETrace(@"=== v7.2 启动（隐身层激活中）===");
+                        @try { ACE_report_last_crash(); } @catch (NSException *e) {}
+            @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_result_hook(); } @catch (NSException *e) { ACETrace(@"结果hook异常: %@", e); }
             @try {
                 Class kc = NSClassFromString(@"_0xD5A13E79");   // 靶场内 SAMKeychain 封装类
