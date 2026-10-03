@@ -176,18 +176,38 @@ static const struct mach_header *ACE_find_target_header(void) {
     }
     return NULL;
 }
+static uintptr_t ace_off2va(uintptr_t base, const uint64_t (*smap)[4], unsigned n, uint32_t off) {
+    for (unsigned i = 0; i < n; i++) {
+        if (off >= smap[i][2] && off < smap[i][2] + smap[i][3])
+            return base + (uintptr_t)smap[i][0] + (off - (uint32_t)smap[i][2]);
+    }
+    return 0;
+}
 static void **ACE_find_ptr_slot(const struct mach_header *hdr, const char *want) {
     uintptr_t base = (uintptr_t)hdr;
     const ACESegCmd64 *seg = (const ACESegCmd64 *)(base + sizeof(struct mach_header_64));
     const struct symtab_command *st = NULL;
     const struct dysymtab_command *dy = NULL;
+    uint64_t smap[16][4]; unsigned nsmap = 0;   // vmaddr, vmsize, fileoff, filesize
     for (uint32_t i = 0; i < hdr->ncmds; i++) {
         ACELoadCmdHdr *c = (ACELoadCmdHdr *)seg;
         if (c->cmd == LC_SYMTAB) st = (const struct symtab_command *)c;
         else if (c->cmd == LC_DYSYMTAB) dy = (const struct dysymtab_command *)c;
+        else if (c->cmd == LC_SEGMENT_64) {
+            const ACESegCmd64 *s64 = (const ACESegCmd64 *)c;
+            if (s64->filesize > 0 && nsmap < 16) {
+                smap[nsmap][0] = s64->vmaddr;  smap[nsmap][1] = s64->vmsize;
+                smap[nsmap][2] = s64->fileoff; smap[nsmap][3] = s64->filesize;
+                nsmap++;
+            }
+        }
         seg = (const ACESegCmd64 *)((uintptr_t)c + c->cmdsize);
     }
-    if (!st || !dy) return NULL;
+    if (!st || !dy || !nsmap) return NULL;
+    const uint32_t *isyms = (const uint32_t *)ace_off2va(base, smap, nsmap, dy->indirectsymoff);
+    const ACENlist64 *nl  = (const ACENlist64 *)ace_off2va(base, smap, nsmap, st->symoff);
+    const char *strtab    = (const char *)ace_off2va(base, smap, nsmap, st->stroff);
+    if (!isyms || !nl || !strtab) return NULL;
     seg = (const ACESegCmd64 *)(base + sizeof(struct mach_header_64));
     for (uint32_t i = 0; i < hdr->ncmds; i++) {
         ACELoadCmdHdr *c = (ACELoadCmdHdr *)seg;
@@ -198,12 +218,10 @@ static void **ACE_find_ptr_slot(const struct mach_header *hdr, const char *want)
                 uint32_t ty = sec[k].flags & 0xff;
                 if ((ty == 0x6 || ty == 0x7) && sec[k].size >= 8) {
                     size_t nslots = (size_t)(sec[k].size / 8);
-                    const uint32_t *isyms = (const uint32_t *)(base + dy->indirectsymoff);
-                    const ACENlist64 *nl = (const ACENlist64 *)(base + st->symoff);
-                    const char *strtab = (const char *)(base + st->stroff);
                     for (size_t j = 0; j < nslots; j++) {
                         uint32_t si = isyms[sec[k].reserved1 + j];
                         if (si & 0xC0000000u) continue;   // INDIRECT_SYMBOL_LOCAL/ABS
+                        if (si >= st->nsyms) continue;    // 越界防御
                         if (strcmp(strtab + nl[si].n_strx, want) == 0)
                             return (void **)(base + sec[k].addr + j * 8);
                     }
