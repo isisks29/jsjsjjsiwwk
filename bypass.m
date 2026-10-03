@@ -72,6 +72,25 @@ static kern_return_t ACE_task_set_exception_ports(mach_port_t t, exception_mask_
     g_hit_tsep++;   // 计数: 验证隐身层真实生效(靶场异常端口接管被挡次数)
     return KERN_SUCCESS;
 }
+// v7.13 前置声明(nanosleep 探针提前引用; 定义在下方原位置)
+static uintptr_t g_tgt_base, g_tgt_end;
+static uintptr_t g_self_base;
+static int g_ace_ready, g_ace_busy;
+static int g_hit_nsl = 0;
+static int ACE_nanosleep(const struct timespec *rqtp, struct timespec *rmtp) {
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    int from_tgt = (g_tgt_base && ra >= g_tgt_base && ra < g_tgt_end);
+    int from_self = (g_self_base && ra >= g_self_base);
+    if (from_tgt && !from_self && g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1; g_hit_nsl++;
+        long sec = rqtp ? (long)rqtp->tv_sec : -1;
+        long nsec = rqtp ? rqtp->tv_nsec : -1;
+        ACETrace(@"[wd] nanosleep(%ld.%09ld) caller=TGT+0x%lx", sec, nsec,
+                 (unsigned long)(ra - g_tgt_base));
+        g_ace_busy = 0;
+    }
+    return nanosleep(rqtp, rmtp);   // interpose 不影响本镜像内部调用, 这里直达真身
+}
 static void ACE_exit(int code) { g_hit_exit++; (void)code; for (;;) sleep(86400); }
 static void ACE_abort(void) { g_hit_abort++; for (;;) sleep(86400); }
 // ══════════════ 第 0.5 层：观测日志（存内存，悬浮按钮导出）══════════════
@@ -117,6 +136,7 @@ ACE_INTERPOSE(ACE_task_threads,         task_threads)
 ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
+ACE_INTERPOSE(ACE_nanosleep,            nanosleep)
 
 // ══════════════ 第 0.6 层：验卡结果改写（作业主机制）══════════════
 typedef struct {
@@ -360,6 +380,7 @@ static void *ACE_exc_server(void *arg) {
 }
 typedef kern_return_t (*ACE_tsep_fn)(mach_port_t, exception_mask_t, exception_handler_t,
                                      exception_behavior_t, thread_state_flavor_t);
+
 static void ACE_install_exc_server(void) {
     // task_set_exception_ports 被我们自己的 interpose 拦着, 必须 dlsym(RTLD_NEXT) 拿真身注册
     ACE_tsep_fn real_tsep = (ACE_tsep_fn)dlsym(RTLD_NEXT, "task_set_exception_ports");
@@ -469,6 +490,7 @@ static void *ACE_endtime_keeper(void *arg) {
     }
     return NULL;
 }
+static void *ACE_ctx_monitor(void *arg);   // v7.13 前置声明(定义在下方)
 static void ACE_install_v79_threads(void) {
     pthread_t th;
     pthread_attr_t at;
@@ -476,8 +498,45 @@ static void ACE_install_v79_threads(void) {
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_create(&th, &at, ACE_flight_recorder, NULL);
     pthread_create(&th, &at, ACE_endtime_keeper, NULL);
+    pthread_create(&th, &at, ACE_ctx_monitor, NULL);
     pthread_attr_destroy(&at);
     ACETrace(@"v7.9 飞行记录器+EndTime守护已启动");
+}
+// ═══ v7.13: ctx 关键字段监视器——20ms 采样, 只记录变化 ═══
+// 看门狗 canary 混合了 ctx[0]/+0x74/+0x78/+0x8e/+0x92; 谁在成功路径上改它们,
+// 这里直接打出变化序列(值+采样序号), 与弹窗/死亡时刻对齐即可锁定杀人字段。
+static void *ACE_ctx_monitor(void *arg) {
+    (void)arg;
+    static const int offs[] = { 0x00, 0x74, 0x78, 0x88, 0x8c, 0x8e, 0x92, 0x96, 0x1196, 0x119a };
+    const int NF = (int)(sizeof(offs) / sizeof(offs[0]));
+    unsigned long long last[10];
+    for (int i = 0; i < NF; i++) last[i] = 0xDEADBEEFULL;
+    unsigned long seq = 0;
+    for (;;) {
+        usleep(20000);
+        @try {
+            if (!g_tgt_base) continue;
+            uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
+            if (ctx < 0x100000000ULL) continue;
+            seq++;
+            for (int i = 0; i < NF; i++) {
+                unsigned long long v;
+                if (offs[i] == 0x78) v = *(unsigned long long *)(ctx + 0x78);
+                else if (offs[i] == 0x119a) v = *(unsigned long long *)(ctx + 0x119a);
+                else v = (unsigned long long)(*(unsigned int *)(ctx + offs[i]));
+                if (v != last[i]) {
+                    if (g_ace_ready && !g_ace_busy) {
+                        g_ace_busy = 1;
+                        ACETrace(@"[ctx#%lu] +0x%x: %016llx → %016llx",
+                                 seq, offs[i], last[i], v);
+                        g_ace_busy = 0;
+                    }
+                    last[i] = v;
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    return NULL;
 }
 // ═══ v7.12: 遥测类 _0x7D3B5E28 全量钩 ═══
 // 实证: 13 处 svc exit_group 自毁点里 6 处位于该类方法体内
