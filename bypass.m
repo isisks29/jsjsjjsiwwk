@@ -65,6 +65,20 @@ static void ACE_register_add_image(ACEAddImageFn f) {
     g_watch_cb = f;
     _dyld_register_func_for_add_image(ACE_watch_wrapper);
 }
+// ═══ v7.18: 裸 dyld API 隐身 ═══
+// 实证(v7.17 burst): 死亡瞬间 PC=0xf177c = 完整性扫描器, 走 __dyld_* 裸变体,
+// 绕过我们只钩公开 _dyld_* 的隐身层 → 看到 bypass dylib → 0xf2668 计算式 svc 自毁。
+extern uint32_t __dyld_image_count(void);
+extern const char *__dyld_get_image_name(uint32_t);
+extern const struct mach_header *__dyld_get_image_header(uint32_t);
+extern intptr_t __dyld_get_image_vmaddr_slide(uint32_t);
+static uint32_t ACE_raw_image_count(void) { return ACE_image_count(); }
+static const char *ACE_raw_image_name(uint32_t i) { return ACE_image_name(i); }
+static const struct mach_header *ACE_raw_image_header(uint32_t i) { return ACE_image_header(i); }
+static intptr_t ACE_raw_image_slide(uint32_t i) {
+    int o = ACE_find_our_index();
+    return _dyld_get_image_vmaddr_slide((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+}
 static int g_hit_tt = 0, g_hit_tsep = 0, g_hit_exit = 0, g_hit_abort = 0;
 static kern_return_t ACE_task_threads(mach_port_t t, thread_act_array_t *a, mach_msg_type_number_t *c) {
     g_hit_tt++;
@@ -148,6 +162,10 @@ ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
 ACE_INTERPOSE(ACE_nanosleep,            nanosleep)
+ACE_INTERPOSE(ACE_raw_image_count,      __dyld_image_count)
+ACE_INTERPOSE(ACE_raw_image_name,       __dyld_get_image_name)
+ACE_INTERPOSE(ACE_raw_image_header,     __dyld_get_image_header)
+ACE_INTERPOSE(ACE_raw_image_slide,      __dyld_get_image_vmaddr_slide)
 
 // ══════════════ 第 0.6 层：验卡结果改写（作业主机制）══════════════
 typedef struct {
