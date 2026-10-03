@@ -181,7 +181,7 @@ static void installHooks(void) {
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"tick=%d\n", g_tick];
     [s appendFormat:@"base=%p\n", (void*)g_targetBase];
-    [s appendFormat:@"arm=%d c5=%d\n", g_armDone, g_called5c];
+    [s appendFormat:@"arm=%d c5=%d pat=%d\n", g_armDone, g_called5c, g_patchRet];
     if(g_targetBase){
         [s appendFormat:@"348=%u\n", r32(0x3fc000+0x348)];
         [s appendFormat:@"v328=%p\n", (void*)r64(0x3fc000+0x328)];
@@ -193,11 +193,6 @@ static void installHooks(void) {
             }@catch(NSException*e){}
         }
         [s appendFormat:@"d10=%08x\n", *(volatile uint32_t*)va(0x8d010)];
-        [s appendFormat:@"t20=%08x\n", *(volatile uint32_t*)va(0x1210e0)];
-        [s appendFormat:@"pat=%d\n", g_patchRet];
-[s appendFormat:@"d10=%08x t20=%08x\n",
-    *(volatile uint32_t*)va(0x8d010),
-    *(volatile uint32_t*)va(0x1210e0)];
     }
     self.lbl.text = s;
 }
@@ -236,6 +231,12 @@ static void spawnBall(void){
         [t refresh];
     }@catch(NSException*e){}
 }
+// 顶部确保有：
+// #import <mach/mach_vm.h>
+
+
+
+// ===== constructor =====
 __attribute__((constructor))
 static void initBy(void){
     @autoreleasepool{
@@ -248,29 +249,34 @@ static void initBy(void){
             armFull();
 
             if(g_targetBase){
-    uintptr_t addr = (uintptr_t)va(0x8d010);
-    uintptr_t page0 = addr & ~0x3FFFULL;
+                uintptr_t addr  = (uintptr_t)va(0x8d010);
+                uintptr_t page0 = addr & ~0x3FFFULL;
 
-    kern_return_t kr = vm_protect(mach_task_self(),
-                                  (mach_vm_address_t)page0, 0x4000, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY | VM_PROT_EXECUTE);
-    if(kr == KERN_SUCCESS){
-        *(volatile uint32_t*)addr = 0xD503201F;
-        sys_icache_invalidate((void*)addr, 4);
-        vm_protect(mach_task_self(),
-                   (mach_vm_address_t)page0, 0x4000, FALSE,
-                   VM_PROT_READ | VM_PROT_EXECUTE);
-        g_patchRet = 1;
-    } else {
-        g_patchRet = -kr;
-    }
-}
+                kern_return_t kr = vm_protect(mach_task_self(),
+                                              (mach_vm_address_t)page0,
+                                              0x4000, FALSE,
+                                              VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY | VM_PROT_EXECUTE);
+                if(kr == KERN_SUCCESS){
+                    *(volatile uint32_t*)addr = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d038) = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d058) = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d078) = 0xD503201F;
+                    sys_icache_invalidate((void*)addr, 0x100);
+
+                    vm_protect(mach_task_self(),
+                               (mach_vm_address_t)page0, 0x4000, FALSE,
+                               VM_PROT_READ | VM_PROT_EXECUTE);
+                    g_patchRet = 1;
+                } else {
+                    g_patchRet = -kr;
+                }
 
                 typedef void(*fn_t)(void);
                 fn_t f = (fn_t)va(0x11fa5c);
                 if(f){ f(); g_called5c = 1; }
             }
+
             spawnBall();
-        };
+        });
     }
 }
