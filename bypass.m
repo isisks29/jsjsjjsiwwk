@@ -193,6 +193,10 @@ static void installHooks(void) {
         }
         [s appendFormat:@"d10=%08x\n", *(volatile uint32_t*)va(0x8d010)];
         [s appendFormat:@"t20=%08x\n", *(volatile uint32_t*)va(0x1210e0)];
+        [s appendFormat:@"pat=%d\n", g_patchRet];
+[s appendFormat:@"d10=%08x t20=%08x\n",
+    *(volatile uint32_t*)va(0x8d010),
+    *(volatile uint32_t*)va(0x1210e0)];
     }
     self.lbl.text = s;
 }
@@ -241,7 +245,35 @@ static void initBy(void){
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
             armFull();
+
             if(g_targetBase){
+                // patch 0x8d010/0x8d038/0x8d058/0x8d078 -> nop
+                uintptr_t page0 = ((uintptr_t)va(0x8d010)) & ~0x3FFFULL;
+                int r0 = mprotect((void*)page0, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
+                if(r0 == 0){
+                    *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d038) = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d058) = 0xD503201F;
+                    *(volatile uint32_t*)va(0x8d078) = 0xD503201F;
+                    sys_icache_invalidate((void*)va(0x8d010), 0x100);
+                    mprotect((void*)page0, 0x4000, PROT_READ|PROT_EXEC);
+                    g_patchRet = 1;
+                } else {
+                    g_patchRet = -r0;
+                }
+
+                // patch 0x1210e0 -> b 0x121150
+                uintptr_t page1 = ((uintptr_t)va(0x1210e0)) & ~0x3FFFULL;
+                int r1 = mprotect((void*)page1, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
+                if(r1 == 0){
+                    *(volatile uint32_t*)va(0x1210e0) = 0x1400001C;
+                    sys_icache_invalidate((void*)va(0x1210e0), 4);
+                    mprotect((void*)page1, 0x4000, PROT_READ|PROT_EXEC);
+                    if(g_patchRet == 1) g_patchRet = 2;
+                } else {
+                    g_patchRet = -r1;
+                }
+
                 typedef void(*fn_t)(void);
                 fn_t f = (fn_t)va(0x11fa5c);
                 if(f){ f(); g_called5c = 1; }
