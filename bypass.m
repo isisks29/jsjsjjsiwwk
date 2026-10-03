@@ -479,6 +479,88 @@ static void ACE_install_v79_threads(void) {
     pthread_attr_destroy(&at);
     ACETrace(@"v7.9 飞行记录器+EndTime守护已启动");
 }
+// ═══ v7.12: 遥测类 _0x7D3B5E28 全量钩 ═══
+// 实证: 13 处 svc exit_group 自毁点里 6 处位于该类方法体内
+// (q4→0x9f668, q5→0xa6220/0xa62b8/0xa630c, q17→0xa69c8, q18:→0xa6ae8, q6:/q7:整体=处决函数)。
+// 该类带 NSTimer 属性(q8/q12) → 定时器驱动检查, 不走 dispatch(面包屑盲区, 与实测吻合)。
+// 策略: q 系方法记录 调用点偏移+遗言参数; q6:/q7:(纯处决) 直接吞掉不调原实现。
+#define ACE_TEL_MAX 16
+static SEL g_tel_sel[ACE_TEL_MAX];
+static IMP g_tel_imp[ACE_TEL_MAX];
+static int g_tel_neuter[ACE_TEL_MAX];
+static int g_tel_n = 0;
+static int ACE_tel_idx(SEL s) {
+    for (int i = 0; i < g_tel_n; i++) if (g_tel_sel[i] == s) return i;
+    return -1;
+}
+static unsigned long ACE_tel_caller(void) {
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    return (g_tgt_base && ra >= g_tgt_base && ra < g_tgt_end)
+           ? (unsigned long)(ra - g_tgt_base) : 0UL;
+}
+static void ACE_tel_v(id self, SEL _cmd) {
+    int i = ACE_tel_idx(_cmd);
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[tel] %@ caller=TGT+0x%lx", NSStringFromSelector(_cmd), ACE_tel_caller());
+        g_ace_busy = 0;
+    }
+    if (i >= 0 && g_tel_imp[i]) ((void (*)(id, SEL))g_tel_imp[i])(self, _cmd);
+}
+static void ACE_tel_o(id self, SEL _cmd, id a) {
+    int i = ACE_tel_idx(_cmd);
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[tel] %@ 遗言=[%@] caller=TGT+0x%lx", NSStringFromSelector(_cmd),
+                 ACETrimStr(a, 160), ACE_tel_caller());
+        g_ace_busy = 0;
+    }
+    if (i >= 0 && g_tel_neuter[i]) return;                 // 纯处决方法: 吞掉
+    if (i >= 0 && g_tel_imp[i]) ((void (*)(id, SEL, id))g_tel_imp[i])(self, _cmd, a);
+}
+static unsigned long long ACE_tel_q(id self, SEL _cmd, id a) {
+    int i = ACE_tel_idx(_cmd);
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[tel] %@ 遗言=[%@] caller=TGT+0x%lx", NSStringFromSelector(_cmd),
+                 ACETrimStr(a, 160), ACE_tel_caller());
+        g_ace_busy = 0;
+    }
+    if (i >= 0 && g_tel_neuter[i]) return 0;               // 纯处决方法: 吞掉
+    if (i >= 0 && g_tel_imp[i])
+        return ((unsigned long long (*)(id, SEL, id))g_tel_imp[i])(self, _cmd, a);
+    return 0;
+}
+static void ACE_tel_reg(Class cls, const char *selname, IMP tramp, int neuter) {
+    if (g_tel_n >= ACE_TEL_MAX) return;
+    SEL s = NSSelectorFromString([NSString stringWithUTF8String:selname]);
+    Method m = class_getInstanceMethod(cls, s);
+    if (!m) { ACETrace(@"[tel] 方法不存在: %s", selname); return; }
+    IMP old = method_setImplementation(m, tramp);
+    g_tel_sel[g_tel_n] = s;
+    g_tel_imp[g_tel_n] = old;
+    g_tel_neuter[g_tel_n] = neuter;
+    g_tel_n++;
+}
+static void ACE_install_tel_hooks(void) {
+    @try {
+        Class tel = NSClassFromString(@"_0x7D3B5E28");
+        if (!tel) { ACETrace(@"[tel] 类不存在(版本不符?)"); return; }
+        ACE_tel_reg(tel, "q4",  (IMP)ACE_tel_v, 0);
+        ACE_tel_reg(tel, "q16", (IMP)ACE_tel_v, 0);
+        ACE_tel_reg(tel, "q5",  (IMP)ACE_tel_v, 0);
+        ACE_tel_reg(tel, "q17", (IMP)ACE_tel_v, 0);
+        ACE_tel_reg(tel, "q19", (IMP)ACE_tel_v, 0);
+        ACE_tel_reg(tel, "q18:", (IMP)ACE_tel_o, 0);
+        ACE_tel_reg(tel, "q20:", (IMP)ACE_tel_o, 0);
+        ACE_tel_reg(tel, "q21:", (IMP)ACE_tel_o, 0);
+        ACE_tel_reg(tel, "q22:", (IMP)ACE_tel_o, 0);
+        ACE_tel_reg(tel, "q6:", (IMP)ACE_tel_o, 1);   // 纯处决 → 吞
+        ACE_tel_reg(tel, "q7:", (IMP)ACE_tel_q, 1);   // 纯处决 → 吞
+        ACETrace(@"[tel] 遥测类钩子已挂 %d 个方法 (q6:/q7: 已拆除)", g_tel_n);
+    } @catch (NSException *e) { ACETrace(@"[tel] 挂设异常: %@", e); }
+}
+
 // ═══ v7.7: 定向净化——只删卡密账户 signaturetoken.v2 ═══
 // 实证: v7.5 全量净化把 identitytoken.v4(设备标识)也删了 → UDID 注册死循环;
 // identitytoken.v4 由 ACE_pw_get 注入假值兜底; 卡密账户才是毒化启动复核的元凶。
@@ -837,7 +919,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.11 启动（隐身层激活中）===");
+            ACETrace(@"=== v7.12 启动 ===");
                         @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -863,6 +945,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
                     ACETrace(@"Alert 探针已挂");
                 }
             } @catch (NSException *e) { ACETrace(@"探针挂设异常: %@", e); }
+            @try { ACE_install_tel_hooks(); } @catch (NSException *e) { ACETrace(@"[tel] 安装异常: %@", e); }
             g_ace_busy = 0;
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
         }
