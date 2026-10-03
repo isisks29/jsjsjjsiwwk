@@ -549,7 +549,7 @@ static void *ACE_bp_installer(void *arg) {
             }
             mach_msg_type_number_t c = 128;
             kern_return_t kr = thread_set_state(list[i], ACE_ARM_DEBUG64,
-                                                (thread_state_t)&ds, &c);
+                                                (thread_state_t)&ds, c);
             if (kr == KERN_SUCCESS) ok++; else fail++;
         }
         if (!g_bp_logged && (ok || fail)) {
