@@ -408,49 +408,49 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ((void (*)(id, SEL))orig)(s, c);
             ACE_G(@"核心·%@()", sn);
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:@")) {
         void (^b)(id, SEL, id) = ^(id s, SEL c, id a) {
             ((void (*)(id, SEL, id))orig)(s, c, a);
             ACE_G(@"核心·%@(%@)", sn, ACETrimStr(a, 120));
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:c")) {
         void (^b)(id, SEL, char) = ^(id s, SEL c, char a) {
             ((void (*)(id, SEL, char))orig)(s, c, a);
             ACE_G(@"核心·%@(%d)", sn, (int)a);
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:i")) {
         void (^b)(id, SEL, int) = ^(id s, SEL c, int a) {
             ((void (*)(id, SEL, int))orig)(s, c, a);
             ACE_G(@"核心·%@(%d)", sn, a);
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:q")) {
         void (^b)(id, SEL, long long) = ^(id s, SEL c, long long a) {
             ((void (*)(id, SEL, long long))orig)(s, c, a);
             ACE_G(@"核心·%@(%lld)", sn, a);
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:Q")) {
         void (^b)(id, SEL, unsigned long long) = ^(id s, SEL c, unsigned long long a) {
             ((void (*)(id, SEL, unsigned long long))orig)(s, c, a);
             ACE_G(@"核心·%@(%llu)", sn, a);
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "v@:d")) {
         void (^b)(id, SEL, double) = ^(id s, SEL c, double a) {
             ((void (*)(id, SEL, double))orig)(s, c, a);
             ACE_G(@"核心·%@(%f)", sn, a);
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     // —— 有返回值：原值透传，多记一行 ——
     if (!strcmp(enc, "c@:") || !strcmp(enc, "B@:")) {
@@ -459,7 +459,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@()=%d", sn, (int)r);
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "c@:@") || !strcmp(enc, "B@:@")) {
         char (^b)(id, SEL, id) = ^char(id s, SEL c, id a) {
@@ -467,7 +467,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@(%@)=%d", sn, ACETrimStr(a, 120), (int)r);
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "i@:")) {
         int (^b)(id, SEL) = ^int(id s, SEL c) {
@@ -475,7 +475,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@()=%d", sn, r);
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "q@:")) {
         long long (^b)(id, SEL) = ^long long(id s, SEL c) {
@@ -483,7 +483,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@()=%lld", sn, r);
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "q@:@")) {
         long long (^b)(id, SEL, id) = ^long long(id s, SEL c, id a) {
@@ -491,7 +491,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@(%@)=%lld", sn, ACETrimStr(a, 120), r);
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "d@:")) {
         double (^b)(id, SEL) = ^double(id s, SEL c) {
@@ -499,7 +499,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@()=%f", sn, r);
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "i@:@")) {
         int (^b)(id, SEL, id) = ^int(id s, SEL c, id a) {
@@ -507,7 +507,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@(%@)=%d", sn, ACETrimStr(a, 120), r);
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "d@:@")) {
         double (^b)(id, SEL, id) = ^double(id s, SEL c, id a) {
@@ -515,7 +515,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@(%@)=%f", sn, ACETrimStr(a, 120), r);
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "@@:")) {
         id (^b)(id, SEL) = ^id(id s, SEL c) {
@@ -523,7 +523,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@()=%@", sn, ACETrimStr(r, 120));
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     if (!strcmp(enc, "@@:@")) {
         id (^b)(id, SEL, id) = ^id(id s, SEL c, id a) {
@@ -531,7 +531,7 @@ static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
             ACE_G(@"核心·%@(%@)=%@", sn, ACETrimStr(a, 120), ACETrimStr(r, 120));
             return r;
         };
-        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+        ACE_holdBlock(b); return imp_implementationWithBlock(b);
     }
     return NULL; // 没见过的编码：宁可跳过也不瞎包
 }
