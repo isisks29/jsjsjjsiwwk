@@ -241,35 +241,28 @@ static void ACE_install_crash_catcher(void) {
         ACETrace(@"崩溃捕捉器已装 fd=%d (SIGSEGV/BUS/ILL/TRAP/ABRT)", g_crashfd);
     } @catch (NSException *e) { ACETrace(@"崩溃捕捉器安装失败: %@", e); }
 }
-// ═══ v7.5 新增: 启动净化——清掉本 app 的钥匙串条目与 UserDefaults ═══
-// 实证: iOS 卸载不清钥匙串(SAMKeychain 用自身 access group, 删除重装仍在),
-// 首轮强制成功写入的 TEST123/半初始化状态会毒化后续每次启动(你遇到的启动即闪退死循环)。
+// ═══ v7.7: 定向净化——只删卡密账户 signaturetoken.v2 ═══
+// 实证: v7.5 全量净化把 identitytoken.v4(设备标识)也删了 → UDID 注册死循环;
+// identitytoken.v4 由 ACE_pw_get 注入假值兜底; 卡密账户才是毒化启动复核的元凶。
 #define ACE_VIRGIN_PURGE 1
 static void ACE_boot_purge(void) {
 #if ACE_VIRGIN_PURGE
     @try {
-        NSMutableDictionary *q = [NSMutableDictionary dictionary];
-        [q setObject:(__bridge id)kSecClassGenericPassword forKey:(__bridge id)kSecClass];
-        [q setObject:(__bridge id)kSecMatchLimitAll forKey:(__bridge id)kSecMatchLimit];
-        [q setObject:[NSNumber numberWithBool:YES] forKey:(__bridge id)kSecReturnAttributes];
-        CFTypeRef res = NULL;
-        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
-        int n = 0;
-        if (st == errSecSuccess && res && CFGetTypeID(res) == CFArrayGetTypeID()) {
-            NSArray *items = (__bridge_transfer NSArray *)res;
-            for (id item in items) {
-                NSMutableDictionary *del = [NSMutableDictionary dictionary];
-                [del setObject:(__bridge id)kSecClassGenericPassword forKey:(__bridge id)kSecClass];
-                id svc = [(NSDictionary *)item objectForKey:(__bridge id)kSecAttrService];
-                id acct = [(NSDictionary *)item objectForKey:(__bridge id)kSecAttrAccount];
-                if (svc) [del setObject:svc forKey:(__bridge id)kSecAttrService];
-                if (acct) [del setObject:acct forKey:(__bridge id)kSecAttrAccount];
-                if (SecItemDelete((__bridge CFDictionaryRef)del) == errSecSuccess) n++;
-            }
-        } else if (res) { CFRelease(res); }
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-        [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
-        ACETrace(@"启动净化: 钥匙串删 %d 条, UserDefaults 已清 (%@)", n, bid);
+        NSMutableDictionary *del = [NSMutableDictionary dictionary];
+        [del setObject:(__bridge id)kSecClassGenericPassword forKey:(__bridge id)kSecClass];
+        [del setObject:@"com.apple.LSDocumentRegistry" forKey:(__bridge id)kSecAttrService];
+        [del setObject:@"com.apple.signaturetoken.v2" forKey:(__bridge id)kSecAttrAccount];
+        OSStatus st = SecItemDelete((__bridge CFDictionaryRef)del);
+        NSString *flag = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_purged.flag"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:flag]) {
+            NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+            [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
+            [fm createFileAtPath:flag contents:[@"1" dataUsingEncoding:NSUTF8StringEncoding] attributes:nil];
+            ACETrace(@"启动净化: 卡密账户已删(st=%d) + defaults 一次性清理", (int)st);
+        } else {
+            ACETrace(@"启动净化: 卡密账户已删(st=%d), UDID/defaults 保留", (int)st);
+        }
     } @catch (NSException *e) { ACETrace(@"启动净化异常: %@", e); }
 #endif
 }
@@ -544,8 +537,21 @@ static void ACE_setup_button(void) {
 @implementation ACELicensePatch
 
 static IMP g_pwGet_imp = NULL;
+// v7.7: 假 UDID 注入。实证: identitytoken.v4 的全部读取点只判 length!=0(无校验),
+// 钥匙串查空时返回固定 40 位十六进制串即可过门槛, Safari 注册流程整个跳过。
 static id ACE_pw_get(id cls, SEL _cmd, id svc, id acct) {
     id r = ((id (*)(id, SEL, id, id))g_pwGet_imp)(cls, _cmd, svc, acct);
+    @try {
+        if (!r && [acct isKindOfClass:[NSString class]] &&
+            [(NSString *)acct isEqualToString:@"com.apple.identitytoken.v4"]) {
+            r = @"9f3c2b1a4d5e6f708192a3b4c5d6e7f8091a2b3c";
+            if (g_ace_ready && !g_ace_busy) {
+                g_ace_busy = 1;
+                ACETrace(@"[udid] 钥匙串为空 → 注入固定设备标识, 跳过 Safari 注册");
+                g_ace_busy = 0;
+            }
+        }
+    } @catch (NSException *e2) {}
     if (g_ace_ready && !g_ace_busy) {
         g_ace_busy = 1;
         ACETrace(@"Keychain GET svc=%@ acct=%@ -> %@", svc, acct, r ?: @"(nil)");
