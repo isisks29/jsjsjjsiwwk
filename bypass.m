@@ -444,10 +444,33 @@ typedef kern_return_t (*ACE_tt_fn)(mach_port_t, thread_act_array_t *, mach_msg_t
 static ACE_tt_fn ACE_real_task_threads(void);   // v7.15 前置声明(定义在 v7.14 段)
 static void *ACE_flight_recorder(void *arg) {
     (void)arg;
-    ACE_tt_fn real_tt = ACE_real_task_threads();
+    ACE_tt_fn real_tt = ACE_real_task_threads();   // v7.15: 镜像符号表解析(绕开 interpose 对 dlsym 的污染)
     if (!real_tt) { ACETrace(@"[rec] 真实task_threads解析失败, 线程采样不可用"); return NULL; }
     ACETrace(@"[rec] 采样启动 real_tt=%p", (void *)real_tt);
-    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
+    for (;;) {
+        usleep(50000);
+        if (!g_tgt_base) continue;
+        thread_act_array_t list = NULL;
+        mach_msg_type_number_t n = 0;
+        if (real_tt(mach_task_self(), &list, &n) != KERN_SUCCESS || !list) continue;
+        char line[240]; int p = 0;
+        memcpy(line, "PC:", 3); p = 3;
+        for (unsigned i = 0; i < n && p < 200; i++) {
+            unsigned long long stt[34];
+            memset(stt, 0, sizeof(stt));
+            mach_msg_type_number_t c = 68;
+            if (thread_get_state(list[i], ACE_ARM64_STATE, (thread_state_t)stt, &c) == 0 && c >= 66) {
+                unsigned long long pc = stt[32];
+                if (pc >= g_tgt_base && pc < g_tgt_end) {
+                    static const char *hd = "0123456789abcdef";
+                    unsigned long long off = pc - g_tgt_base;
+                    line[p++] = ' ';
+                    for (int k = 28; k >= 0; k -= 4) line[p++] = hd[(off >> k) & 0xf];
+                }
+            }
+        }
+        line[p] = 0;
+        vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
         int hadTarget = (p > 3);
         strcpy(g_ring[g_ring_i], line);
         g_ring_i = (g_ring_i + 1) & 7;
@@ -475,8 +498,6 @@ static void *ACE_flight_recorder(void *arg) {
     }
     return NULL;
 }
-}
-
 // ═══ v7.9: EndTime 持续补喂——每50ms把 ctx+0x78 顶回 2100 ═══
 // 实证(v7.8日志): prime 写入后"到期时间"仍空白 → 成功路径里有代码事后清零;
 // 清零后过期检测读到 0 → 判过期 → 裸svc自毁(与"授权成功弹窗瞬间闪退"吻合)。
