@@ -14,6 +14,7 @@
 #import <ucontext.h>
 #import <sys/mman.h>
 #import <string.h>
+#import <mach/mach_vm.h>
 static volatile int g_patchedDraw = 0;
 static volatile uint32_t g_drawW0 = 0, g_drawW1 = 0;
 static volatile int g_tick = 0;
@@ -247,13 +248,22 @@ static void initBy(void){
             armFull();
 
             if(g_targetBase){
-                // patch 0x8d010/0x8d038/0x8d058/0x8d078 -> nop
-                uintptr_t page0 = ((uintptr_t)va(0x8d010)) & ~0x3FFFULL;
-int r0 = mprotect((void*)page0, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
-if(r0 == 0){
-    *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
-    sys_icache_invalidate((void*)va(0x8d010), 4);
-    mprotect((void*)page0, 0x4000, PROT_READ|PROT_EXEC);
+    uintptr_t addr = (uintptr_t)va(0x8d010);
+    uintptr_t page0 = addr & ~0x3FFFULL;
+
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                  (mach_vm_address_t)page0, 0x4000, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY | VM_PROT_EXECUTE);
+    if(kr == KERN_SUCCESS){
+        *(volatile uint32_t*)addr = 0xD503201F;
+        sys_icache_invalidate((void*)addr, 4);
+        vm_protect(mach_task_self(),
+                   (mach_vm_address_t)page0, 0x4000, FALSE,
+                   VM_PROT_READ | VM_PROT_EXECUTE);
+        g_patchRet = 1;
+    } else {
+        g_patchRet = -kr;
+    }
 }
 
                 typedef void(*fn_t)(void);
