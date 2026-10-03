@@ -249,21 +249,6 @@ static void initBy(void){
             if(g_targetBase){
                 // patch 0x8d010/0x8d038/0x8d058/0x8d078 -> nop
                 uintptr_t page0 = ((uintptr_t)va(0x8d010)) & ~0x3FFFULL;
-                int r0 = mprotect((void*)page0, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
-                if(r0 == 0){
-                    *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
-                    *(volatile uint32_t*)va(0x8d038) = 0xD503201F;
-                    *(volatile uint32_t*)va(0x8d058) = 0xD503201F;
-                    *(volatile uint32_t*)va(0x8d078) = 0xD503201F;
-                    sys_icache_invalidate((void*)va(0x8d010), 0x100);
-                    mprotect((void*)page0, 0x4000, PROT_READ|PROT_EXEC);
-                    g_patchRet = 1;
-                } else {
-                    g_patchRet = -r0;
-                }
-
-                // patch 0x1210e0 -> b 0x121150
-                uintptr_t page0 = ((uintptr_t)va(0x8d010)) & ~0x3FFFULL;
 int r0 = mprotect((void*)page0, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC);
 if(r0 == 0){
     *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
