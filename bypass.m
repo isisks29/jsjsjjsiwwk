@@ -4,56 +4,60 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <dlfcn.h>
 #import <unistd.h>
 #import <stdlib.h>
 
 // ══════════ 第 0 层：dyld 拦截（先于所有 +load/构造函数生效）══════
-typedef void (*ACEAddImageFn)(const void *mh, intptr_t slide);
+// 回调签名与 <mach-o/dyld.h> 声明完全一致（Xcode15+ 函数指针不匹配即报错）
+typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
 
-static const void *ACE_self_header(void) {
+static const struct mach_header *ACE_self_header(void) {
     Dl_info info;
-    if (dladdr((const void *)&ACE_self_header, &info)) return info.dli_fbase;
+    if (dladdr((const void *)&ACE_self_header, &info))
+        return (const struct mach_header *)info.dli_fbase;
     return NULL;   // 取不到就放弃隐身，其余功能照常工作
 }
 
 static int g_our_index = -1;
 static int ACE_find_our_index(void) {
     if (g_our_index >= 0) return g_our_index;
-    const void *self = ACE_self_header();
+    const struct mach_header *self = ACE_self_header();
     if (!self) return -1;
-    uint32_t n = __dyld_image_count();          // 本镜像内的调用不受本表影响
+    uint32_t n = _dyld_image_count();           // 本镜像内的调用不受本表影响
     for (uint32_t i = 0; i < n; i++)
-        if (__dyld_get_image_header(i) == self) { g_our_index = (int)i; return g_our_index; }
+        if (_dyld_get_image_header(i) == self) { g_our_index = (int)i; return g_our_index; }
     return -1;
 }
 
 // 把补丁从模块枚举里摘掉（watchdog 的扫描循环失明）
 static uint32_t ACE_image_count(void) {
-    return (uint32_t)((int)__dyld_image_count() - (ACE_find_our_index() >= 0 ? 1 : 0));
+    return (uint32_t)((int)_dyld_image_count() - (ACE_find_our_index() >= 0 ? 1 : 0));
 }
 static const char *ACE_image_name(uint32_t i) {
     int o = ACE_find_our_index();
-    return __dyld_get_image_name((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+    return _dyld_get_image_name((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
 }
-static const void *ACE_image_header(uint32_t i) {
+static const struct mach_header *ACE_image_header(uint32_t i) {
     int o = ACE_find_our_index();
-    return __dyld_get_image_header((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+    return _dyld_get_image_header((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
 }
 
 // 接管监视器注册：转发给靶场回调，但把“补丁镜像”伪装成“主程序镜像”。
 // 监视器 @0x44bc 对主程序直接放行（跳过匹配），其余镜像原样喂入。
 static ACEAddImageFn g_watch_cb = NULL;
-static void ACE_watch_wrapper(const void *mh, intptr_t slide) {
+static void ACE_watch_wrapper(const struct mach_header *mh, intptr_t slide) {
     if (!g_watch_cb) return;
     if (mh && mh == ACE_self_header())
-        g_watch_cb(__dyld_get_image_header(0), slide);   // 伪装成主程序
+        g_watch_cb(_dyld_get_image_header(0), slide);   // 伪装成主程序
     else
         g_watch_cb(mh, slide);
 }
 static void ACE_register_add_image(ACEAddImageFn f) {
     g_watch_cb = f;
-    __dyld_register_func_for_add_image(ACE_watch_wrapper);
+    _dyld_register_func_for_add_image(ACE_watch_wrapper);
 }
 
 // 反调试/异常劫持关闭（返回成功但不给数据 → 扫描循环自然空转）
@@ -85,10 +89,10 @@ static void ACE_abort(void) {
     const struct { const void *r, *o; } _ace_ip_##orig \
     __attribute__((used, section("__DATA,__interpose"))) = { (const void *)(rep), (const void *)(orig) };
 
-ACE_INTERPOSE(ACE_register_add_image,   __dyld_register_func_for_add_image)
-ACE_INTERPOSE(ACE_image_count,          __dyld_image_count)
-ACE_INTERPOSE(ACE_image_name,           __dyld_get_image_name)
-ACE_INTERPOSE(ACE_image_header,         __dyld_get_image_header)
+ACE_INTERPOSE(ACE_register_add_image,   _dyld_register_func_for_add_image)
+ACE_INTERPOSE(ACE_image_count,          _dyld_image_count)
+ACE_INTERPOSE(ACE_image_name,           _dyld_get_image_name)
+ACE_INTERPOSE(ACE_image_header,         _dyld_get_image_header)
 ACE_INTERPOSE(ACE_task_threads,         task_threads)
 ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
