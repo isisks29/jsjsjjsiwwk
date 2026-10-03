@@ -24,7 +24,6 @@ static const struct mach_header *ACE_self_header(void) {
         return (const struct mach_header *)info.dli_fbase;
     return NULL;
 }
-// 按索引位移把“自己”从镜像编号里抠掉（与落地文件名无关，天然免疫改名）
 static int g_our_index = -1;
 static int ACE_find_our_index(void) {
     if (g_our_index >= 0) return g_our_index;
@@ -49,7 +48,6 @@ static const struct mach_header *ACE_image_header(uint32_t i) {
 static ACEAddImageFn g_watch_cb = NULL;
 static void ACE_watch_wrapper(const struct mach_header *mh, intptr_t slide) {
     if (!g_watch_cb) return;
-    // 只在我们自己的镜像上报主程序头，不做任何额外查询
     if (mh && mh == ACE_self_header()) g_watch_cb(_dyld_get_image_header(0), slide);
     else g_watch_cb(mh, slide);
 }
@@ -70,10 +68,7 @@ static void ACE_abort(void) { for (;;) sleep(86400); }
 // ══════════════ 第 0.5 层：观测日志（存内存，悬浮按钮导出）══════════════
 static NSMutableArray *g_logbuf = NULL;
 static int g_trace_lines = 0;
-// 重入闸门：日志自身的 Foundation 调用会再次命中被接管的符号，挡住第二层。
-// 绝不能用 __thread——libSystem 初始化最早期访问 TLS 会触发 abort（实测教训）。
 static int g_ace_busy = 0;
-// 就绪开关：+load 执行前所有探针纯转发、零动作。
 static int g_ace_ready = 0;
 
 static void ACETraceLine(NSString *line) {
@@ -93,9 +88,7 @@ static NSString *ACELogDump(void) {
     NSString *head = [NSString stringWithFormat:@"=== ace 日志 · %lu 行 ===\n", (unsigned long)[snap count]];
     return [head stringByAppendingString:[snap componentsJoinedByString:@"\n"]];
 }
-// 记录闸门：就绪且不重入才记
 #define ACE_G(...) do { if (g_ace_ready && !g_ace_busy) { g_ace_busy = 1; @try { ACETrace(__VA_ARGS__); } @catch (NSException *e) {} g_ace_busy = 0; } } while (0)
-// 截断对象文本（%@ 不允许带精度）
 static NSString *ACETrimStr(id obj, NSUInteger n) {
     if (!obj) return @"(nil)";
     NSString *s = [obj description];
@@ -117,14 +110,12 @@ ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
 
 // ══════════════ 第 0.6 层：验卡结果改写（作业主机制）══════════════
-// 改写靶场 __la_symbol_ptr 的 _dispatch_async 槽（静态槽位 0x3e84b8，间接符号表实证）。
-// 派发时刻识别两个结果 block（invoke=靶场+0xef0c8 / +0xdcf68），把判定 capture
-// 改成成功值（+0x38→0 / +0x30→非0）后原样放行。纯数据写，零 .text 修改。
 typedef struct {
     uint32_t cmd, cmdsize;
 } ACELoadCmdHdr;
 typedef struct {
     uint32_t cmd, cmdsize;
+    char segname[16];
     uint64_t vmaddr, vmsize, fileoff, filesize;
     uint32_t maxprot, initprot, nsects, flags;
 } ACESegCmd64;
@@ -139,21 +130,38 @@ static uintptr_t g_tgt_base = 0, g_tgt_end = 0;
 static void *g_saved_slot_val = NULL;
 static int g_rw_dialog = 0, g_rw_boot = 0;
 
-// 按指令签名识别靶场镜像（文件名无关）；签名不符=版本不同，绝不安装
+static int ACE_addr_mapped(uintptr_t base, const uint64_t *segs, unsigned nseg,
+                           uintptr_t addr, size_t len) {
+    for (unsigned i = 0; i < nseg; i++) {
+        uintptr_t s = base + (uintptr_t)segs[i * 2];
+        uintptr_t e = s + (uintptr_t)segs[i * 2 + 1];
+        if (addr >= s && addr + len <= e) return 1;
+    }
+    return 0;
+}
 static int ACE_sig_ok(uintptr_t base) {
     const struct mach_header_64 *h64 = (const struct mach_header_64 *)base;
     if (h64->ncmds == 0 || h64->ncmds > 256) return 0;
     uint64_t textsize = 0;
+    uint64_t segs[32]; unsigned nseg = 0;   // (vmaddr, vmsize) 对，fileoff==0 的映射段
     ACELoadCmdHdr *c = (ACELoadCmdHdr *)(base + sizeof(struct mach_header_64));
     for (uint32_t i = 0; i < h64->ncmds; i++) {
         if (c->cmdsize < 8 || c->cmdsize > 0x100000) return 0;   // 命令流损坏防御
         if (c->cmd == LC_SEGMENT_64) {
             const ACESegCmd64 *s64 = (const ACESegCmd64 *)c;
-            if (s64->vmaddr == 0 && s64->vmsize > textsize) textsize = s64->vmsize;
+            if (strncmp(s64->segname, "__PAGEZERO", 16) != 0 && s64->fileoff == 0 &&
+                s64->vmsize > 0 && nseg < 16) {
+                segs[nseg * 2] = s64->vmaddr; segs[nseg * 2 + 1] = s64->vmsize; nseg++;
+            }
+            if (s64->vmaddr == 0 && strncmp(s64->segname, "__PAGEZERO", 16) != 0 &&
+                s64->vmsize > textsize && s64->vmsize < 0x10000000ULL)
+                textsize = s64->vmsize;
         }
         c = (ACELoadCmdHdr *)((uintptr_t)c + c->cmdsize);
     }
-    if (textsize < 0x100000) return 0;   // 防小镜像越界读
+    if (textsize < 0x100000) return 0;   // 首选基址非 0 或太小 → 不是候选
+    if (!ACE_addr_mapped(base, segs, nseg, base + 0xef0fc, 4)) return 0;
+    if (!ACE_addr_mapped(base, segs, nseg, base + 0xdcf68, 4)) return 0;
     const uint32_t *p1 = (const uint32_t *)(base + 0xef0fc);   // ldr w8,[x0,#0x38]
     const uint32_t *p2 = (const uint32_t *)(base + 0xdcf68);   // ldr w8,[x0,#0x30]
     return *p1 == 0xB9403808u && *p2 == 0xB9403008u;
@@ -168,7 +176,6 @@ static const struct mach_header *ACE_find_target_header(void) {
     }
     return NULL;
 }
-// 查符号名对应的指针槽（__got=0x6 / __la_symbol_ptr=0x7，走间接符号表）
 static void **ACE_find_ptr_slot(const struct mach_header *hdr, const char *want) {
     uintptr_t base = (uintptr_t)hdr;
     const ACESegCmd64 *seg = (const ACESegCmd64 *)(base + sizeof(struct mach_header_64));
@@ -207,8 +214,6 @@ static void **ACE_find_ptr_slot(const struct mach_header *hdr, const char *want)
     }
     return NULL;
 }
-// 替换体：命中靶场结果 block 就改判定值，然后放行。
-// 内部调用 dispatch_async 走【我们自己镜像】的绑定=真 libdispatch，无递归风险。
 static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
     @try {
         if (blk && g_tgt_base) {
@@ -225,7 +230,7 @@ static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
                 } else if (off == 0xdcf68ULL) {            // 启动复核结果: capture+0x30 → 非0
                     volatile int32_t *slot = (volatile int32_t *)((uintptr_t)(__bridge void *)blk + 0x30);
                     if (*slot == 0) {
-ACETrace(@"[hook] 启动复核结果 0 → 1（强制成功路径）");
+                        ACETrace(@"[hook] 启动复核结果 0 → 1（强制成功路径）");
                         *slot = 1; g_rw_boot++;
                     }
                 }
@@ -244,7 +249,10 @@ static void ACE_install_result_hook(void) {
         for (uint32_t i = 0; i < ((const struct mach_header_64 *)hdr)->ncmds; i++) {
             if (c->cmd == LC_SEGMENT_64) {
                 const ACESegCmd64 *s64 = (const ACESegCmd64 *)c;
-                if (s64->vmaddr == 0 && s64->vmsize > 0) { textsize = s64->vmsize; break; }
+                if (s64->vmaddr == 0 && s64->vmsize > 0 && s64->vmsize < 0x10000000ULL &&
+                    strncmp(s64->segname, "__PAGEZERO", 16) != 0) {
+                    textsize = s64->vmsize; break;
+                }
             }
             c = (ACELoadCmdHdr *)((uintptr_t)c + c->cmdsize);
         }
@@ -259,7 +267,6 @@ static void ACE_install_result_hook(void) {
              (void *)base, (unsigned long long)textsize, slot, g_saved_slot_val,
              (void *)ACE_dispatch_async_hook);
 }
-
 // ══════════════ 屏幕悬浮按钮（日志导出）═══════════════
 @interface ACELogWindow : UIWindow
 @end
@@ -271,7 +278,6 @@ static ACELogWindow *g_logWin = nil;
 static UIViewController *ACE_topVC(void);
 
 @implementation ACELogWindow
-// 只有点在按钮上才拦截触摸，其余位置穿透到下层界面
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *v = [super hitTest:point withEvent:event];
     if (!v || v == self) return nil;
@@ -419,7 +425,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.1 启动（隐身层激活中）===");
+            ACETrace(@"=== v7.2 启动（隐身层激活中）===");
             @try { ACE_install_result_hook(); } @catch (NSException *e) { ACETrace(@"结果hook异常: %@", e); }
             @try {
                 Class kc = NSClassFromString(@"_0xD5A13E79");   // 靶场内 SAMKeychain 封装类
@@ -440,7 +446,6 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
                 }
             } @catch (NSException *e) { ACETrace(@"探针挂设异常: %@", e); }
             g_ace_busy = 0;
-            // 按钮晚 1 秒再建，避开启动早期最脆弱的阶段
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
         }
     });
