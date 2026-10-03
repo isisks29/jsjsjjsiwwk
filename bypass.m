@@ -83,7 +83,6 @@ static void ACETraceLine(NSString *line) {
 }
 // 用宏直接拼字面量前缀后走 stringWithFormat:，避免新版 SDK 的 va_list 匹配问题
 #define ACETrace(fmt, ...) ACETraceLine([NSString stringWithFormat:(@"[ace] " fmt), ##__VA_ARGS__])
-
 static NSString *ACELogDump(void) {
     NSMutableArray *snap = nil;
     @synchronized ([NSMutableArray class]) { snap = [g_logbuf mutableCopy]; }
@@ -109,6 +108,13 @@ static const char *ACE_hex(const unsigned char *d, int n) {
     int k = 0;
     for (int i = 0; i < n && k < 120; i++) k += sprintf(buf + k, "%02x", d[i]);
     return buf;
+}
+// 截断对象文本（%@ 不允许带精度，超长截断必须手动做）
+static NSString *ACETrimStr(id obj, NSUInteger n) {
+    if (!obj) return @"(nil)";
+    NSString *s = [obj description];
+    if ([s length] > n) s = [s substringToIndex:n];
+    return s;
 }
 
 // —— 探针 interpose：只记录、原样放行，不改变任何行为 ——
@@ -145,10 +151,10 @@ static OSStatus ACE_SecItemCopyMatching_wrap(const CFDictionaryRef query, CFType
     OSStatus s = SecItemCopyMatching(query, result);
     @autoreleasepool {
         NSString *qd = (__bridge_transfer NSString *)CFCopyDescription((const void *)query);
-        ACETrace(@"SecItemCopyMatching status=%d query=%.300@", (int)s, qd);
+        ACETrace(@"SecItemCopyMatching status=%d query=%@", (int)s, ACETrimStr(qd, 300));
         if (s == 0 && result && *result) {
             NSString *rd = (__bridge_transfer NSString *)CFCopyDescription(*result);
-            ACETrace(@"  -> item=%.300@", rd);
+            ACETrace(@"  -> item=%@", ACETrimStr(rd, 300));
         }
     }
     return s;
@@ -325,7 +331,7 @@ static id ACE_pw_get(id cls, SEL _cmd, id svc, id acct) {
 static IMP g_pwSet_imp = NULL;
 static BOOL ACE_pw_set(id cls, SEL _cmd, id pw, id svc, id acct) {
     BOOL r = ((BOOL (*)(id, SEL, id, id, id))g_pwSet_imp)(cls, _cmd, pw, svc, acct);
-    ACETrace(@"Keychain SET svc=%@ acct=%@ pw=[%.64@] ok=%d", svc, acct, pw ?: @"(nil)", r);
+    ACETrace(@"Keychain SET svc=%@ acct=%@ pw=%@ ok=%d", svc, acct, ACETrimStr(pw, 64), r);
     return r;
 }
 static IMP g_start_imp = NULL;
