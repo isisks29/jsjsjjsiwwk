@@ -65,20 +65,7 @@ static void ACE_register_add_image(ACEAddImageFn f) {
     g_watch_cb = f;
     _dyld_register_func_for_add_image(ACE_watch_wrapper);
 }
-// ═══ v7.18: 裸 dyld API 隐身 ═══
-// 实证(v7.17 burst): 死亡瞬间 PC=0xf177c = 完整性扫描器, 走 __dyld_* 裸变体,
-// 绕过我们只钩公开 _dyld_* 的隐身层 → 看到 bypass dylib → 0xf2668 计算式 svc 自毁。
-extern uint32_t __dyld_image_count(void);
-extern const char *__dyld_get_image_name(uint32_t);
-extern const struct mach_header *__dyld_get_image_header(uint32_t);
-extern intptr_t __dyld_get_image_vmaddr_slide(uint32_t);
-static uint32_t ACE_raw_image_count(void) { return ACE_image_count(); }
-static const char *ACE_raw_image_name(uint32_t i) { return ACE_image_name(i); }
-static const struct mach_header *ACE_raw_image_header(uint32_t i) { return ACE_image_header(i); }
-static intptr_t ACE_raw_image_slide(uint32_t i) {
-    int o = ACE_find_our_index();
-    return _dyld_get_image_vmaddr_slide((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
-}
+
 static int g_hit_tt = 0, g_hit_tsep = 0, g_hit_exit = 0, g_hit_abort = 0;
 static kern_return_t ACE_task_threads(mach_port_t t, thread_act_array_t *a, mach_msg_type_number_t *c) {
     g_hit_tt++;
@@ -134,6 +121,37 @@ static int ACE_nanosleep(const struct timespec *rqtp, struct timespec *rmtp) {
     }
     return nanosleep(rqtp, rmtp);
 }
+// ═══ v7.18: 安保线程孵化拦截(pthread_create interpose) ═══
+// 实证链: v7.17 burst 死亡瞬间 PC=0xf177c = 安保初始化函数(内含两个 pthread_create:
+// 0xf1b64→孵化看门狗线程0xf26cc, 0xf1ea4→孵化校验线程0xf4650); SIGKILL 处决簇
+// (0xf8308/0xf83d0, getpid+kill 裸svc)就在校验线程函数体内, 且该函数含 AC 01 协议帧
+// 校验(0xf4884 cmp w8,#0xac) → 成功路径孵化校验线程 → 连服务器复核 → 假卡必死。
+// 修法: 拦截 pthread_create, 靶场安保线程(入口+0xf26cc/+0xf4650)直接不孵化。
+static int ACE_pthread_create(pthread_t *t, const pthread_attr_t *a,
+                              void *(*fn)(void *), void *arg) {
+    if (g_tgt_base && fn) {
+        uintptr_t e = (uintptr_t)fn;
+        if (e >= g_tgt_base && e < g_tgt_end) {
+            uintptr_t off = e - g_tgt_base;
+            if (off == 0xf26ccULL || off == 0xf4650ULL) {
+                if (g_ace_ready && !g_ace_busy) {
+                    g_ace_busy = 1;
+                    ACETrace(@"[pc] 拦截靶场安保线程孵化 entry=+0x%lx (看门狗/校验线程)",
+                             (unsigned long)off);
+                    g_ace_busy = 0;
+                }
+                if (t) *t = (pthread_t)0;
+                return 0;   // 假装创建成功
+            }
+            if (g_ace_ready && !g_ace_busy) {
+                g_ace_busy = 1;
+                ACETrace(@"[pc] 靶场线程孵化 entry=+0x%lx (放行)", (unsigned long)off);
+                g_ace_busy = 0;
+            }
+        }
+    }
+    return pthread_create(t, a, fn, arg);   // interpose 不影响本镜像内部调用, 直达真身
+}
 static NSString *ACELogDump(void) {
     NSMutableArray *snap = nil;
     @synchronized ([NSMutableArray class]) { snap = [g_logbuf mutableCopy]; }
@@ -162,10 +180,7 @@ ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
 ACE_INTERPOSE(ACE_nanosleep,            nanosleep)
-ACE_INTERPOSE(ACE_raw_image_count,      __dyld_image_count)
-ACE_INTERPOSE(ACE_raw_image_name,       __dyld_get_image_name)
-ACE_INTERPOSE(ACE_raw_image_header,     __dyld_get_image_header)
-ACE_INTERPOSE(ACE_raw_image_slide,      __dyld_get_image_vmaddr_slide)
+ACE_INTERPOSE(ACE_pthread_create,       pthread_create)
 
 // ══════════════ 第 0.6 层：验卡结果改写（作业主机制）══════════════
 typedef struct {
@@ -197,8 +212,9 @@ static void ACE_prime_endtime(void) {
         double *endp = (double *)(ctx + 0x78);
         double now = (double)time(NULL);
         if (*endp < now + 86400.0) {
-            ACETrace(@"[prime] EndTime %.0f → 4102444800 (2100-01-01, 避开时间检测裸svc自毁)", *endp);
-            *endp = 4102444800.0;
+            // v7.18: 仿周卡 now+7天(老师实证: 真卡=领取时刻+卡时长; 2100年=76年卡是异常值)
+            ACETrace(@"[prime] EndTime %.0f → %.0f (仿周卡: now+7天)", *endp, now + 7.0 * 86400.0);
+            *endp = now + 7.0 * 86400.0;
         }
     } @catch (NSException *e) {}
 }
@@ -567,7 +583,7 @@ static void *ACE_endtime_keeper(void *arg) {
             if (ctx < 0x100000000ULL) continue;
             volatile double *endp = (volatile double *)(ctx + 0x78);
             double now = (double)time(NULL);
-            if (*endp < now + 86400.0) *endp = 4102444800.0;
+            if (*endp < now + 86400.0) *endp = now + 7.0 * 86400.0;   // v7.18: 仿周卡
         } @catch (NSException *e) {}
     }
     return NULL;
@@ -1148,7 +1164,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.17 启动（隐身层激活中）===");
+            ACETrace(@"=== v7.18 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
