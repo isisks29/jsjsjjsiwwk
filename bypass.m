@@ -1,3 +1,4 @@
+
 #define ACE_TRACE          1   // 1=观测探针（本轮用这个）
 #define ACE_ENABLE_OBJC_LAYER 0 // 本轮必须为 0：不干扰原始校验流程
 
@@ -17,7 +18,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-// ══════════════ 第 0 层：隐身（按名字过滤模块）════════════════════
+// ══════════════ 第 0 层：隐身（v3 已验证逻辑）══════════════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
 
 static const struct mach_header *ACE_self_header(void) {
@@ -26,64 +27,34 @@ static const struct mach_header *ACE_self_header(void) {
         return (const struct mach_header *)info.dli_fbase;
     return NULL;
 }
-// ASCII 大小写不敏感子串
-static int ACE_stristr(const char *hay, const char *needle) {
-    if (!hay || !needle || !*needle) return hay && !*needle;
-    size_t nl = strlen(needle);
-    for (const char *p = hay; *p; p++) {
-        size_t i = 0;
-        while (i < nl && p[i]) {
-            char a = p[i], b = needle[i];
-            if (a >= 'A' && a <= 'Z') a += 32;
-            if (b >= 'A' && b <= 'Z') b += 32;
-            if (a != b) break;
-            i++;
-        }
-        if (i == nl) return 1;
-    }
-    return 0;
-}
-// 命中任一关键词的动态库，对目标程序“不存在”
-static int ACE_name_hidden(const char *n) {
-    if (!n) return 0;
-    static const char *kws[] = { "libacepatch", "bypass", "frida", "cycript", "substrate",
-                                 "tweakinject", "liberty", "sileo", "ellekit" };
-    for (int k = 0; k < 8; k++)
-        if (ACE_stristr(n, kws[k])) return 1;
-    return 0;
-}
-static int ACE_hidden_at(uint32_t i) {
-    // 按镜像基址认自己——与实际落地文件名（“bypass 114.dylib”）无关
-    if (_dyld_get_image_header(i) == ACE_self_header()) return 1;
-    return ACE_name_hidden(_dyld_get_image_name(i));
+// v3 原样：按索引位移把“自己”从编号里抠掉（与落地文件名无关，天然免疫改名）
+static int g_our_index = -1;
+static int ACE_find_our_index(void) {
+    if (g_our_index >= 0) return g_our_index;
+    const struct mach_header *self = ACE_self_header();
+    if (!self) return -1;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++)
+        if (_dyld_get_image_header(i) == self) { g_our_index = (int)i; return g_our_index; }
+    return -1;
 }
 static uint32_t ACE_image_count(void) {
-    uint32_t n = _dyld_image_count(), h = 0;
-    for (uint32_t i = 0; i < n; i++) if (ACE_hidden_at(i)) h++;
-    return n - h;
+    return (uint32_t)((int)_dyld_image_count() - (ACE_find_our_index() >= 0 ? 1 : 0));
 }
 static const char *ACE_image_name(uint32_t i) {
-    uint32_t n = _dyld_image_count();
-    for (uint32_t j = 0; j < n; j++)
-        if (!ACE_hidden_at(j)) { if (i == 0) return _dyld_get_image_name(j); i--; }
-    return NULL;
+    int o = ACE_find_our_index();
+    return _dyld_get_image_name((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
 }
 static const struct mach_header *ACE_image_header(uint32_t i) {
-    uint32_t n = _dyld_image_count();
-    for (uint32_t j = 0; j < n; j++)
-        if (!ACE_hidden_at(j)) { if (i == 0) return _dyld_get_image_header(j); i--; }
-    return NULL;
+    int o = ACE_find_our_index();
+    return _dyld_get_image_header((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
 }
 static ACEAddImageFn g_watch_cb = NULL;
 static void ACE_watch_wrapper(const struct mach_header *mh, intptr_t slide) {
     if (!g_watch_cb) return;
-    const struct mach_header *m2 = mh;
-    Dl_info di;
-    // 新加载的库若命中隐藏名单（含自家补丁、frida gadget），回调里报主程序头
-    if (mh && dladdr(mh, &di) &&
-        (di.dli_fbase == ACE_self_header() || ACE_name_hidden(di.dli_fname)))
-        m2 = _dyld_get_image_header(0);
-    g_watch_cb(m2, slide);
+    // v3 原样：只在我们自己的镜像上报主程序头，不做任何额外查询
+    if (mh && mh == ACE_self_header()) g_watch_cb(_dyld_get_image_header(0), slide);
+    else g_watch_cb(mh, slide);
 }
 static void ACE_register_add_image(ACEAddImageFn f) {
     g_watch_cb = f;
@@ -103,11 +74,10 @@ static void ACE_abort(void) { for (;;) sleep(86400); }
 #if ACE_TRACE
 static NSMutableArray *g_logbuf = NULL;
 static int g_trace_lines = 0;
-// 重入闸门：日志自身的 Foundation 调用会再次命中被接管的 strcmp/strstr，挡住第二层。
-// 绝不能用 __thread——libSystem 初始化最早期访问 TLS 会触发 _tlvm_bootstrap_error 直接 abort
-//（v5.3 崩溃日志实锤）。普通全局变量在该阶段完全安全，代价只是多线程偶发少记一条。
+// 重入闸门 + 就绪开关（v5.3/v5.4 崩溃教训）：
+// ① 绝不能用 __thread——libSystem 初始化最早期访问 TLS 直接 abort；
+// ② 我们 +load 之前所有探针纯转发、零动作；日志自身的调用再命中探针时由闸门挡住。
 static int g_ace_busy = 0;
-// 就绪开关：我们 +load 执行前（Foundation 都还没起来时），所有探针纯转发、零动作。
 static int g_ace_ready = 0;
 
 static void ACETraceLine(NSString *line) {
@@ -137,7 +107,7 @@ void ACELogExternal(const char *utf8) {
     g_ace_busy = 0;
 }
 
-// 判断内存块像不像可打印文本（过滤系统级海量比对噪音）
+// 判断内存块像不像可打印文本（过滤噪音）
 static BOOL ACELooksText(const void *p, size_t n) {
     if (!p || n < 6) return NO;
     const unsigned char *b = p; int run = 0;
@@ -163,7 +133,7 @@ static NSString *ACETrimStr(id obj, NSUInteger n) {
     return s;
 }
 
-// —— 探针 interpose：只记录、原样放行；记录前后开关闸门防套娃 ——
+// —— 只保留三个低频探针：记录、原样放行、闸门保护 ——
 static void ACE_SHA256_wrap(const void *data, CC_LONG len, unsigned char *md) {
     CC_SHA256(data, len, md);
     if (g_ace_ready && !g_ace_busy && len <= 1024 && ACELooksText(data, len)) {
@@ -171,42 +141,6 @@ static void ACE_SHA256_wrap(const void *data, CC_LONG len, unsigned char *md) {
         ACETrace(@"SHA256 in(len=%u)[%.256s] digest=%s", len, (const char *)data, ACE_hex(md, 32));
         g_ace_busy = 0;
     }
-}
-static int ACE_memcmp_wrap(const void *a, const void *b, size_t n) {
-    int r = memcmp(a, b, n);
-    if (g_ace_ready && !g_ace_busy && n >= 16 && (ACELooksText(a, n) || ACELooksText(b, n))) {
-        g_ace_busy = 1;
-        ACETrace(@"memcmp n=%zu A=[%.48s] B=[%.48s] equal=%d", n, (const char *)a, (const char *)b, r == 0);
-        g_ace_busy = 0;
-    }
-    return r;
-}
-static int ACE_strcmp_wrap(const char *a, const char *b) {
-    int r = strcmp(a, b);
-    if (g_ace_ready && !g_ace_busy && a && b && (strlen(a) >= 8 || strlen(b) >= 8)) {
-        g_ace_busy = 1;
-        ACETrace(@"strcmp A=[%.64s] B=[%.64s] eq=%d", a, b, r == 0);
-        g_ace_busy = 0;
-    }
-    return r;
-}
-static int ACE_strncmp_wrap(const char *a, const char *b, size_t n) {
-    int r = strncmp(a, b, n);
-    if (g_ace_ready && !g_ace_busy && a && b && n >= 6 && (strlen(a) >= 8 || strlen(b) >= 8)) {
-        g_ace_busy = 1;
-        ACETrace(@"strncmp n=%zu A=[%.64s] B=[%.64s]", n, a, b);
-        g_ace_busy = 0;
-    }
-    return r;
-}
-static char *ACE_strstr_wrap(const char *hay, const char *needle) {
-    char *r = strstr(hay, needle);
-    if (g_ace_ready && !g_ace_busy && needle && hay && strlen(needle) >= 4) {
-        g_ace_busy = 1;
-        ACETrace(@"strstr needle=[%.64s] hit=%d hay=[%.96s]", needle, r != NULL, hay);
-        g_ace_busy = 0;
-    }
-    return r;
 }
 static OSStatus ACE_SecItemCopyMatching_wrap(const CFDictionaryRef query, CFTypeRef *result) {
     OSStatus s = SecItemCopyMatching(query, result);
@@ -252,10 +186,6 @@ ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
 #if ACE_TRACE
 ACE_INTERPOSE(ACE_SHA256_wrap,          CC_SHA256)
-ACE_INTERPOSE(ACE_memcmp_wrap,          memcmp)
-ACE_INTERPOSE(ACE_strcmp_wrap,          strcmp)
-ACE_INTERPOSE(ACE_strncmp_wrap,         strncmp)
-ACE_INTERPOSE(ACE_strstr_wrap,          strstr)
 ACE_INTERPOSE(ACE_SecItemCopyMatching_wrap, SecItemCopyMatching)
 ACE_INTERPOSE(ACE_fopen_wrap,           fopen)
 #endif
