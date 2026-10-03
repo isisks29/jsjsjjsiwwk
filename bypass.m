@@ -72,18 +72,18 @@ static void ACE_abort(void) { for (;;) sleep(86400); }
 static NSMutableArray *g_logbuf = NULL;
 static int g_trace_lines = 0;
 
-static void ACETrace(NSString *fmt, ...) {
+static void ACETraceLine(NSString *line) {
     if (g_trace_lines > 5000) return; // 总量封顶，防噪音撑爆内存
     g_trace_lines++;
-    va_list ap; va_start(ap, fmt);
-    NSString *line = [NSString stringWithFormat:[@"[ace] " stringByAppendingString:fmt] arguments:ap];
-    va_end(ap);
     @autoreleasepool { NSLog(@"%@", line); }
     @synchronized ([NSMutableArray class]) {
         if (!g_logbuf) g_logbuf = [[NSMutableArray alloc] init];
         [g_logbuf addObject:line];
     }
 }
+// 用宏直接拼字面量前缀后走 stringWithFormat:，避免新版 SDK 的 va_list 匹配问题
+#define ACETrace(fmt, ...) ACETraceLine([NSString stringWithFormat:(@"[ace] " fmt), ##__VA_ARGS__])
+
 static NSString *ACELogDump(void) {
     NSMutableArray *snap = nil;
     @synchronized ([NSMutableArray class]) { snap = [g_logbuf mutableCopy]; }
@@ -160,7 +160,8 @@ static FILE *ACE_fopen_wrap(const char *path, const char *mode) {
     return f;
 }
 #else  // ACE_TRACE=0 时的静默版本
-static void ACETrace(NSString *fmt, ...) { (void)fmt; }
+static void ACETraceLine(NSString *line) { (void)line; }
+#define ACETrace(fmt, ...) ACETraceLine([NSString stringWithFormat:(@"[ace] " fmt), ##__VA_ARGS__])
 #endif // ACE_TRACE
 
 #define ACE_INTERPOSE(rep, orig) \
@@ -329,7 +330,8 @@ static BOOL ACE_pw_set(id cls, SEL _cmd, id pw, id svc, id acct) {
 }
 static IMP g_start_imp = NULL;
 static void ACE_start_loading(id self, SEL _cmd) {
-    id req = objc_msgSend(self, NSSelectorFromString(@"request"));
+    id (*msgSendReq)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    id req = msgSendReq(self, NSSelectorFromString(@"request"));
     ACETrace(@"MITM startLoading req=%@", req);
     ((void (*)(id, SEL))g_start_imp)(self, _cmd);
 }
