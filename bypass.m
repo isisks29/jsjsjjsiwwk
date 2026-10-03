@@ -1,4 +1,5 @@
 
+
 #define ACE_TRACE          1   // 1=观测探针（本轮用这个）
 #define ACE_ENABLE_OBJC_LAYER 0 // 本轮必须为 0：不干扰原始校验流程
 
@@ -15,10 +16,8 @@
 #import <string.h>
 #import <stdio.h>
 #import <math.h>
-#import <CommonCrypto/CommonDigest.h>
-#import <Security/Security.h>
 
-// ══════════════ 第 0 层：隐身（v3 已验证逻辑）══════════════════════
+// ══════════════ 第 0 层：隐身（按名字过滤模块）════════════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
 
 static const struct mach_header *ACE_self_header(void) {
@@ -26,6 +25,33 @@ static const struct mach_header *ACE_self_header(void) {
     if (dladdr((const void *)&ACE_self_header, &info))
         return (const struct mach_header *)info.dli_fbase;
     return NULL;
+}
+// （暂存关键词表，等 gadget 版本再用；本轮不接入任何调用路径）
+__attribute__((unused))
+static int ACE_stristr(const char *hay, const char *needle) {
+    if (!hay || !needle || !*needle) return hay && !*needle;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i]) {
+            char a = p[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+__attribute__((unused))
+static int ACE_name_hidden(const char *n) {
+    if (!n) return 0;
+    static const char *kws[] = { "libacepatch", "bypass", "frida", "cycript", "substrate",
+                                 "tweakinject", "liberty", "sileo", "ellekit" };
+    for (int k = 0; k < 8; k++)
+        if (ACE_stristr(n, kws[k])) return 1;
+    return 0;
 }
 // v3 原样：按索引位移把“自己”从编号里抠掉（与落地文件名无关，天然免疫改名）
 static int g_our_index = -1;
@@ -74,10 +100,11 @@ static void ACE_abort(void) { for (;;) sleep(86400); }
 #if ACE_TRACE
 static NSMutableArray *g_logbuf = NULL;
 static int g_trace_lines = 0;
-// 重入闸门 + 就绪开关（v5.3/v5.4 崩溃教训）：
-// ① 绝不能用 __thread——libSystem 初始化最早期访问 TLS 直接 abort；
-// ② 我们 +load 之前所有探针纯转发、零动作；日志自身的调用再命中探针时由闸门挡住。
+// 重入闸门：日志自身的 Foundation 调用会再次命中被接管的 strcmp/strstr，挡住第二层。
+// 绝不能用 __thread——libSystem 初始化最早期访问 TLS 会触发 _tlvm_bootstrap_error 直接 abort
+//（v5.3 崩溃日志实锤）。普通全局变量在该阶段完全安全，代价只是多线程偶发少记一条。
 static int g_ace_busy = 0;
+// 就绪开关：我们 +load 执行前（Foundation 都还没起来时），所有探针纯转发、零动作。
 static int g_ace_ready = 0;
 
 static void ACETraceLine(NSString *line) {
@@ -107,24 +134,6 @@ void ACELogExternal(const char *utf8) {
     g_ace_busy = 0;
 }
 
-// 判断内存块像不像可打印文本（过滤噪音）
-static BOOL ACELooksText(const void *p, size_t n) {
-    if (!p || n < 6) return NO;
-    const unsigned char *b = p; int run = 0;
-    for (size_t i = 0; i < n && i < 512; i++) {
-        unsigned char c = b[i];
-        if (c == 0) { if (run >= 6) return YES; run = 0; }
-        else if (c >= 0x20 && c < 0x7f) run++;
-        else run = 0;
-    }
-    return run >= 6;
-}
-static const char *ACE_hex(const unsigned char *d, int n) {
-    static char buf[130]; buf[0] = 0;
-    int k = 0;
-    for (int i = 0; i < n && k < 120; i++) k += sprintf(buf + k, "%02x", d[i]);
-    return buf;
-}
 // 截断对象文本（%@ 不允许带精度，超长截断必须手动做）
 static NSString *ACETrimStr(id obj, NSUInteger n) {
     if (!obj) return @"(nil)";
@@ -133,40 +142,6 @@ static NSString *ACETrimStr(id obj, NSUInteger n) {
     return s;
 }
 
-// —— 只保留三个低频探针：记录、原样放行、闸门保护 ——
-static void ACE_SHA256_wrap(const void *data, CC_LONG len, unsigned char *md) {
-    CC_SHA256(data, len, md);
-    if (g_ace_ready && !g_ace_busy && len <= 1024 && ACELooksText(data, len)) {
-        g_ace_busy = 1;
-        ACETrace(@"SHA256 in(len=%u)[%.256s] digest=%s", len, (const char *)data, ACE_hex(md, 32));
-        g_ace_busy = 0;
-    }
-}
-static OSStatus ACE_SecItemCopyMatching_wrap(const CFDictionaryRef query, CFTypeRef *result) {
-    OSStatus s = SecItemCopyMatching(query, result);
-    if (g_ace_ready && !g_ace_busy) {
-        g_ace_busy = 1;
-        @autoreleasepool {
-            NSString *qd = (__bridge_transfer NSString *)CFCopyDescription((const void *)query);
-            ACETrace(@"SecItemCopyMatching status=%d query=%@", (int)s, ACETrimStr(qd, 300));
-            if (s == 0 && result && *result) {
-                NSString *rd = (__bridge_transfer NSString *)CFCopyDescription(*result);
-                ACETrace(@"  -> item=%@", ACETrimStr(rd, 300));
-            }
-        }
-        g_ace_busy = 0;
-    }
-    return s;
-}
-static FILE *ACE_fopen_wrap(const char *path, const char *mode) {
-    FILE *f = fopen(path, mode);
-    if (g_ace_ready && !g_ace_busy && path && strncmp(path, "/System/", 8) && strncmp(path, "/usr/lib", 8)) {
-        g_ace_busy = 1;
-        ACETrace(@"fopen [%.128s] mode=[%.8s] ok=%d", path, mode ?: "", f != NULL);
-        g_ace_busy = 0;
-    }
-    return f;
-}
 #else  // ACE_TRACE=0 时的静默版本
 static void ACETraceLine(NSString *line) { (void)line; }
 #define ACETrace(fmt, ...) ACETraceLine([NSString stringWithFormat:(@"[ace] " fmt), ##__VA_ARGS__])
@@ -184,11 +159,6 @@ ACE_INTERPOSE(ACE_task_threads,         task_threads)
 ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
-#if ACE_TRACE
-ACE_INTERPOSE(ACE_SHA256_wrap,          CC_SHA256)
-ACE_INTERPOSE(ACE_SecItemCopyMatching_wrap, SecItemCopyMatching)
-ACE_INTERPOSE(ACE_fopen_wrap,           fopen)
-#endif
 
 // ══════════════ 第 1 层：授权核心 hook（本轮默认关闭）══════════════
 #if ACE_ENABLE_OBJC_LAYER
@@ -360,6 +330,48 @@ static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
     }
     return ((id (*)(id, SEL, id, id, NSInteger))g_alert_imp)(cls, _cmd, title, msg, style);
 }
+
+// —— 授权核心 ObjC 探针（v4 已验证 ObjC 换 IMP 可过反篡改检测）——
+static IMP g_q4_imp = NULL, g_q5_imp = NULL, g_q17_imp = NULL, g_q19_imp = NULL;
+static IMP g_q18_imp = NULL, g_q20_imp = NULL, g_q21_imp = NULL, g_q22_imp = NULL;
+
+// 每次核心方法跑完，把授权对象的当前状态记一行
+static void ACE_logState(id self, const char *tag) {
+    if (!g_ace_ready || g_ace_busy) return;
+    g_ace_busy = 1;
+    @autoreleasepool {
+        @try {
+            static SEL sQ2, sQ13, sQ14, sQ15, sQ1, sQ7;
+            if (!sQ2) {
+                sQ2  = NSSelectorFromString(@"q2");   sQ13 = NSSelectorFromString(@"q13");
+                sQ14 = NSSelectorFromString(@"q14");  sQ15 = NSSelectorFromString(@"q15");
+                sQ1  = NSSelectorFromString(@"q1");   sQ7  = NSSelectorFromString(@"q7:");
+            }
+            BOOL (*getB)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+            double (*getD)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+            long long (*getLL)(id, SEL, id) = (long long (*)(id, SEL, id))objc_msgSend;
+            id (*getObj)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+            ACETrace(@"%s -> q2=%d q13=%d q14=%.0f q15=%.0f q7:=%lld q1=%@",
+                     tag, getB(self, sQ2), getB(self, sQ13), getD(self, sQ14),
+                     getD(self, sQ15), getLL(self, sQ7, nil), ACETrimStr(getObj(self, sQ1), 100));
+        } @catch (NSException *e) {}
+    }
+    g_ace_busy = 0;
+}
+static void ACE_logArg(id o, const char *tag) {
+    if (!g_ace_ready || g_ace_busy) return;
+    g_ace_busy = 1;
+    ACETrace(@"%s 入参=%@", tag, ACETrimStr(o, 200));
+    g_ace_busy = 0;
+}
+static void ACE_q4(id self, SEL _cmd)  { ((void(*)(id,SEL))g_q4_imp)(self,_cmd);  ACE_logState(self, "q4"); }
+static void ACE_q5(id self, SEL _cmd)  { ((void(*)(id,SEL))g_q5_imp)(self,_cmd);  ACE_logState(self, "q5"); }
+static void ACE_q17(id self, SEL _cmd) { ((void(*)(id,SEL))g_q17_imp)(self,_cmd); ACE_logState(self, "q17"); }
+static void ACE_q19(id self, SEL _cmd) { ((void(*)(id,SEL))g_q19_imp)(self,_cmd); ACE_logState(self, "q19"); }
+static void ACE_q18(id self, SEL _cmd, id o) { ACE_logArg(o, "q18:"); ((void(*)(id,SEL,id))g_q18_imp)(self,_cmd,o); ACE_logState(self, "q18:"); }
+static void ACE_q20(id self, SEL _cmd, id o) { ACE_logArg(o, "q20:"); ((void(*)(id,SEL,id))g_q20_imp)(self,_cmd,o); ACE_logState(self, "q20:"); }
+static void ACE_q21(id self, SEL _cmd, id o) { ACE_logArg(o, "q21:"); ((void(*)(id,SEL,id))g_q21_imp)(self,_cmd,o); ACE_logState(self, "q21:"); }
+static void ACE_q22(id self, SEL _cmd, id o) { ACE_logArg(o, "q22:"); ((void(*)(id,SEL,id))g_q22_imp)(self,_cmd,o); ACE_logState(self, "q22:"); }
 #endif
 
 + (void)load {
@@ -392,6 +404,23 @@ static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
                     Method m4 = class_getClassMethod(alert, NSSelectorFromString(@"alertControllerWithTitle:message:preferredStyle:"));
                     if (m4) g_alert_imp = method_setImplementation(m4, (IMP)ACE_alert_init);
                     ACETrace(@"Alert 探针已挂");
+                }
+                Class core = NSClassFromString(@"_0x7D3B5E28");
+                if (core) {
+                    struct { const char *sel; IMP imp; IMP *save; } hs[] = {
+                        {"q4",   (IMP)ACE_q4,  &g_q4_imp},  {"q5",   (IMP)ACE_q5,  &g_q5_imp},
+                        {"q17",  (IMP)ACE_q17, &g_q17_imp}, {"q19",  (IMP)ACE_q19, &g_q19_imp},
+                        {"q18:", (IMP)ACE_q18, &g_q18_imp}, {"q20:", (IMP)ACE_q20, &g_q20_imp},
+                        {"q21:", (IMP)ACE_q21, &g_q21_imp}, {"q22:", (IMP)ACE_q22, &g_q22_imp},
+                    };
+                    int hooked = 0;
+                    for (int k = 0; k < 8; k++) {
+                        Method m = class_getInstanceMethod(core, NSSelectorFromString([NSString stringWithUTF8String:hs[k].sel]));
+                        if (m) { *hs[k].save = method_setImplementation(m, hs[k].imp); hooked++; }
+                    }
+                    ACETrace(@"授权核心探针已挂 %d/8", hooked);
+                } else {
+                    ACETrace(@"授权核心类缺失！IPA 内 dylib 与 GitHub 版不一致");
                 }
             } @catch (NSException *e) { ACETrace(@"探针挂设异常: %@", e); }
             g_ace_busy = 0;
