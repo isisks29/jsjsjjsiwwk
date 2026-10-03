@@ -344,7 +344,7 @@ static void *ACE_exc_server(void *arg) {
                                             (thread_state_t)st, &cnt);
         unsigned long long pc = (gs == 0 && cnt >= 66) ? st[32] : 0;
         if (g_crashfd >= 0) {
-            char b[224]; int n = 0;
+            char b[320]; int n = 0;
             const char *p = "EXC="; memcpy(b + n, p, 4); n += 4;
             b[n++] = (char)('0' + (req.exception / 10) % 10);
             b[n++] = (char)('0' + req.exception % 10);
@@ -356,6 +356,10 @@ static void *ACE_exc_server(void *arg) {
             p = " TGT+="; memcpy(b + n, p, 6); n += 6;
             ace_hex16(b + n, (g_tgt_base && pc >= g_tgt_base && pc < g_tgt_end)
                                ? pc - g_tgt_base : 0); n += 16;
+            unsigned long long lr = (gs == 0 && cnt >= 66) ? st[30] : 0;
+            p = " LR_TGT+="; memcpy(b + n, p, 10); n += 10;
+            ace_hex16(b + n, (g_tgt_base && lr >= g_tgt_base && lr < g_tgt_end)
+                               ? lr - g_tgt_base : 0); n += 16;
             b[n++] = '\n';
             write(g_crashfd, b, (size_t)n); fsync(g_crashfd);
         }
@@ -492,6 +496,7 @@ static void *ACE_endtime_keeper(void *arg) {
     return NULL;
 }
 static void *ACE_ctx_monitor(void *arg);   // v7.13 前置声明(定义在下方)
+static void *ACE_bp_installer(void *arg);  // v7.14 前置声明(定义在下方)
 static void ACE_install_v79_threads(void) {
     pthread_t th;
     pthread_attr_t at;
@@ -500,8 +505,61 @@ static void ACE_install_v79_threads(void) {
     pthread_create(&th, &at, ACE_flight_recorder, NULL);
     pthread_create(&th, &at, ACE_endtime_keeper, NULL);
     pthread_create(&th, &at, ACE_ctx_monitor, NULL);
+        pthread_create(&th, &at, ACE_bp_installer, NULL);
     pthread_attr_destroy(&at);
     ACETrace(@"v7.9 飞行记录器+EndTime守护已启动");
+}
+// ═══ v7.14: 硬件断点哨兵——16 个裸 svc 处决点全部下 CPU 硬件断点 ═══
+// 原理: ARM debug 寄存器(DBGBCR/DBGBVR)经 thread_set_state 设置, 不写靶场一个字节。
+// 命中 → EXC_BREAKPOINT → 异常层记录 PC+LR(凶手与调用者) 并跳过 svc+brk(枪打不响)。
+// 靶场的断点扫描器(0x545f8)靠 task_threads 枚举线程, 已被隐身层致盲, 看不到这些断点。
+typedef struct { unsigned long long bvr[16], bcr[16], wvr[16], wcr[16]; } ACEDbgState64;
+#define ACE_ARM_DEBUG64 15
+static const unsigned long long g_kill_sites[16] = {
+    0x9f668ULL, 0xa6220ULL, 0xa62b8ULL, 0xa630cULL, 0xa69d0ULL, 0xa6ae8ULL,
+    0xae820ULL, 0xc2e34ULL, 0xefe40ULL, 0xf1744ULL, 0xf1768ULL, 0xf1774ULL,
+    0xf958cULL, 0xf8308ULL, 0xf831cULL, 0xf83d0ULL };
+static int g_bp_logged = 0;
+static ACE_tt_fn ACE_real_task_threads(void) {
+    ACE_tt_fn f = NULL;
+    void *h = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_NOW);
+    if (h) f = (ACE_tt_fn)dlsym(h, "task_threads");
+    if (!f || f == (ACE_tt_fn)&ACE_task_threads)
+        f = (ACE_tt_fn)dlsym(RTLD_NEXT, "task_threads");
+    if (f == (ACE_tt_fn)&ACE_task_threads) return NULL;
+    return f;
+}
+static void *ACE_bp_installer(void *arg) {
+    (void)arg;
+    ACE_tt_fn real_tt = ACE_real_task_threads();
+    if (!real_tt) { ACETrace(@"[bp] 拿不到真实task_threads, 哨兵无法安装"); return NULL; }
+    for (;;) {
+        usleep(100000);
+        if (!g_tgt_base) continue;
+        thread_act_array_t list = NULL;
+        mach_msg_type_number_t n = 0;
+        if (real_tt(mach_task_self(), &list, &n) != KERN_SUCCESS || !list) continue;
+        int ok = 0, fail = 0;
+        for (unsigned i = 0; i < n; i++) {
+            ACEDbgState64 ds;
+            memset(&ds, 0, sizeof(ds));
+            for (int k = 0; k < 16; k++) {
+                ds.bvr[k] = (unsigned long long)(g_tgt_base + g_kill_sites[k]);
+                ds.bcr[k] = 0x7ULL;   // E=1, PMC=EL0/EL1, 非链接地址匹配
+            }
+            mach_msg_type_number_t c = 128;
+            kern_return_t kr = thread_set_state(list[i], ACE_ARM_DEBUG64,
+                                                (thread_state_t)&ds, &c);
+            if (kr == KERN_SUCCESS) ok++; else fail++;
+        }
+        if (!g_bp_logged && (ok || fail)) {
+            g_bp_logged = 1;
+            ACETrace(@"[bp] 硬件断点哨兵: %u 线程, 成功%d 失败%d %s", (unsigned)n, ok, fail,
+                     fail && !ok ? "(iOS拒绝设置debug状态, 此路不通)" : "");
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
+    }
+    return NULL;
 }
 // ═══ v7.13: ctx 关键字段监视器——20ms 采样, 只记录变化 ═══
 // 看门狗 canary 混合了 ctx[0]/+0x74/+0x78/+0x8e/+0x92; 谁在成功路径上改它们,
