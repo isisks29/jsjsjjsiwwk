@@ -241,30 +241,6 @@ static void initBy(void){
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
             armFull();
-
-            // 先 patch 两个，再调 sub_11fa5c
-            if(g_targetBase){
-                uintptr_t page0 = ((uintptr_t)va(0x8d010)) & ~0x3FFFULL;
-                if(mprotect((void*)page0, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC) == 0){
-                    *(volatile uint32_t*)va(0x8d010) = 0xD503201F;
-                    *(volatile uint32_t*)va(0x8d038) = 0xD503201F;
-                    *(volatile uint32_t*)va(0x8d058) = 0xD503201F;
-                    *(volatile uint32_t*)va(0x8d078) = 0xD503201F;
-                    sys_icache_invalidate((void*)va(0x8d010), 0x100);
-                    mprotect((void*)page0, 0x4000, PROT_READ|PROT_EXEC);
-                }
-                uintptr_t page1 = ((uintptr_t)va(0x1210e0)) & ~0x3FFFULL;
-                if(mprotect((void*)page1, 0x4000, PROT_READ|PROT_WRITE|PROT_EXEC) == 0){
-                    *(volatile uint32_t*)va(0x1210e0) = 0x1400001C;
-                    sys_icache_invalidate((void*)va(0x1210e0), 4);
-                    mprotect((void*)page1, 0x4000, PROT_READ|PROT_EXEC);
-                }
-
-                typedef void(*fn_t)(void);
-                fn_t f = (fn_t)va(0x11fa5c);
-                if(f){ f(); g_called5c = 1; }
-            }
-
             spawnBall();
         });
     }
