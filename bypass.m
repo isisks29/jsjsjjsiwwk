@@ -172,61 +172,169 @@ ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
 
-// ══════════════ 第 0.6 层：v6.2 定点补丁（默认关闭！）══════════════
-// v6.1 教训（实测一进就崩）：运行期改 __text 这条路在当前环境不可行——
-//   ① csops 给自己打 CS_DEBUGGED 正是反调试扫描的典型特征，等于自报"被调试"；
-//   ② 对已签名镜像 __text 写入会被代码签名机制直接 SIGKILL（W^X/CS_KILL）。
-// v6.2 起绕过改走「离线静态补丁」：在 GitHub Actions 里重签名之前直接改
-// target dylib 文件字节（偏移==虚拟地址已实证，__text offset==va），
-// 运行时 dylib 只保留 v5.9 观测探针。下方运行期补丁代码默认双 0 关闭、
-// 且已删除 csops 退路；仅当确认运行环境允许改写(越狱+CS_PLATFORMED 等)才可试开。
-#define ACE_FORCE_SUCCESS    0   // v6.2 默认 0（静态补丁替代）；1=运行期强改 0xef0fc
-#define ACE_FASTFAIL_CONNECT 0   // 1=可选: connect 改 127.0.0.1:1 秒失败
+// ══════════════ 第 0.6 层：v7.0 验卡结果改写（作业主机制）══════════════
+// 原理（全部实证，详见文件头 v6.0 链路）：
+//  · 弹窗验卡结果 block invoke = 靶场+0xef0c8，其 capture+0x38 = 0xd27ac 返回值，
+//    0=成功；启动复核结果 block invoke = 靶场+0xdcf68，capture+0x30，非0=成功。
+//  · 两个结果 block 都经 dispatch_async 派发 → 在派发时刻改写 capture（纯数据写，
+//    block 此时还活着），随后原样放行 → 原成功路径全量执行（写钥匙串+激活状态机+
+//    靶场自己的成功 UI/面板解锁）。不碰靶场 .text 一个字节。
+//  · hook 方式 = fishhook 式改写【靶场镜像自己的】__la_symbol_ptr 里 _dispatch_async
+//    槽（静态槽位 0x3e84b8，间接符号表实证）。改的是靶场 __DATA 数据页——与 ObjC
+//    换 IMP 同级安全（v4/v5.6 实证过检）；不加任何 __interpose 条目（v5.4 教训：
+//    interpose 集合扰动会撞上 0x1212xx 自改写代码区自毁）；不用 csops（v6.1 教训）。
+//  · 版本自保护：按 0xef0fc/0xdcf68 两处指令签名识别靶场镜像并校验版本
+//    （配套 target.dylib sha256 f1163751…f550ef），不符只记日志绝不安装。
+#define ACE_RESULT_HOOK 1
 
-#if ACE_FORCE_SUCCESS || ACE_FASTFAIL_CONNECT
-typedef struct { uint32_t off; uint32_t expect; uint32_t patch; const char *what; } ACEPatchEnt;
-static const ACEPatchEnt g_ace_patches[] = {
-#if ACE_FORCE_SUCCESS
-    { 0xef0fcu, 0xB9403808u, 0x52800008u, "结果判定强制成功(w8=0)" },
-#endif
-#if ACE_FASTFAIL_CONNECT
-    { 0xd2884u, 0x72A6E4A8u, 0x72A02008u, "connect 端口 9527→1" },
-    { 0xd288cu, 0x528999C8u, 0x529CDBC8u, "connect IP 低半 4cce→e6de" },
-    { 0xd2890u, 0x72AEC508u, 0x72BAD668u, "connect IP 高半 7628→d6b3" },
-#endif
-};
-static uintptr_t ACE_target_base(void) {
+typedef struct {
+    uint32_t cmd, cmdsize;
+} ACELoadCmdHdr;
+typedef struct {
+    uint32_t cmd, cmdsize;
+    uint64_t vmaddr, vmsize, fileoff, filesize;
+    uint32_t maxprot, initprot, nsects, flags;
+} ACESegCmd64;
+typedef struct {
+    char sectname[16], segname[16];
+    uint64_t addr, size;
+    uint32_t offset, align, reloff, nreloc, flags, reserved1, reserved2, reserved3;
+} ACESect64;
+typedef struct { uint32_t n_strx; uint8_t n_type; uint8_t n_sect; uint16_t n_desc; uint64_t n_value; } ACENlist64;
+
+static uintptr_t g_tgt_base = 0, g_tgt_end = 0;
+static uintptr_t g_hooked_slot = 0;
+static void *g_saved_slot_val = NULL;
+static int g_rw_dialog = 0, g_rw_boot = 0;   // 改写计数（悬浮按钮日志可见）
+
+// 找靶场镜像：按【指令签名】识别——即使 IPA 里文件名不同也能命中。
+static int ACE_sig_ok(uintptr_t base) {
+    // 先确认 __TEXT vmsize 覆盖签名偏移，再读——防止扫到小镜像时越界访问
+    const struct mach_header_64 *h64 = (const struct mach_header_64 *)base;
+    if (h64->ncmds == 0 || h64->ncmds > 256) return 0;
+    uint64_t textsize = 0;
+    ACELoadCmdHdr *c = (ACELoadCmdHdr *)(base + sizeof(struct mach_header_64));
+    for (uint32_t i = 0; i < h64->ncmds; i++) {
+        if (c->cmdsize < 8 || c->cmdsize > 0x100000) return 0;   // 命令流损坏防御
+        if (c->cmd == LC_SEGMENT_64) {
+            const ACESegCmd64 *s64 = (const ACESegCmd64 *)c;
+            if (s64->vmaddr == 0 && s64->vmsize > textsize) textsize = s64->vmsize;
+        }
+        c = (ACELoadCmdHdr *)((uintptr_t)c + c->cmdsize);
+    }
+    if (textsize < 0x100000) return 0;
+    const uint32_t *p1 = (const uint32_t *)(base + 0xef0fc);
+    const uint32_t *p2 = (const uint32_t *)(base + 0xdcf68);
+    return *p1 == 0xB9403808u && *p2 == 0xB9403008u;
+}
+static const struct mach_header *ACE_find_target_header(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (nm && strstr(nm, "ballsace"))
-            return (uintptr_t)_dyld_get_image_header(i);
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!h) continue;
+        uint32_t magic = *(const uint32_t *)h;
+        if (magic != 0xFEEDFACFu) continue;   // 只看 64 位 Mach-O 镜像
+        if (ACE_sig_ok((uintptr_t)h)) return h;
     }
-    return 0;
+    return NULL;
 }
-static void ACE_apply_patches(void) {
-    uintptr_t base = ACE_target_base();
-    if (!base) { ACETrace(@"未找到靶场镜像(名字含 ballsace)，跳过定点补丁"); return; }
-    for (size_t k = 0; k < sizeof(g_ace_patches) / sizeof(g_ace_patches[0]); k++) {
-        const ACEPatchEnt *p = &g_ace_patches[k];
-        volatile uint32_t *slot = (volatile uint32_t *)(base + p->off);
-        if (*slot == p->patch) { ACETrace(@"补丁[%s] 已是目标值，跳过", p->what); continue; }
-        if (*slot != p->expect) {
-            ACETrace(@"补丁[%s] 签名不符: +0x%x 处=0x%08x —— 不动手", p->what, p->off, *slot);
-            continue;
+// 在靶场镜像内查符号名对应的指针槽（__got=S_NON_LAZY 0x6 / __la_symbol_ptr=S_LAZY 0x7），
+// 走 LC_SYMTAB+LC_DYSYMTAB 间接符号表（靶场是 DYLD_INFO_ONLY 经典布局，已实证）。
+static void **ACE_find_ptr_slot(const struct mach_header *hdr, const char *want) {
+    uintptr_t base = (uintptr_t)hdr;
+    const ACESegCmd64 *seg = (const ACESegCmd64 *)(base + sizeof(struct mach_header_64));
+    const struct symtab_command *st = NULL;
+    const struct dysymtab_command *dy = NULL;
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        ACELoadCmdHdr *c = (ACELoadCmdHdr *)seg;
+        if (c->cmd == LC_SYMTAB) st = (const struct symtab_command *)c;
+        else if (c->cmd == LC_DYSYMTAB) dy = (const struct dysymtab_command *)c;
+        seg = (const ACESegCmd64 *)((uintptr_t)c + c->cmdsize);
+    }
+    if (!st || !dy) return NULL;
+    seg = (const ACESegCmd64 *)(base + sizeof(struct mach_header_64));
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        ACELoadCmdHdr *c = (ACELoadCmdHdr *)seg;
+        if (c->cmd == LC_SEGMENT_64) {
+            const ACESegCmd64 *s64 = (const ACESegCmd64 *)c;
+            const ACESect64 *sec = (const ACESect64 *)((uintptr_t)c + sizeof(ACESegCmd64));
+            for (uint32_t k = 0; k < s64->nsects; k++) {
+                uint32_t ty = sec[k].flags & 0xff;
+                if ((ty == 0x6 || ty == 0x7) && sec[k].size >= 8) {
+                    size_t nslots = (size_t)(sec[k].size / 8);
+                    const uint32_t *isyms = (const uint32_t *)(base + dy->indirectsymoff);
+                    const ACENlist64 *nl = (const ACENlist64 *)(base + st->symoff);
+                    const char *strtab = (const char *)(base + st->stroff);
+                    for (size_t j = 0; j < nslots; j++) {
+                        uint32_t si = isyms[sec[k].reserved1 + j];
+                        // INDIRECT_SYMBOL_LOCAL=0x80000000 / INDIRECT_SYMBOL_ABS=0x40000000
+                        if (si & 0xC0000000u) continue;
+                        if (strcmp(strtab + nl[si].n_strx, want) == 0)
+                            return (void **)(base + sec[k].addr + j * 8);
+                    }
+                }
+            }
         }
-        // 注意：不再有 csops/CS_DEBUGGED 退路（v6.1 实测触发反调试自毁）
-        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)slot, 4, 0,
-                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-        if (kr != KERN_SUCCESS) { ACETrace(@"补丁[%s] vm_protect 失败 kr=%d", p->what, kr); continue; }
-        *slot = p->patch;
-        sys_icache_invalidate((void *)(uintptr_t)slot, 4);
-        ACETrace(@"补丁[%s] +0x%x: 0x%08x -> 0x%08x 完成", p->what, p->off, p->expect, p->patch);
+        seg = (const ACESegCmd64 *)((uintptr_t)c + c->cmdsize);
     }
+    return NULL;
 }
-#else
-static void ACE_apply_patches(void) { /* v6.2: 运行期补丁已关闭，绕过走离线静态补丁 */ }
-#endif
+// 我们的替换体。检查 block invoke 是否靶场两个结果 block，是则改写判定值再放行。
+// 注意：本函数内部调用 dispatch_async 走【我们自己镜像】的绑定 = 真 libdispatch，
+// 我们从不改自己镜像的槽 → 无递归风险。
+static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
+    @try {
+        if (blk && g_tgt_base) {
+            void **hdrp = (void **)(void *)blk;
+            uintptr_t inv = (uintptr_t)hdrp[2];           // block 布局: isa/flags/reserved/invoke@+16
+            if (inv >= g_tgt_base && inv < g_tgt_end) {
+                uintptr_t off = inv - g_tgt_base;
+                if (off == 0xef0c8ULL) {                   // 弹窗验卡结果: capture+0x38 → 0
+                    volatile int32_t *slot = (volatile int32_t *)((uintptr_t)blk + 0x38);
+                    if (*slot != 0) {
+                        ACETrace(@"[hook] 弹窗验卡结果 %d → 0（强制成功路径）", *slot);
+                        *slot = 0; g_rw_dialog++;
+                    }
+                } else if (off == 0xdcf68ULL) {            // 启动复核结果: capture+0x30 → 非0
+                    volatile int32_t *slot = (volatile int32_t *)((uintptr_t)blk + 0x30);
+                    if (*slot == 0) {
+                        ACETrace(@"[hook] 启动复核结果 0 → 1（强制成功路径）");
+                        *slot = 1; g_rw_boot++;
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    dispatch_async(q, blk);
+}
+static void ACE_install_result_hook(void) {
+    const struct mach_header *hdr = ACE_find_target_header();
+    if (!hdr) { ACETrace(@"结果hook: 未找到靶场镜像(按 0xef0fc/0xdcf68 指令签名扫描全部镜像)"); return; }
+    uintptr_t base = (uintptr_t)hdr;
+    // __TEXT vmsize 动态取（本版本=0x3e8000），供 invoke 归属判断
+    uint64_t textsize = 0x3e8000;
+    {
+        ACELoadCmdHdr *c = (ACELoadCmdHdr *)(base + sizeof(struct mach_header_64));
+        for (uint32_t i = 0; i < ((const struct mach_header_64 *)hdr)->ncmds; i++) {
+            if (c->cmd == LC_SEGMENT_64) {
+                const ACESegCmd64 *s64 = (const ACESegCmd64 *)c;
+                if (s64->vmaddr == 0 && s64->vmsize > 0) { textsize = s64->vmsize; break; }
+            }
+            c = (ACELoadCmdHdr *)((uintptr_t)c + c->cmdsize);
+        }
+    }
+    void **slot = ACE_find_ptr_slot(hdr, "_dispatch_async");
+    if (!slot) { ACETrace(@"结果hook: 未找到 _dispatch_async 指针槽"); return; }
+    g_tgt_base = base;
+    g_tgt_end = base + (uintptr_t)textsize;
+    g_saved_slot_val = *slot;
+    *slot = (void *)ACE_dispatch_async_hook;
+    g_hooked_slot = (uintptr_t)slot;
+    ACETrace(@"结果hook 已安装: 靶场基址=%p __TEXT=0x%llx 槽=%p 原值=%p → %p",
+             (void *)base, (unsigned long long)textsize, slot, g_saved_slot_val,
+             (void *)ACE_dispatch_async_hook);
+}
+
 // ══════════════ 第 1 层：授权核心 hook（本轮默认关闭）══════════════
 #if ACE_ENABLE_OBJC_LAYER
 static IMP ACEReplace(Class cls, SEL sel, IMP newImp) {
@@ -734,7 +842,7 @@ static void ACE_wideSweepClasses(void) {
         @autoreleasepool {
             g_ace_busy = 1;
             ACETrace(@"=== 探针启动（隐身层激活中）===");
-            @try { ACE_apply_patches(); } @catch (NSException *e) { ACETrace(@"定点补丁异常: %@", e); }
+            try { ACE_install_result_hook(); } @catch (NSException *e) { ACETrace(@"结果hook异常: %@", e); }
             @try {
                 Class kc = NSClassFromString(@"_0xD5A13E79");
                 if (kc) {
