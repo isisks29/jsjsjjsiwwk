@@ -1,5 +1,6 @@
 
 
+
 #define ACE_TRACE          1   // 1=观测探针（本轮用这个）
 #define ACE_ENABLE_OBJC_LAYER 0 // 本轮必须为 0：不干扰原始校验流程
 
@@ -133,6 +134,9 @@ void ACELogExternal(const char *utf8) {
     @autoreleasepool { ACETraceLine(utf8 ? [NSString stringWithUTF8String:utf8] : @"(null)"); }
     g_ace_busy = 0;
 }
+
+// 记录闸门：就绪且不重入才记，记完立刻交还
+#define ACE_G(...) do { if (g_ace_ready && !g_ace_busy) { g_ace_busy = 1; ACETrace(__VA_ARGS__); g_ace_busy = 0; } } while (0)
 
 // 截断对象文本（%@ 不允许带精度，超长截断必须手动做）
 static NSString *ACETrimStr(id obj, NSUInteger n) {
@@ -330,6 +334,18 @@ static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
     }
     return ((id (*)(id, SEL, id, id, NSInteger))g_alert_imp)(cls, _cmd, title, msg, style);
 }
+static IMP g_addAct_imp = NULL;
+static void ACE_addAct(id self, SEL _cmd, id action) {
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        @try {
+            id (*getT)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+            ACE_G(@"Alert按钮: %@", ACETrimStr(getT(action, NSSelectorFromString(@"title")), 64));
+        } @catch (NSException *e) {}
+        g_ace_busy = 0;
+    }
+    ((void (*)(id, SEL, id))g_addAct_imp)(self, _cmd, action);
+}
 
 // —— 授权核心 ObjC 探针（v4 已验证 ObjC 换 IMP 可过反篡改检测）——
 static IMP g_q4_imp = NULL, g_q5_imp = NULL, g_q17_imp = NULL, g_q19_imp = NULL;
@@ -372,6 +388,188 @@ static void ACE_q18(id self, SEL _cmd, id o) { ACE_logArg(o, "q18:"); ((void(*)(
 static void ACE_q20(id self, SEL _cmd, id o) { ACE_logArg(o, "q20:"); ((void(*)(id,SEL,id))g_q20_imp)(self,_cmd,o); ACE_logState(self, "q20:"); }
 static void ACE_q21(id self, SEL _cmd, id o) { ACE_logArg(o, "q21:"); ((void(*)(id,SEL,id))g_q21_imp)(self,_cmd,o); ACE_logState(self, "q21:"); }
 static void ACE_q22(id self, SEL _cmd, id o) { ACE_logArg(o, "q22:"); ((void(*)(id,SEL,id))g_q22_imp)(self,_cmd,o); ACE_logState(self, "q22:"); }
+
+// —— v5.7 全方法普查：按类型编码套通用记录壳，返回值一律原样透传 ——
+static BOOL ACE_isSpecial(SEL sel) {
+    static const char *sp[] = {"q4","q5","q17","q19","q18:","q20:","q21:","q22:"};
+    const char *n = sel_getName(sel);
+    for (int k = 0; k < 8; k++) if (!strcmp(n, sp[k])) return YES;
+    return NO;
+}
+static NSMutableArray *g_sweep_hold = NULL;
+static void ACE_holdBlock(id obj) { // 壳 block 必须永久持有，否则 IMP 变悬空指针
+    if (!g_sweep_hold) g_sweep_hold = [[NSMutableArray alloc] init];
+    [g_sweep_hold addObject:obj];
+}
+static IMP ACE_makeWrap(IMP orig, NSString *sn, const char *enc) {
+    // —— 无返回值 ——
+    if (!strcmp(enc, "v@:")) {
+        void (^b)(id, SEL) = ^(id s, SEL c) {
+            ((void (*)(id, SEL))orig)(s, c);
+            ACE_G(@"核心·%@()", sn);
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "v@:@")) {
+        void (^b)(id, SEL, id) = ^(id s, SEL c, id a) {
+            ((void (*)(id, SEL, id))orig)(s, c, a);
+            ACE_G(@"核心·%@(%@)", sn, ACETrimStr(a, 120));
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "v@:c")) {
+        void (^b)(id, SEL, char) = ^(id s, SEL c, char a) {
+            ((void (*)(id, SEL, char))orig)(s, c, a);
+            ACE_G(@"核心·%@(%d)", sn, (int)a);
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "v@:i")) {
+        void (^b)(id, SEL, int) = ^(id s, SEL c, int a) {
+            ((void (*)(id, SEL, int))orig)(s, c, a);
+            ACE_G(@"核心·%@(%d)", sn, a);
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "v@:q")) {
+        void (^b)(id, SEL, long long) = ^(id s, SEL c, long long a) {
+            ((void (*)(id, SEL, long long))orig)(s, c, a);
+            ACE_G(@"核心·%@(%lld)", sn, a);
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "v@:Q")) {
+        void (^b)(id, SEL, unsigned long long) = ^(id s, SEL c, unsigned long long a) {
+            ((void (*)(id, SEL, unsigned long long))orig)(s, c, a);
+            ACE_G(@"核心·%@(%llu)", sn, a);
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "v@:d")) {
+        void (^b)(id, SEL, double) = ^(id s, SEL c, double a) {
+            ((void (*)(id, SEL, double))orig)(s, c, a);
+            ACE_G(@"核心·%@(%f)", sn, a);
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    // —— 有返回值：原值透传，多记一行 ——
+    if (!strcmp(enc, "c@:") || !strcmp(enc, "B@:")) {
+        char (^b)(id, SEL) = ^char(id s, SEL c) {
+            char r = ((char (*)(id, SEL))orig)(s, c);
+            ACE_G(@"核心·%@()=%d", sn, (int)r);
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "c@:@") || !strcmp(enc, "B@:@")) {
+        char (^b)(id, SEL, id) = ^char(id s, SEL c, id a) {
+            char r = ((char (*)(id, SEL, id))orig)(s, c, a);
+            ACE_G(@"核心·%@(%@)=%d", sn, ACETrimStr(a, 120), (int)r);
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "i@:")) {
+        int (^b)(id, SEL) = ^int(id s, SEL c) {
+            int r = ((int (*)(id, SEL))orig)(s, c);
+            ACE_G(@"核心·%@()=%d", sn, r);
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "q@:")) {
+        long long (^b)(id, SEL) = ^long long(id s, SEL c) {
+            long long r = ((long long (*)(id, SEL))orig)(s, c);
+            ACE_G(@"核心·%@()=%lld", sn, r);
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "q@:@")) {
+        long long (^b)(id, SEL, id) = ^long long(id s, SEL c, id a) {
+            long long r = ((long long (*)(id, SEL, id))orig)(s, c, a);
+            ACE_G(@"核心·%@(%@)=%lld", sn, ACETrimStr(a, 120), r);
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "d@:")) {
+        double (^b)(id, SEL) = ^double(id s, SEL c) {
+            double r = ((double (*)(id, SEL))orig)(s, c);
+            ACE_G(@"核心·%@()=%f", sn, r);
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "i@:@")) {
+        int (^b)(id, SEL, id) = ^int(id s, SEL c, id a) {
+            int r = ((int (*)(id, SEL, id))orig)(s, c, a);
+            ACE_G(@"核心·%@(%@)=%d", sn, ACETrimStr(a, 120), r);
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "d@:@")) {
+        double (^b)(id, SEL, id) = ^double(id s, SEL c, id a) {
+            double r = ((double (*)(id, SEL, id))orig)(s, c, a);
+            ACE_G(@"核心·%@(%@)=%f", sn, ACETrimStr(a, 120), r);
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "@@:")) {
+        id (^b)(id, SEL) = ^id(id s, SEL c) {
+            id r = ((id (*)(id, SEL))orig)(s, c);
+            ACE_G(@"核心·%@()=%@", sn, ACETrimStr(r, 120));
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    if (!strcmp(enc, "@@:@")) {
+        id (^b)(id, SEL, id) = ^id(id s, SEL c, id a) {
+            id r = ((id (*)(id, SEL, id))orig)(s, c, a);
+            ACE_G(@"核心·%@(%@)=%@", sn, ACETrimStr(a, 120), ACETrimStr(r, 120));
+            return r;
+        };
+        ACE_holdBlock(b); return imp_implementationWithBlock((__bridge void *)b);
+    }
+    return NULL; // 没见过的编码：宁可跳过也不瞎包
+}
+// v5.7 普查：列出授权核心全部方法/成员，并把能识别编码的方法都套上记录壳
+static void ACE_sweepCore(Class core) {
+    Class sup = class_getSuperclass(core);
+    ACE_G(@"核心父类: %s", sup ? class_getName(sup) : "?");
+    unsigned int ic = 0;
+    Ivar *ivs = class_copyIvarList(core, &ic);
+    for (unsigned int k = 0; k < ic; k++)
+        ACE_G(@"成员 %u/%u: %s [%s]", k + 1, ic, ivar_getName(ivs[k]) ?: "?", ivar_getTypeEncoding(ivs[k]) ?: "?");
+    free(ivs);
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(core, &mc);
+    int swept = 0, skipped = 0;
+    for (unsigned int k = 0; k < mc; k++) {
+        SEL sel = method_getName(ms[k]);
+        const char *enc = method_getTypeEncoding(ms[k]) ?: "?";
+        NSString *sn = NSStringFromSelector(sel);
+        ACE_G(@"实例方法 %u/%u: %@ [%s]", k + 1, mc, sn, enc);
+        if (ACE_isSpecial(sel)) continue;
+        IMP imp = ACE_makeWrap(method_getImplementation(ms[k]), sn, enc);
+        if (imp) { method_setImplementation(ms[k], imp); swept++; }
+        else { skipped++; }
+    }
+    free(ms);
+    unsigned int cmc = 0;
+    Method *cms = class_copyMethodList(object_getClass(core), &cmc);
+    for (unsigned int k = 0; k < cmc; k++) {
+        SEL sel = method_getName(cms[k]);
+        const char *enc = method_getTypeEncoding(cms[k]) ?: "?";
+        ACE_G(@"类方法 %u/%u: %@ [%s]", k + 1, cmc, NSStringFromSelector(sel), enc);
+        IMP imp = ACE_makeWrap(method_getImplementation(cms[k]), NSStringFromSelector(sel), enc);
+        if (imp) method_setImplementation(cms[k], imp);
+    }
+    free(cms);
+    ACE_G(@"普查完成: 实例包 %d / 跳过 %d / 类方法 %d", swept, skipped, cmc);
+}
 #endif
 
 + (void)load {
@@ -403,7 +601,9 @@ static void ACE_q22(id self, SEL _cmd, id o) { ACE_logArg(o, "q22:"); ((void(*)(
                 if (alert) {
                     Method m4 = class_getClassMethod(alert, NSSelectorFromString(@"alertControllerWithTitle:message:preferredStyle:"));
                     if (m4) g_alert_imp = method_setImplementation(m4, (IMP)ACE_alert_init);
-                    ACETrace(@"Alert 探针已挂");
+                    Method m5 = class_getInstanceMethod(alert, NSSelectorFromString(@"addAction:"));
+                    if (m5) g_addAct_imp = method_setImplementation(m5, (IMP)ACE_addAct);
+                    ACETrace(@"Alert 探针已挂（含按钮）");
                 }
                 Class core = NSClassFromString(@"_0x7D3B5E28");
                 if (core) {
@@ -419,6 +619,7 @@ static void ACE_q22(id self, SEL _cmd, id o) { ACE_logArg(o, "q22:"); ((void(*)(
                         if (m) { *hs[k].save = method_setImplementation(m, hs[k].imp); hooked++; }
                     }
                     ACETrace(@"授权核心探针已挂 %d/8", hooked);
+                    ACE_sweepCore(core);
                 } else {
                     ACETrace(@"授权核心类缺失！IPA 内 dylib 与 GitHub 版不一致");
                 }
