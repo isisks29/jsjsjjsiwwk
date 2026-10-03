@@ -325,7 +325,7 @@ static void *ACE_exc_server(void *arg) {
             st[32] = pc + 4;   // 跳过 brk, 拆掉自毁
             cnt = 68;
             g_exc_skip++;
-            thread_set_state(req.thread.name, ACE_ARM64_STATE, (thread_state_t)st, &cnt);
+            thread_set_state(req.thread.name, ACE_ARM64_STATE, (thread_state_t)st, cnt);
             rep.retCode = KERN_SUCCESS;
         } else {
             rep.retCode = KERN_FAILURE;   // 交回常规崩溃流程(信号层还有捕捉器兜底)
