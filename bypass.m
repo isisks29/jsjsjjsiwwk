@@ -526,9 +526,25 @@ static const unsigned g_sus_off[] = {
     0x9f840, 0xae808, 0xc65b0, 0xd27ac, 0xdcf88
 };
 #define ACE_SUS_N 35
+static mach_port_t g_main_th = MACH_PORT_NULL;   // v7.31: 主线程端口(冻结排除用, 声明前移供 recorder 用)
 static unsigned char g_sus_seen[96][ACE_SUS_N];
+// v7.33: 专职反篡改线程「区域冻结」——它们整条命都在这些区间里, 冻在开枪之前
+// (自毁点上冻结太晚: svc 亚微秒完成; 函数体区域有 ms 级窗口, 300µs 采样必中)
+//  z0: 复核巨函数入口+时间检测+dispatcher [0xaeda8,0xaf000)
+//  z1: 复核巨函数网络客户端+once块 [0xb1e00,0xbc000) (0xaf000-0xb1e00 留缝: 0xafe40 失败计数属验卡路径, 不误伤)
+//  z2: 看门狗 [0xf26cc,0xf2900)   z3: 校验线程 [0xf4650,0xf4a00)   z4: kill簇 [0xf82a0,0xf8400)
+static unsigned char g_zone_frozen[96];
+static int ace_freeze_zone(unsigned long long off) {
+    if (off >= 0xaeda8ULL && off < 0xaf000ULL) return 0;
+    if (off >= 0xb1e00ULL && off < 0xbc000ULL) return 1;
+    if (off >= 0xf26ccULL && off < 0xf2900ULL) return 2;
+    if (off >= 0xf4650ULL && off < 0xf4a00ULL) return 3;
+    if (off >= 0xf82a0ULL && off < 0xf8400ULL) return 4;
+    return -1;
+}
 static void *ACE_flight_recorder(void *arg) {
     (void)arg;
+    mach_port_t self_th = mach_thread_self();   // v7.33: 岗哨冻结时排除采样线程自己
     ACE_tt_fn real_tt = ACE_real_task_threads();
     if (!real_tt) { ACETrace(@"[rec] 真实task_threads解析失败, 线程采样不可用"); return NULL; }
     ACETrace(@"[rec] 采样启动 real_tt=%p", (void *)real_tt);
@@ -572,19 +588,45 @@ static void *ACE_flight_recorder(void *arg) {
                     line[p++] = ' ';
                     for (int k = 28; k >= 0; k -= 4) line[p++] = hd[(off >> k) & 0xf];
                     // v7.32: 岗哨命中即报(每线程×每岗哨一次, 写直通死也留痕)
+                    // v7.33: 岗哨命中即报; 自毁点(岗哨0-23)且非主/非采样线程 → 当场冻结
+                    // (iOS 禁运行时写 .text, 冻结线程是平台合法的缴械: 枪手停在 svc 前永不开枪)
                     if (i < 96) {
                         for (unsigned s = 0; s < ACE_SUS_N; s++) {
                             unsigned long long so = g_sus_off[s];
                             if (off >= so && off < so + 0x60ULL && !g_sus_seen[i][s]
                                 && g_ace_ready && !g_ace_busy) {
                                 g_sus_seen[i][s] = 1;
+                                int canFreeze = (s < 24) && list[i] != g_main_th
+                                                && list[i] != self_th;
+                                kern_return_t fkr = 0;
+                                if (canFreeze) fkr = thread_suspend(list[i]);
                                 g_ace_busy = 1;
-                                ACETrace(@"[watch] t%02u 路过岗哨%u @+0x%llx (lr+0x%llx)", i, s, off,
-                                         lrInT ? (lr - g_tgt_base) : 0ULL);
+                                if (canFreeze)
+                                    ACETrace(@"[freeze-kill] t%02u 冻结于自毁点%u @+0x%llx kr=%d (lr+0x%llx)",
+                                             i, s, off, fkr, lrInT ? (lr - g_tgt_base) : 0ULL);
+                                else
+                                    ACETrace(@"[watch] t%02u 路过岗哨%u @+0x%llx (lr+0x%llx)", i, s, off,
+                                             lrInT ? (lr - g_tgt_base) : 0ULL);
                                 g_ace_busy = 0;
                             }
                         }
                     }
+                    // v7.33: 区域冻结——专职反篡改线程踩进危险区立即永久挂起(非主/非采样线程)
+                    if (i < 96 && !g_zone_frozen[i] && list[i] != g_main_th
+                        && list[i] != self_th) {
+                        int z = ace_freeze_zone(off);
+                        if (z >= 0) {
+                            g_zone_frozen[i] = 1;
+                            kern_return_t zkr = thread_suspend(list[i]);
+                            if (g_ace_ready && !g_ace_busy) {
+                                g_ace_busy = 1;
+                                ACETrace(@"[zone-freeze] t%02u 区域%d 冻结 @+0x%llx kr=%d (lr+0x%llx)",
+                                         i, z, off, zkr, lrInT ? (lr - g_tgt_base) : 0ULL);
+                                g_ace_busy = 0;
+                            }
+                        }
+                    }
+
                 }
                 // v7.27: burst 期间记录【全部线程】——凶手线程死前多在 libsystem(不在靶场),
                 // 旧过滤器把它挡掉了。全线程最后一拍 = 每条线程死前位置, 真凶必现形。
@@ -790,7 +832,7 @@ static void *ACE_web_keeper(void *arg) {
 // (0xb1e00-0xb2d00 区间), WAN 往返数百 ms = 大捕获窗口 → 3ms 巡逻,
 // 非主线程 PC 命中区间 → thread_suspend 永久冻结(它永远等不到判决)。
 // 只冻网络区间: 验卡主流程 d27ac 在 0xdxxxx(区间外)不受影响, 主线程按端口排除。
-static mach_port_t g_main_th = MACH_PORT_NULL;
+
 static int g_freeze_n = 0;
 static void *ACE_freezer(void *arg) {
     (void)arg;
@@ -1291,7 +1333,10 @@ static void ACE_install_result_hook(void) {
     if (!slot) { ACETrace(@"结果hook: 未找到 _dispatch_async 指针槽"); return; }
     g_tgt_base = base;
     g_tgt_end = base + (uintptr_t)textsize;
-    ACE_disarm_kills();   // v7.32: 先缴械再改写槽(任何后续检查失败都打不死进程)
+    // v7.33: 撤销运行时写 .text —— iOS 对 file-backed RX 页禁止加 W(代码签名强制),
+    // v7.32 实证: ACE_disarm_kills 第一个写点即 EXC_BAD_ACCESS → 启动 ~1s 闪退。
+    // 改用「岗哨冻结」(thread_suspend, 纯 Mach API 不碰代码页), 见 flight_recorder。
+    // ACE_disarm_kills();
     g_saved_slot_val = *slot;
     *slot = (void *)ACE_dispatch_async_hook;
     ACETrace(@"结果hook 已安装: 靶场基址=%p __TEXT=0x%llx 槽=%p 原值=%p → %p",
@@ -1557,7 +1602,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.32 启动 ===");
+            ACETrace(@"=== v7.33 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
