@@ -89,14 +89,24 @@ static NSMutableArray *g_logbuf = NULL;
 static int g_trace_lines = 0;
 static int g_ace_busy = 0;
 static int g_ace_ready = 0;
+static int g_livefd = -1;   // v7.29: 写直通日志 fd(ace_log.txt 每行即时落盘)
 
 static void ACETraceLine(NSString *line) {
-    if (g_trace_lines > 20000) return;
+    if (g_trace_lines > 20000) return; // 总量封顶(v7.11 面包屑需要更大容量)
     g_trace_lines++;
     @autoreleasepool { NSLog(@"%@", line); }
     @synchronized ([NSMutableArray class]) {
         if (!g_logbuf) g_logbuf = [[NSMutableArray alloc] init];
         [g_logbuf addObject:line];
+    }
+    // v7.29: 写直通——死亡发生在成功后 <1s 内, 心跳每秒落盘来不及, 死前日志(含 q18: 遗言)全靠这个
+    if (g_livefd >= 0 && line) {
+        const char *u = [line UTF8String];
+        if (u) {
+            ssize_t w1 = write(g_livefd, u, strlen(u));
+            ssize_t w2 = write(g_livefd, "\n", 1);
+            (void)w1; (void)w2;
+        }
     }
 }
 // v7.17b: ACETrace 由宏改为函数——彻底避开 ##__VA_ARGS__ 宏展开的解析级联错误
@@ -268,6 +278,10 @@ static NSString *ACE_crash_path(void) {
 static UIViewController *ACE_topVC(void);   // 前置声明(定义在悬浮按钮段)
 static void ACE_report_last_crash(void) {
     @try {
+        // v7.29: 最先抢救上次运行的 ace_log.txt(此刻还没被截断), 随后立刻开写直通 fd
+        NSString *logp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_log.txt"];
+        NSData *ld3 = [NSData dataWithContentsOfFile:logp];
+        g_livefd = open(logp.fileSystemRepresentation, O_CREAT | O_WRONLY | O_TRUNC | O_APPEND, 0644);
         NSData *d = [NSData dataWithContentsOfFile:ACE_crash_path()];
         if (d && [d length]) {
             NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
@@ -290,8 +304,7 @@ static void ACE_report_last_crash(void) {
         } else {
             ACETrace(@"上次崩溃文件为空: 若上次确实闪退, 说明是【裸svc exit_group】类不可捕获自毁");
         }
-        NSData *ld3 = [NSData dataWithContentsOfFile:
-            [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_log.txt"]];
+                // v7.29: ld3 已在函数开头抢救读取(写直通截断前)
         if (ld3 && [ld3 length]) {
             NSString *ls = [[NSString alloc] initWithData:ld3 encoding:NSUTF8StringEncoding];
             if (ls) {
@@ -469,15 +482,12 @@ static char g_ring[8][240];
 static volatile int g_ring_i = 0, g_ring_n = 0;
 static volatile long long g_burst_until = 0;   // v7.17: 高精度突发采样截止时间(秒)
 
-// ═══ v7.8: 心跳日志落盘(每秒全量写 Documents/ace_log.txt) ═══
 static void *ACE_heartbeat(void *arg) {
     (void)arg;
-    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_log.txt"];
     for (;;) {
         sleep(1);
         @autoreleasepool {
-            NSString *dump = ACELogDump();
-            if (dump) [dump writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+            // v7.29: ace_log.txt 改为 ACETraceLine 写直通, 心跳不再整文件重写
             NSMutableString *tr = [NSMutableString string];
             int start = (g_ring_i - g_ring_n + 8) & 7;
             for (int k = 0; k < g_ring_n; k++) {
@@ -1411,7 +1421,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.28 启动 ===");
+            ACETrace(@"=== v7.29 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
