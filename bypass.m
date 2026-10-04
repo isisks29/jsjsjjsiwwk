@@ -896,6 +896,8 @@ static void *ACE_web_keeper(void *arg) {
                 if (ctx >= 0x100000000ULL) {
                     uint64_t Cnow = *(volatile uint64_t *)(ctx + 0x119a);
                     if (Cnow != lastC) {
+                    if (lastC != 0)
+                            ACETrace(@"[creseed] C: %llx → %llx (谁在重播种?)", lastC, Cnow);
                         lastC = Cnow;
                         ACE_web_tick();   // C 变了(重播种/首建) → 立即重建全部导数
                         n20 = 0;
@@ -1115,6 +1117,64 @@ static unsigned long ACE_tel_caller(void) {
     return (g_tgt_base && ra >= g_tgt_base && ra < g_tgt_end)
            ? (unsigned long)(ra - g_tgt_base) : 0UL;
 }
+// ═══ v7.39: 方程活体快照仪 ═══
+// q4 钩子入口(靶场0xf1ed8)与 canary 方程校验(0xf1ef0-0xf2164)背靠背执行,
+// 在 q4 入口按靶场公式(0xf20a0-0xf2164 反汇编逐条对照)求值全部 13 条方程,
+// 哪条 FAIL 哪条就是死刑判决——终结"猜方程"时代。写直通, 死也带得走。
+static uint32_t ACE_pmix32(uint32_t x) {   // 无尾部 >>17 折叠的 partial_mix(eq3/4 用)
+    x ^= x >> 15; x *= 0x1f3d6a71u; x ^= x >> 11; x *= 0x8e4b1395u;
+    return x;
+}
+static void ACE_eq_snapshot(const char *tag) {
+    @try {
+        if (!g_tgt_base) return;
+        uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
+        if (ctx < 0x100000000ULL) { ACETrace(@"[eq@%s] ctx未就绪", tag); return; }
+        uint64_t S = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) ^ 0xb75e8052badb72a6ULL;
+        uint32_t a8 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8);
+        uint32_t ac = *(volatile uint32_t *)(g_tgt_base + 0x3ff6ac);
+        uint32_t b0 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0);
+        uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
+        uint32_t e2 = ACE_mix32(Slo ^ 0xd18ddb25u);
+        uint32_t G  = ACE_pmix32(a8 ^ 0x1767cedcu);
+        uint32_t e3 = (Slo ^ (G >> 17)) ^ G;
+        uint32_t H  = ACE_pmix32(ac ^ 0x5d41c293u);
+        uint32_t e4 = (Shi ^ (H >> 17)) ^ H;
+        mach_timebase_info_data_t ti; mach_timebase_info(&ti);
+        uint64_t ms = ti.denom ? ((uint64_t)mach_absolute_time() * ti.numer / ti.denom) / 1000000ULL : 0;
+        long long age = (long long)ms - (long long)S;
+        uint64_t C = *(volatile uint64_t *)(ctx + 0x119a);
+        uint64_t A = *(volatile uint64_t *)(ctx + 0x11a2);
+        uint64_t E = (uint64_t)(*(volatile long long *)(ctx + 0x78));
+        uint32_t p8e = *(volatile uint32_t *)(ctx + 0x8e);
+        uint32_t p92 = *(volatile uint32_t *)(ctx + 0x92);
+        uint32_t c0  = *(volatile uint32_t *)ctx;
+        uint32_t s10 = *(volatile uint32_t *)(ctx + 0x11aa);
+        uint32_t s18 = *(volatile uint32_t *)(ctx + 0x11b2);
+        uint32_t s20 = *(volatile uint32_t *)(ctx + 0x11ba);
+        uint32_t chk = *(volatile uint32_t *)(ctx + 0x11c2);
+        uint32_t e10 = (uint32_t)(C >> 7)  ^ s10 ^ 0x4a9b5206u;
+        uint32_t e11 = (uint32_t)(C >> 13) ^ s18 ^ 0x8c1a73e5u;
+        uint32_t e12 = (uint32_t)(C >> 19) ^ s20 ^ 0x5f8a16e3u;
+        uint32_t m = (uint32_t)(A >> 32) ^ (uint32_t)A;
+        m *= 0x45d9f3b7u; m ^= s10; m *= 0x8e4b1395u; m ^= s18;
+        m *= 0x1f3d6a71u; m ^= s20; m ^= m >> 16;
+        int f1 = (a8 == 0), f2 = (a8 != e2), f3 = (ac != e3), f4 = (b0 != e4);
+        int f5 = (age < 0 || age > 45000);
+        int f6 = (p8e == 0), f7 = (p92 == 0), f8 = (C == 0);
+        int f9 = (E != (C ^ A ^ 0xa5c3e1f7b6d2489aULL));
+        int f10 = (p8e != e10), f11 = (p92 != e11), f12 = (c0 != e12), f13 = (chk != m);
+        ACETrace(@"[eq@%s] 1-4:%d%d%d%d 5:%d(age%lld) 6-8:%d%d%d 9:%d 10:%d 11:%d 12:%d 13:%d (1=FAIL)",
+                 tag, f1, f2, f3, f4, f5, age, f6, f7, f8, f9, f10, f11, f12, f13);
+        if (f9 | f10 | f11 | f12 | f13) {
+            ACETrace(@"[eq@%s|vals] C=%llx E=%llx A=%llx c0=%x p8e=%x p92=%x s10=%x s18=%x s20=%x chk=%x calc=%x",
+                     tag, C, E, A, c0, p8e, p92, s10, s18, s20, chk, m);
+        }
+        if (f2 | f3 | f4 | f5) {
+            ACETrace(@"[eq@%s|S] S=%llu a8=%x/%x ac=%x/%x b0=%x/%x", tag, S, a8, e2, ac, e3, b0, e4);
+        }
+    } @catch (NSException *e) {}
+}
 static void ACE_tel_v(id self, SEL _cmd) {
     int i = ACE_tel_idx(_cmd);
     if (g_ace_ready && !g_ace_busy) {
@@ -1122,6 +1182,8 @@ static void ACE_tel_v(id self, SEL _cmd) {
         ACETrace(@"[tel] %@ caller=TGT+0x%lx", NSStringFromSelector(_cmd), ACE_tel_caller());
         g_ace_busy = 0;
     }
+    // v7.39: q4 入口 = canary 方程区前一毫米 → 全方程活体快照(判决书)
+    if (_cmd == NSSelectorFromString(@"q4")) ACE_eq_snapshot("q4");
     if (i >= 0 && g_tel_imp[i]) ((void (*)(id, SEL))g_tel_imp[i])(self, _cmd);
 }
 static void ACE_tel_o(id self, SEL _cmd, id a) {
@@ -1404,31 +1466,21 @@ static int ACE_disarm_kills(void) {
 typedef int (*ACE_pc_fn)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 static ACE_pc_fn g_real_pc = NULL;
 static int ACE_pc_gate(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg) {
+    // v7.39: 全量记录每次调用(v7.38 疑点: 序言两个孵化没出现在 gate——要么没走
+    // 这个槽, 要么日志被 busy 吞。全记录+去busy闸门, 一次看清)。ASCII 标签防乱码。
     if (g_tgt_base && fn) {
         uintptr_t e = (uintptr_t)fn;
-        // v7.38: 黑名单扩容——看门狗(0xf26cc)/校验线程(0xf4650)入口即 getentropy
-        // 重播种 C(0xf2720/0xf46b4 实证), 播种后 canary 导数网(A/s10/s18/s20/chk)
-        // 全部过期, 安保初始化方程校验读新C比旧导数 → eq⑨-⑬必崩 → 主线程自毁。
-        // 主线程被钥匙串XPC阻塞的几ms恰好给这两线程调度窗口 → 20ms tick 必输。
-        // 拦孵化=根除重播种(v7.18-21 interpose 时代拦截过, 无握手副作用实证)。
         if (e >= g_tgt_base && e < g_tgt_end) {
             unsigned long off = (unsigned long)(e - g_tgt_base);
             if (off == 0xaeda8UL || off == 0xf26ccUL || off == 0xf4650UL) {
                 if (t) *t = (pthread_t)0;
-                if (g_ace_ready && !g_ace_busy) {
-                    g_ace_busy = 1;
-                    ACETrace(@"[gate] 拦下安保线程孵化 entry=+0x%lx %s (假成功)", off,
-                             off == 0xaeda8UL ? "复核巨函数" :
-                             (off == 0xf26ccUL ? "看门狗(C重播种者)" : "校验线程(C重播种者)"));
-                    g_ace_busy = 0;
-                }
+                ACETrace(@"[gate] BLOCK entry=+0x%lx %s", off,
+                         off == 0xaeda8UL ? "reval" : (off == 0xf26ccUL ? "watchdog" : "verifier"));
                 return 0;
             }
-            if (g_ace_ready && !g_ace_busy) {
-                g_ace_busy = 1;
-                ACETrace(@"[gate] 靶场线程孵化放行 entry=+0x%lx", off);
-                g_ace_busy = 0;
-            }
+            ACETrace(@"[gate] pass entry=+0x%lx", off);
+        } else {
+            ACETrace(@"[gate] pass external fn=%p", fn);
         }
     }
     return g_real_pc(t, a, fn, arg);
@@ -1736,7 +1788,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.38 启动 ===");
+            ACETrace(@"=== v7.39 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
