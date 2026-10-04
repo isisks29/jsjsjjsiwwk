@@ -666,7 +666,7 @@ static void ACE_web_tick(void) {
         }
         uint64_t ns = (uint64_t)mach_absolute_time();
         if (den) ns = ns * num / den;
-        uint64_t S = ns / 1000000000ULL;             // 单调秒 = 校验方的种子
+        uint64_t S = ns / 1000000ULL;             // v7.26: 单调毫秒(靶场时间门魔数=除1e6, 实证)
         uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
         *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) = S ^ 0xb75e8052badb72a6ULL;
         uint32_t a8 = ACE_mix32(Slo ^ 0xd18ddb25u);
@@ -1403,7 +1403,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.25 启动 ===");
+            ACETrace(@"=== v7.26 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
