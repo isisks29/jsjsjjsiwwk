@@ -512,6 +512,20 @@ static void ACE_install_heartbeat(void) {
 // ═══ v7.9/v7.17: 飞行记录器——平时50ms采样; 验卡后6秒内1ms高精度采样(PC+LR直写文件) ═══
 typedef kern_return_t (*ACE_tt_fn)(mach_port_t, thread_act_array_t *, mach_msg_type_number_t *);
 static ACE_tt_fn ACE_real_task_threads(void);   // v7.15 前置声明(定义在下一段)
+// ═══ v7.32: 嫌疑人岗哨表(全部嫌疑人行为一次列进日志) ═══
+// 24 个自毁点 + 11 个关键函数入口。采样线程 PC 落在 [入口,+0x60) 即算路过,
+// 每线程×每岗哨首见立写直通日志——死没死都能看到"谁、什么时候、路过了哪个现场"。
+static const unsigned g_sus_off[] = {
+    // 0-23 自毁点(已缴械, 命中 = 有人开枪但打不响)
+    0x9f668, 0xa6220, 0xa62b8, 0xa630c, 0xa69d0, 0xa6ae8, 0xae820, 0xc2e34,
+    0xefe34, 0xf1738, 0xf1768, 0xf9580, 0xd1818, 0xd183c, 0xf8308, 0xf83d0,
+    0x31c14, 0xe61c0, 0xe6224, 0xf2668, 0xefe40, 0xf1744, 0xf1774, 0xf958c,
+    // 24-34 关键函数入口(正常路径, 命中 = 检查在跑)
+    0xf177c, 0x9de64, 0x9ddec, 0xaeda8, 0xf26cc, 0xf4650,
+    0x9f840, 0xae808, 0xc65b0, 0xd27ac, 0xdcf88
+};
+#define ACE_SUS_N 35
+static unsigned char g_sus_seen[96][ACE_SUS_N];
 static void *ACE_flight_recorder(void *arg) {
     (void)arg;
     ACE_tt_fn real_tt = ACE_real_task_threads();
@@ -556,6 +570,20 @@ static void *ACE_flight_recorder(void *arg) {
                     unsigned long long off = pc - g_tgt_base;
                     line[p++] = ' ';
                     for (int k = 28; k >= 0; k -= 4) line[p++] = hd[(off >> k) & 0xf];
+                    // v7.32: 岗哨命中即报(每线程×每岗哨一次, 写直通死也留痕)
+                    if (i < 96) {
+                        for (unsigned s = 0; s < ACE_SUS_N; s++) {
+                            unsigned long long so = g_sus_off[s];
+                            if (off >= so && off < so + 0x60ULL && !g_sus_seen[i][s]
+                                && g_ace_ready && !g_ace_busy) {
+                                g_sus_seen[i][s] = 1;
+                                g_ace_busy = 1;
+                                ACETrace(@"[watch] t%02u 路过岗哨%u @+0x%llx (lr+0x%llx)", i, s, off,
+                                         lrInT ? (lr - g_tgt_base) : 0ULL);
+                                g_ace_busy = 0;
+                            }
+                        }
+                    }
                 }
                 // v7.27: burst 期间记录【全部线程】——凶手线程死前多在 libsystem(不在靶场),
                 // 旧过滤器把它挡掉了。全线程最后一拍 = 每条线程死前位置, 真凶必现形。
@@ -1205,6 +1233,41 @@ static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
     } @catch (NSException *e) {}
     dispatch_async(q, blk);
 }
+// ═══ v7.32: 全员缴械——20 处自毁点全部改哑弹 ═══
+// 分类实证(text.bin 全量 106 个 svc):
+//  - movz x0,#9 + movz x16,#1 + svc = exit(9), 12 处静态
+//  - x16=#0x25(kill) 2 处; 动态 x16 10 处(0x31c14/0xe61c0/0xe6224/0xf2668:
+//    x0=状态×9 dispatcher 形态; 0xefe34/0xf1738/0xf1768/0xf9580: x16 从 TLS+0x148
+//    读且 x1=#9 双保险形态; 0xd1818/0xd183c: x16=0+1=exit(1))——全部自毁
+//  - #0x1f4=getentropy/#6=close/#4=write/#3=read/#0x61=socket/#0x62=connect 良性, 不动
+// 每处 svc 后必跟 brk#1 或 movz x0,#9(第二道保险)。补丁: svc→movz x0,#0(假装退出
+// 码返回), 后一条→ret(安全检查失败路径变成正常返回)。进程从此打不死。
+// 若 vm_protect 失败(签名不允许改 .text) → 日志报 fail=24, 换静态重打包方案。
+static int ACE_disarm_kills(void) {
+    static const unsigned kills[] = {
+        0x9f668, 0xa6220, 0xa62b8, 0xa630c, 0xa69d0, 0xa6ae8, 0xae820, 0xc2e34,
+        0xefe34, 0xefe40, 0xf1738, 0xf1744, 0xf1768, 0xf1774, 0xf9580, 0xf958c,
+        0xd1818, 0xd183c, 0xf8308, 0xf83d0, 0x31c14, 0xe61c0, 0xe6224, 0xf2668
+    };
+    int ok = 0, fail = 0;
+    for (unsigned k = 0; k < sizeof(kills) / sizeof(kills[0]); k++) {
+        uintptr_t at = g_tgt_base + kills[k];
+        vm_address_t page = (vm_address_t)at & ~(vm_address_t)0x3FFF;
+        kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, 0,
+                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) { fail++; continue; }
+        volatile uint32_t *svc = (volatile uint32_t *)at;
+        if (*svc == 0xd4001001u) {        // svc #0x80
+            *svc = 0xd2800000u;           // movz x0, #0
+            *(svc + 1) = 0xd65f03c0u;     // brk/movz → ret
+            sys_icache_invalidate((void *)at, 8);
+            ok++;
+        } else { fail++; }
+    }
+    ACETrace(@"[disarm] 自毁点缴械: 成功=%d 失败=%d%s", ok, fail,
+             (fail && !ok) ? " (vm_protect 全拒=签名限制改不了 .text, 需换方案)" : "");
+    return ok;
+}
 static void ACE_install_result_hook(void) {
     const struct mach_header *hdr = ACE_find_target_header();
     if (!hdr) { ACETrace(@"结果hook: 未找到靶场镜像(按指令签名扫描)"); return; }
@@ -1227,6 +1290,7 @@ static void ACE_install_result_hook(void) {
     if (!slot) { ACETrace(@"结果hook: 未找到 _dispatch_async 指针槽"); return; }
     g_tgt_base = base;
     g_tgt_end = base + (uintptr_t)textsize;
+    ACE_disarm_kills();   // v7.32: 先缴械再改写槽(任何后续检查失败都打不死进程)
     g_saved_slot_val = *slot;
     *slot = (void *)ACE_dispatch_async_hook;
     ACETrace(@"结果hook 已安装: 靶场基址=%p __TEXT=0x%llx 槽=%p 原值=%p → %p",
@@ -1492,7 +1556,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.31 启动（隐身层激活中）===");
+            ACETrace(@"=== v7.32 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
