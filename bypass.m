@@ -53,7 +53,13 @@ static uint32_t ACE_image_count(void) {
 }
 static const char *ACE_image_name(uint32_t i) {
     int o = ACE_find_our_index();
-    return _dyld_get_image_name((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+    const char *nm = _dyld_get_image_name((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+    // v7.37: 对靶场隐藏 libsystem_pthread —— 其导出树扫描(q4@0x9eaa4, 解密实证
+    // 目标="libsystem_pthread"+"/_pthread_create")解析不到真 pthread_create
+    // → 缓存[0x3f65a8]永远为空 → 复核线程(entry 0xaeda8)孵化只能走 GOT 桩
+    // 0x14fdf4 → 被 ACE_pc_gate 拦截。decoy 不含原子串, strcmp/strstr 都不中。
+    if (nm && strstr(nm, "libsystem_pthread")) return "libsystem_pthr_ead.dylib";
+    return nm;
 }
 static const struct mach_header *ACE_image_header(uint32_t i) {
     int o = ACE_find_our_index();
@@ -811,6 +817,10 @@ static uint32_t ACE_mix32(uint32_t x) {
 static void ACE_web_tick(void) {
     @try {
         if (!g_tgt_base) return;
+        // v7.37: 真 pthread_create 缓存槽恒清零——q4/q5 孵化复核线程优先走
+        // blr [0x3f65a8](导出树解析缓存, 绕过GOT); 清零后 cbz 必落 GOT 桩路径,
+        // 与镜像名隐藏(libsystem_pthread)+GOT门神构成三层封锁。
+        *(volatile uint64_t *)(g_tgt_base + 0x3f65a8ULL) = 0;
         // ── ① 全局时钟哈希链(时间相关, 持续刷新保证新鲜度窗) ──
         volatile uint32_t *tb = (volatile uint32_t *)(g_tgt_base + 0x3f6b40);
         uint32_t num = tb[0], den = tb[1];
@@ -1362,6 +1372,34 @@ static int ACE_disarm_kills(void) {
              (fail && !ok) ? " (vm_protect 全拒=签名限制改不了 .text, 需换方案)" : "");
     return ok;
 }
+// ═══ v7.37: 复核线程孵化门神 ═══
+// 靶场 GOT pthread_create 槽 = base+0x3e87c8 (实证: 孵化桩 0x14fdf4 =
+// adrp 0x3e8000 + ldr #0x7c8 + br x16; 同法实证 dispatch_async 槽 0x3e84b8
+// 与已改写槽一致, 模型交叉验证)。间接符号表被混淆(radr://), 只能按偏移定位。
+// entry==靶场+0xaeda8(复核巨函数) → 拦下假成功; 其余放行(看门狗/校验线程
+// 已实证 ctx[0]<0 良性退出, 放行避免行为漂移)。
+typedef int (*ACE_pc_fn)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+static ACE_pc_fn g_real_pc = NULL;
+static int ACE_pc_gate(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg) {
+    if (g_tgt_base && fn) {
+        uintptr_t e = (uintptr_t)fn;
+        if (e == g_tgt_base + 0xaeda8ULL) {
+            if (t) *t = (pthread_t)0;
+            if (g_ace_ready && !g_ace_busy) {
+                g_ace_busy = 1;
+                ACETrace(@"[gate] 拦下复核线程孵化 entry=+0xaeda8 (假成功, 杀手未出生)");
+                g_ace_busy = 0;
+            }
+            return 0;
+        }
+        if (e >= g_tgt_base && e < g_tgt_end && g_ace_ready && !g_ace_busy) {
+            g_ace_busy = 1;
+            ACETrace(@"[gate] 靶场线程孵化放行 entry=+0x%lx", (unsigned long)(e - g_tgt_base));
+            g_ace_busy = 0;
+        }
+    }
+    return g_real_pc(t, a, fn, arg);
+}
 static void ACE_install_result_hook(void) {
     const struct mach_header *hdr = ACE_find_target_header();
     if (!hdr) { ACETrace(@"结果hook: 未找到靶场镜像(按指令签名扫描)"); return; }
@@ -1393,6 +1431,18 @@ static void ACE_install_result_hook(void) {
     ACETrace(@"结果hook 已安装: 靶场基址=%p __TEXT=0x%llx 槽=%p 原值=%p → %p",
              (void *)base, (unsigned long long)textsize, slot, g_saved_slot_val,
              (void *)ACE_dispatch_async_hook);
+             // v7.37: pthread_create GOT 槽改写(偏移实证锚死; dladdr 验证原值确在
+    // libsystem_pthread 内才改写, 不符只记日志不动手)
+    volatile void **pcs = (volatile void **)(base + 0x3e87c8ULL);
+    void *pcold = *pcs;
+    Dl_info pcdi;
+    if (pcold && dladdr(pcold, &pcdi) && pcdi.dli_fname && strstr(pcdi.dli_fname, "libsystem_pthread")) {
+        g_real_pc = (ACE_pc_fn)pcold;
+        *pcs = (void *)ACE_pc_gate;
+        ACETrace(@"[gate] pthread_create槽已改写: %p(%s) → %p", pcold, pcdi.dli_fname, (void *)ACE_pc_gate);
+    } else {
+        ACETrace(@"[gate] pthread_create槽验证失败不改写: %p", pcold);
+    }
 }
 // ══════════════ 屏幕悬浮按钮（日志导出）═══════════════
 @interface ACELogWindow : UIWindow
@@ -1653,7 +1703,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.36 启动 ===");
+            ACETrace(@"=== v7.37 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
