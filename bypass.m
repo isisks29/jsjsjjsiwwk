@@ -1400,7 +1400,11 @@ static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
             uintptr_t inv = (uintptr_t)hdrp[2];           // block 布局: invoke 在 +16
             if (inv >= g_tgt_base && inv < g_tgt_end) {
                 uintptr_t off = inv - g_tgt_base;
-                ACETrace(@"[disp] +0x%lx", (unsigned long)off);   // v7.11 面包屑
+                // v7.40: 加 caller 偏移——区分 q4 两次派发(0x9ee1c/0x9f21c, invoke 都可能是 9f6a0 系)
+                uintptr_t ra0 = (uintptr_t)__builtin_return_address(0);
+                unsigned long coff = (g_tgt_base && ra0 >= g_tgt_base && ra0 < g_tgt_end)
+                                     ? (unsigned long)(ra0 - g_tgt_base) : 0UL;
+                ACETrace(@"[disp] +0x%lx caller=+0x%lx", (unsigned long)off, coff);   // v7.11 面包屑: 死前最后几行=凶手
                 if (off == 0xef0c8ULL) {                   // 弹窗验卡结果: capture+0x38 → 0
                     volatile int32_t *slot = (volatile int32_t *)((uintptr_t)(__bridge void *)blk + 0x38);
                     if (*slot != 0) {
@@ -1484,6 +1488,36 @@ static int ACE_pc_gate(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *
         }
     }
     return g_real_pc(t, a, fn, arg);
+}
+// ═══ v7.40: 通知中心探针 ═══
+// 排除法终局: 方程区实测13/13全过(q4入口快照) + 复核线程已拦 + 看门狗/校验零活动
+// → 主线程死亡路径只剩安保初始化尾段: defaultCenter → VM解密通知名 →
+// postNotificationName:object:(0xf25c0)。observer 在 post 内部【同步】执行
+// (游戏/靶场回调)——若 observer 查 config(ctx+0x1196=0, 我们没有真卡配置)后开枪,
+// 死亡位置/时序/零日志/零采样痕迹全部吻合。探针在调原实现【之前】落写直通日志:
+// 若死在 observer 里, 日志将停在 [notif] post [通知名] caller=+0xf25xx —— 名字+凶手同框。
+static void (*g_orig_post2)(id, SEL, NSString *, id) = NULL;
+static void ACE_post2(id self, SEL _cmd, NSString *name, id obj) {
+    @try {
+        uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+        if (g_tgt_base && ra >= g_tgt_base && ra < g_tgt_end
+            && g_ace_ready && !g_ace_busy) {
+            g_ace_busy = 1;
+            ACETrace(@"[notif] post [%@] caller=TGT+0x%lx", name,
+                     (unsigned long)(ra - g_tgt_base));
+            g_ace_busy = 0;
+        }
+    } @catch (NSException *e) {}
+    if (g_orig_post2) g_orig_post2(self, _cmd, name, obj);
+}
+static void ACE_install_notif_probe(void) {
+    @try {
+        Method m = class_getInstanceMethod([NSNotificationCenter class],
+                                           @selector(postNotificationName:object:));
+        if (m) g_orig_post2 = (void (*)(id, SEL, NSString *, id))
+            method_setImplementation(m, (IMP)ACE_post2);
+        ACETrace(@"通知中心探针已挂=%d", g_orig_post2 != NULL);
+    } @catch (NSException *e) { ACETrace(@"notif探针异常: %@", e); }
 }
 static void ACE_install_result_hook(void) {
     const struct mach_header *hdr = ACE_find_target_header();
@@ -1788,7 +1822,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.39 启动 ===");
+            ACETrace(@"=== v7.4 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -1813,6 +1847,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
                     if (m5) g_addAct_imp = method_setImplementation(m5, (IMP)ACE_addAct);
                     ACETrace(@"Alert 探针已挂");
                 }
+                ACE_install_notif_probe();   // v7.40: 通知中心探针(安保尾段传感器)
             } @catch (NSException *e) { ACETrace(@"探针挂设异常: %@", e); }
             @try { ACE_install_tel_hooks(); } @catch (NSException *e) { ACETrace(@"[tel] 安装异常: %@", e); }
             g_ace_busy = 0;
