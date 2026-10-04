@@ -319,14 +319,54 @@ static void ACE_report_last_crash(void) {
         NSData *bd4 = [NSData dataWithContentsOfFile:
             [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_burst.txt"]];
         if (bd4 && [bd4 length]) {
-            NSString *bs = [[NSString alloc] initWithData:bd4 encoding:NSUTF8StringEncoding];
-            if (bs) {
-                NSUInteger BL = [bs length];
-                NSString *btail = (BL > 6000) ? [bs substringFromIndex:BL - 6000] : bs;
-                ACETrace(@"===== 上次死前高精度采样(末尾=最接近死亡) =====\n%@", btail);
-                [UIPasteboard generalPasteboard].string =
-                    [NSString stringWithFormat:@"[aceburst]\n%@", btail];
+            // v7.34: burst 全量 T 行提炼 —— 「全部嫌疑人活动全记录」。
+            // T行 = 某线程 PC 当时在靶场 __text 内(300µs 采样的每一瞬间)。旧版只贴尾
+            // 6000 字节 = 只见死前 idle; 真凶的活动在更早的拍里。按线程压缩 PC 连续段
+            // (同 PC 连续多拍合并 ×N), 整个 6 秒窗口所有靶场活动浓缩成几十行。
+            const char *bb = (const char *)[bd4 bytes];
+            NSUInteger BL = [bd4 length];
+            NSMutableString *dg = [NSMutableString stringWithCapacity:4096];
+            char lastPc[64][17], lastLr[64][17], runSw[64][3];
+            int runN[64];
+            memset(lastPc, 0, sizeof(lastPc)); memset(lastLr, 0, sizeof(lastLr));
+            memset(runSw, 0, sizeof(runSw)); memset(runN, 0, sizeof(runN));
+            char curSw[3] = "??";
+            long entries = 0;
+            #define ACE_HX(c) (((c)>='0'&&(c)<='9')?((c)-'0'):((((c)|32)>='a')?(((c)|32)-'a'+10):0))
+            #define ACE_T_FLUSH(ix) do { if (runN[ix] > 0 && entries < 600) { \
+                    [dg appendFormat:@"S%.2s t%02x P%s L%s x%d\n", runSw[ix], (ix), lastPc[ix], lastLr[ix], runN[ix]]; \
+                    entries++; } runN[ix] = 0; } while (0)
+            NSUInteger bi = 0;
+            while (bi < BL) {
+                const char *nl = (const char *)memchr(bb + bi, '\n', BL - bi);
+                NSUInteger len = nl ? (NSUInteger)(nl - (bb + bi)) : (BL - bi);
+                if (len == 3 && bb[bi] == 'S') {
+                    curSw[0] = bb[bi+1]; curSw[1] = bb[bi+2];
+                } else if (len == 37 && bb[bi] == 'T') {
+                    int idx = ACE_HX(bb[bi+1]) * 16 + ACE_HX(bb[bi+2]);
+                    if (idx >= 0 && idx < 64) {
+                        char pc[17], lr2[17];
+                        memcpy(pc, bb + bi + 4, 16); pc[16] = 0;
+                        memcpy(lr2, bb + bi + 21, 16); lr2[16] = 0;
+                        if (runN[idx] > 0 && memcmp(lastPc[idx], pc, 16) == 0) {
+                            runN[idx]++;
+                        } else {
+                            ACE_T_FLUSH(idx);
+                            memcpy(lastPc[idx], pc, 17); memcpy(lastLr[idx], lr2, 17);
+                            runSw[idx][0] = curSw[0]; runSw[idx][1] = curSw[1];
+                            runN[idx] = 1;
+                        }
+                    }
+                }
+                if (!nl) break;
+                bi += len + 1;
             }
+            for (int fx = 0; fx < 64; fx++) ACE_T_FLUSH(fx);
+            #undef ACE_T_FLUSH
+            #undef ACE_HX
+            ACETrace(@"===== 上次burst靶场活动全记录(%ld段, t行已滤) =====\n%@", entries, dg);
+            [UIPasteboard generalPasteboard].string =
+                [NSString stringWithFormat:@"[aceTline]\n%@", dg];
         }
         NSData *td2 = [NSData dataWithContentsOfFile:
             [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_trace.txt"]];
@@ -535,8 +575,10 @@ static unsigned char g_sus_seen[96][ACE_SUS_N];
 //  z2: 看门狗 [0xf26cc,0xf2900)   z3: 校验线程 [0xf4650,0xf4a00)   z4: kill簇 [0xf82a0,0xf8400)
 static unsigned char g_zone_frozen[96];
 static int ace_freeze_zone(unsigned long long off) {
-    if (off >= 0xaeda8ULL && off < 0xaf000ULL) return 0;
-    if (off >= 0xb1e00ULL && off < 0xbc000ULL) return 1;
+    // v7.34: 区域0扩为巨函数全域——实证 q4 给线程参数+0x10 写死初始状态1
+    // (0x9ea60: movz w8,#1; str w8,[x22,#0x10]), 状态1走 0xaf090 数据处理路径
+    // (NSData length/bytes, 选择子已解密实证), 在旧区域0/1 的缝隙里, 必须盖住
+    if (off >= 0xaeda8ULL && off < 0xbc000ULL) return 0;
     if (off >= 0xf26ccULL && off < 0xf2900ULL) return 2;
     if (off >= 0xf4650ULL && off < 0xf4a00ULL) return 3;
     if (off >= 0xf82a0ULL && off < 0xf8400ULL) return 4;
@@ -1602,7 +1644,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.33 启动 ===");
+            ACETrace(@"=== v7.34 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
