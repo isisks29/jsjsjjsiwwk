@@ -753,6 +753,52 @@ static void *ACE_web_keeper(void *arg) {
     for (;;) { usleep(20000); ACE_web_tick(); }
     return NULL;
 }
+// ═══ v7.31: 复核线程冷冻器 ═══
+// q4 扫描后用「导出树解析的真 pthread_create」孵化 entry=0xaeda8 的复核巨函数线程
+// (interpose 拦不到)。该线程: 时间检测(v7.30 已中和) → 裸svc socket/connect 到
+// 111.170.155.161:9527 二次复核 → 服务器判无真卡 → dispatcher → exit_group(9)。
+// 裸 svc 网络无法 hook, 但线程阻塞在 connect/read 时 PC 停在靶场内 svc 指令
+// (0xb1e00-0xb2d00 区间), WAN 往返数百 ms = 大捕获窗口 → 3ms 巡逻,
+// 非主线程 PC 命中区间 → thread_suspend 永久冻结(它永远等不到判决)。
+// 只冻网络区间: 验卡主流程 d27ac 在 0xdxxxx(区间外)不受影响, 主线程按端口排除。
+static mach_port_t g_main_th = MACH_PORT_NULL;
+static int g_freeze_n = 0;
+static void *ACE_freezer(void *arg) {
+    (void)arg;
+    ACE_tt_fn real_tt = ACE_real_task_threads();
+    if (!real_tt) return NULL;
+    for (;;) {
+        usleep(3000);
+        @try {
+            if (!g_tgt_base) continue;
+            uintptr_t lo = g_tgt_base + 0xb1e00ULL, hi = g_tgt_base + 0xb2d00ULL;
+            thread_act_array_t list = NULL;
+            mach_msg_type_number_t n = 0;
+            if (real_tt(mach_task_self(), &list, &n) != KERN_SUCCESS || !list) continue;
+            for (unsigned i = 0; i < n; i++) {
+                if (list[i] == g_main_th) continue;
+                unsigned long long stt[34];
+                memset(stt, 0, sizeof(stt));
+                mach_msg_type_number_t c = 68;
+                if (thread_get_state(list[i], ACE_ARM64_STATE, (thread_state_t)stt, &c) == 0 && c >= 66) {
+                    uintptr_t pc = (uintptr_t)stt[32];
+                    if (pc >= lo && pc < hi) {
+                        kern_return_t kr = thread_suspend(list[i]);
+                        g_freeze_n++;
+                        if (g_ace_ready && !g_ace_busy) {
+                            g_ace_busy = 1;
+                            ACETrace(@"[freeze#%d] 冻结复核线程#%u PC=+0x%lx kr=%d (永久挂起)",
+                                     g_freeze_n, i, (unsigned long)(pc - g_tgt_base), kr);
+                            g_ace_busy = 0;
+                        }
+                    }
+                }
+            }
+            vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
+        } @catch (NSException *e) {}
+    }
+    return NULL;
+}
 static void *ACE_ctx_monitor(void *arg);   // v7.13 前置声明(定义在下方)
 
 static void ACE_install_v79_threads(void) {
@@ -764,6 +810,7 @@ static void ACE_install_v79_threads(void) {
     // v7.24: endtime keeper 并入 web tick(单写者, 消除竞态)
     pthread_create(&th, &at, ACE_web_keeper, NULL);      // v7.24: 封印网守护
     pthread_create(&th, &at, ACE_clock_keeper, NULL);   // v7.23: 时钟一致性守护
+    pthread_create(&th, &at, ACE_freezer, NULL);         // v7.31: 复核线程冷冻器
     pthread_create(&th, &at, ACE_ctx_monitor, NULL);
     
     pthread_attr_destroy(&at);
@@ -1443,8 +1490,9 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     g_ace_ready = 1;
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            g_ace_busy = 1;
-            ACETrace(@"=== v7.30 启动 ===");
+                        g_ace_busy = 1;
+            g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
+            ACETrace(@"=== v7.31 启动（隐身层激活中）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
