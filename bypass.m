@@ -624,12 +624,9 @@ static void *ACE_endtime_keeper(void *arg) {
     }
     return NULL;
 }
-// ═══ v7.28: 时钟守护单位修复(毫秒) ═══
-// 靶场魔数 0x431bde82d7b634db(@0xaeed4) = 除以 1e6 → 单调钟是【毫秒】,
-// K([0x3ba280])=1000.0(已从二进制读出实证)换回秒。旧版 /1e9 公式错误,
-// "自校正"反而把 epoch 毒化 → 时间跳变检测必炸(v7.21/v7.27 burst 实证死于此)。
 static void *ACE_clock_keeper(void *arg) {
     (void)arg;
+    static int prearmed = 0;   // v7.30
     for (;;) {
         usleep(50000);
         @autoreleasepool { @try {
@@ -639,7 +636,33 @@ static void *ACE_clock_keeper(void *arg) {
             const volatile uint64_t *mbase= (const volatile uint64_t *)(g_tgt_base + 0x3f65c8);
             volatile double  *epoch = (volatile double *)(g_tgt_base + 0x3f65d0);
             volatile double  *ovr   = (volatile double *)(g_tgt_base + 0x3f65e0);
-            if (*ovr != 0.0) *ovr = 0.0;               // v7.28: 锁死主检分支(override路径语义未全解)
+                        // ═══ v7.30: once 预武装(抢在靶场中毒初始化块之前) ═══
+            // Block A(0xc69a8) 把 epoch[0x3f65d0] 初始化成栈残留的次正规垃圾(~1.7e-314)
+            // → 时间跳变线程出生即自检: computed≈开机秒数 vs 墙钟17.8亿 → 差>30s → exit_group(9),
+            //   全程微秒级, 50ms 守护来不及修(v7.29 burst: t39 PC=0 未及执行首指令即死, 实证)。
+            // dispatch_once token == -1 即"已执行": 抢先预置两个 token 并自写一致基线, 中毒块永不跑。
+            if (!prearmed) {
+                prearmed = 1;
+                volatile uint64_t *tokD8 = (volatile uint64_t *)(g_tgt_base + 0x3f65d8);
+                volatile uint64_t *tokB8 = (volatile uint64_t *)(g_tgt_base + 0x3f65b8);
+                if (*tokD8 != ~(uint64_t)0) {
+                    if (tb[0] == 0 || tb[1] == 0) {
+                        mach_timebase_info_data_t ti; mach_timebase_info(&ti);
+                        ((volatile uint32_t *)(g_tgt_base + 0x3f65b0))[0] = ti.numer;
+                        ((volatile uint32_t *)(g_tgt_base + 0x3f65b0))[1] = ti.denom;
+                        *(volatile uint32_t *)(g_tgt_base + 0x3f65f8) = 1;   // block B 同款 flag
+                    }
+                    uint32_t pn = tb[0], pd = tb[1];
+                    uint64_t pabs = mach_absolute_time();
+                    uint64_t pms = pd ? ((pabs * (uint64_t)pn) / (uint64_t)pd) / 1000000ULL : 0ULL;
+                    *(volatile uint64_t *)(g_tgt_base + 0x3f65c8) = pms;    // mbase=单调毫秒now
+                    *(volatile double *)(g_tgt_base + 0x3f65d0) =
+                        [[NSDate date] timeIntervalSince1970];               // epoch=墙钟now(一致!)
+                    *tokB8 = ~(uint64_t)0;   // 基线就绪后再落 token(数据先于标志)
+                    *tokD8 = ~(uint64_t)0;
+                }
+            }
+            if (*ovr != 0.0) *ovr = 0.0;               // v7.28: 锁死主检分支
             double K = *(const double *)(g_tgt_base + 0x3ba280);
             uint64_t abst = mach_absolute_time();
             uint32_t num = tb[0], den = tb[1];
@@ -1421,7 +1444,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.29 启动 ===");
+            ACETrace(@"=== v7.30 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
