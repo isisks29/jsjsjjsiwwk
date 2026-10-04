@@ -22,6 +22,10 @@
 #import <pthread.h>
 #import <sys/stat.h>
 #import <Security/Security.h>
+#import <sys/socket.h>     // v7.20: 活服务器探针
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <errno.h>
 
 // ══════════════ 第 0 层：隐身（对靶场的 dyld/调试探测不可见）══════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
@@ -209,14 +213,17 @@ static int g_rw_dialog = 0, g_rw_boot = 0;
 static void ACE_prime_endtime(void) {
     @try {
         if (!g_tgt_base) return;
-        uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);   // 全局 ctx 指针(实证)
+        uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
         if (ctx < 0x100000000ULL) return;
-        double *endp = (double *)(ctx + 0x78);
-        double now = (double)time(NULL);
-        if (*endp < now + 86400.0) {
-            // v7.18: 仿周卡 now+7天(老师实证: 真卡=领取时刻+卡时长; 2100年=76年卡是异常值)
-            ACETrace(@"[prime] EndTime %.0f → %.0f (仿周卡: now+7天)", *endp, now + 7.0 * 86400.0);
-            *endp = now + 7.0 * 86400.0;
+        // v7.21 铁证修正: 0xe411c 无配置分支用 scvtf 把 ctx+0x78 当有符号整数转 double。
+        // 之前写 double 位模式 → 被当 ~4.7e18 秒 → NSDate 溢出 → 到期时间空白。
+        // 正确: 写整数 Unix 秒, 到期 = now + 3650 天。
+        volatile long long *endp = (volatile long long *)(ctx + 0x78);
+        long long nowll = (long long)time(NULL);
+        long long target = nowll + 3650LL * 86400LL;
+        if (*endp < nowll + 86400LL) {
+            ACETrace(@"[prime] EndTime(int64) %lld → %lld (now+3650天)", *endp, target);
+            *endp = target;
         }
     } @catch (NSException *e) {}
 }
@@ -583,9 +590,10 @@ static void *ACE_endtime_keeper(void *arg) {
             if (!g_tgt_base) continue;
             uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
             if (ctx < 0x100000000ULL) continue;
-            volatile double *endp = (volatile double *)(ctx + 0x78);
-            double now = (double)time(NULL);
-            if (*endp < now + 86400.0) *endp = now + 7.0 * 86400.0;   // v7.18: 仿周卡
+            // v7.21: 按 scvtf 整数语义写 int64 Unix 秒
+            volatile long long *endp = (volatile long long *)(ctx + 0x78);
+            long long nowll = (long long)time(NULL);
+            if (*endp < nowll + 86400LL) *endp = nowll + 3650LL * 86400LL;
         } @catch (NSException *e) {}
     }
     return NULL;
@@ -1167,14 +1175,100 @@ static BOOL ACE_pw_set(id cls, SEL _cmd, id pw, id svc, id acct) {
     return r;
 }
 static IMP g_alert_imp = NULL;
+// ══════════════ v7.20 采集器 A: 全量 ctx dump ══════════════
+static void ACE_dump_ctx_full(NSString *tag) {
+    @try {
+        if (!g_tgt_base) { ACETrace(@"[dump] %s: g_tgt_base 未就绪", tag.UTF8String); return; }
+        uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
+        if (ctx < 0x100000000ULL) { ACETrace(@"[dump] %@: ctx 指针无效=%llx", tag, (unsigned long long)ctx); return; }
+        const unsigned char *p = (const unsigned char *)ctx;
+        ACETrace(@"[dump] %@ ctx=%p 全量0x11c6:", tag, (void *)ctx);
+        for (int off = 0; off < 0x11c6; off += 32) {
+            NSMutableString *hex = [NSMutableString stringWithCapacity:100];
+            int n = (0x11c6 - off) < 32 ? (0x11c6 - off) : 32;
+            for (int i = 0; i < n; i++) [hex appendFormat:@"%02x", p[off + i]];
+            ACETrace(@"[dump] +%04x: %@", off, hex);
+        }
+    } @catch (NSException *e) { ACETrace(@"[dump] 异常: %@", e); }
+}
+
+// ══════════════ v7.20 采集器 B: 活服务器探针 ══════════════
+static const char *ACE_SRV_IP = "111.170.155.161";   // 静态解码自 d27ac connect sockaddr
+static uint16_t    ACE_SRV_PORT = 9527;
+static void ACE_hexdump_bytes(NSString *tag, const unsigned char *b, int n) {
+    if (n <= 0) { ACETrace(@"[probe] %@: (空)", tag); return; }
+    for (int off = 0; off < n; off += 32) {
+        NSMutableString *hex = [NSMutableString string];
+        NSMutableString *asc = [NSMutableString string];
+        int m = (n - off) < 32 ? (n - off) : 32;
+        for (int i = 0; i < m; i++) {
+            [hex appendFormat:@"%02x", b[off + i]];
+            unsigned char c = b[off + i];
+            [asc appendFormat:@"%c", (c >= 0x20 && c < 0x7f) ? c : '.'];
+        }
+        ACETrace(@"[probe] %@ +%03x: %-64s |%@|", tag, off, hex.UTF8String, asc);
+    }
+}
+static void *ACE_net_probe(void *arg) {
+    (void)arg;
+    @autoreleasepool {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { ACETrace(@"[probe] socket 失败 errno=%d", errno); return NULL; }
+        struct timeval tv; tv.tv_sec = 4; tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(ACE_SRV_PORT);
+        inet_pton(AF_INET, ACE_SRV_IP, &sa.sin_addr);
+        ACETrace(@"[probe] 连接 %s:%d fd=%d ...", ACE_SRV_IP, ACE_SRV_PORT, fd);
+        int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+        if (rc != 0) {
+            ACETrace(@"[probe] connect 失败 errno=%d (%s) —— 服务器不可达, -404 可能是本地伪造",
+                     errno, strerror(errno));
+            close(fd); return NULL;
+        }
+        ACETrace(@"[probe] ★ connect 成功: 服务器存活, -404 是真实回包!");
+        unsigned char buf[4096];
+        int got = (int)recv(fd, buf, sizeof(buf), 0);
+        if (got > 0) {
+            ACETrace(@"[probe] 连上即收到 %d 字节(握手/banner):", got);
+            ACE_hexdump_bytes(@"banner", buf, got);
+        } else {
+            ACETrace(@"[probe] 连上无 banner (recv=%d errno=%d), 主动发探测帧", got, errno);
+        }
+        unsigned char probe[9] = { 0xAC, 0x01, 0x02, 0,0, 0,0,0,0 };
+        int sent = (int)send(fd, probe, sizeof(probe), 0);
+        ACETrace(@"[probe] 发送探测帧 %d 字节: AC 01 02 len=0", sent);
+        got = (int)recv(fd, buf, sizeof(buf), 0);
+        ACETrace(@"[probe] 探测回包 %d 字节 errno=%d:", got, got > 0 ? 0 : errno);
+        if (got > 0) ACE_hexdump_bytes(@"resp", buf, got);
+        close(fd);
+        ACETrace(@"[probe] 完成");
+    }
+    return NULL;
+}
+static void ACE_start_net_probe(void) {
+    pthread_t th; pthread_attr_t at; pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_create(&th, &at, ACE_net_probe, NULL);
+    pthread_attr_destroy(&at);
+}
 static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
     if (g_ace_ready && !g_ace_busy) {
         g_ace_busy = 1;
         ACETrace(@"UIAlert title=[%@] msg=[%@]", ACETrimStr(title, 96), ACETrimStr(msg, 160));
+        NSString *t = [title isKindOfClass:[NSString class]] ? title : @"";
+        NSString *m = [msg isKindOfClass:[NSString class]] ? msg : @"";
+        if ([t containsString:@"授权"] || [t containsString:@"到期"] ||
+            [m containsString:@"到期"] || [m containsString:@"激活"]) {
+            ACE_dump_ctx_full(@"成功弹窗");
+        }
         g_ace_busy = 0;
     }
     return ((id (*)(id, SEL, id, id, NSInteger))g_alert_imp)(cls, _cmd, title, msg, style);
 }
+
 static IMP g_addAct_imp = NULL;
 static void ACE_addAct(id self, SEL _cmd, id action) {
     if (g_ace_ready && !g_ace_busy) {
@@ -1193,7 +1287,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.19 启动 ===");
+            ACETrace(@"=== v7.21 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -1222,6 +1316,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             @try { ACE_install_tel_hooks(); } @catch (NSException *e) { ACETrace(@"[tel] 安装异常: %@", e); }
             g_ace_busy = 0;
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
+            @try { ACE_start_net_probe(); } @catch (NSException *e) { ACETrace(@"[probe] 启动异常: %@", e); }
         }
     });
 }
