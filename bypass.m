@@ -614,13 +614,10 @@ static void *ACE_endtime_keeper(void *arg) {
     }
     return NULL;
 }
-// ═══ v7.23: 时钟一致性守护(中和时间跳变检测) ═══
-// burst 实证: 死前主检线程 PC=0xaeadc(时间跳变检测方法入口), 由 q4 定时流程调入。
-// 判据(0xaef40-0xaef78 实证): wall_base[0x3f65a0]>0 且 派生钟-墙钟基线>30s → exit_group(9)。
-// 派生钟 computed = (mono_sec - mbase[0x3f65c8])/K[0x3ba280] + epoch[0x3f65d0],
-//   mono_sec = mach_absolute_time*num/den([0x3f65b0]) / 1e9。
-// 守护: 每50ms 照靶场自己的公式重算 computed, 与真实墙钟差>5s 就微调 epoch(纯数据写)
-//   → 三个检测分支(30s主检/override/adj)差值恒≈0, 全部安全通过。
+// ═══ v7.28: 时钟守护单位修复(毫秒) ═══
+// 靶场魔数 0x431bde82d7b634db(@0xaeed4) = 除以 1e6 → 单调钟是【毫秒】,
+// K([0x3ba280])=1000.0(已从二进制读出实证)换回秒。旧版 /1e9 公式错误,
+// "自校正"反而把 epoch 毒化 → 时间跳变检测必炸(v7.21/v7.27 burst 实证死于此)。
 static void *ACE_clock_keeper(void *arg) {
     (void)arg;
     for (;;) {
@@ -631,11 +628,13 @@ static void *ACE_clock_keeper(void *arg) {
             const volatile uint32_t *tb   = (const volatile uint32_t *)(g_tgt_base + 0x3f65b0);
             const volatile uint64_t *mbase= (const volatile uint64_t *)(g_tgt_base + 0x3f65c8);
             volatile double  *epoch = (volatile double *)(g_tgt_base + 0x3f65d0);
+            volatile double  *ovr   = (volatile double *)(g_tgt_base + 0x3f65e0);
+            if (*ovr != 0.0) *ovr = 0.0;               // v7.28: 锁死主检分支(override路径语义未全解)
             double K = *(const double *)(g_tgt_base + 0x3ba280);
             uint64_t abst = mach_absolute_time();
             uint32_t num = tb[0], den = tb[1];
-            double mono_sec = den ? (double)((abst * (uint64_t)num) / (uint64_t)den) / 1e9 : 0.0;
-            double delta = mono_sec - (double)*mbase;
+            uint64_t mono_ms = den ? ((abst * (uint64_t)num) / (uint64_t)den) / 1000000ULL : 0ULL;
+            double delta = (double)(mono_ms - *mbase); // u64 回绕减法, 与靶场 0xaeeb8-0xaef00 逐项一致
             double computed = (K != 0.0 && isfinite(K)) ? (delta / K) : delta;
             computed += *epoch;
             double wall = [[NSDate date] timeIntervalSince1970];
@@ -1412,7 +1411,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.27 启动 ===");
+            ACETrace(@"=== v7.28 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
