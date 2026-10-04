@@ -558,7 +558,7 @@ static void *ACE_flight_recorder(void *arg) {
             }
         }
 
-        }
+        
         line[p] = 0;
         vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
         int hadTarget = (p > 3);
