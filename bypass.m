@@ -575,10 +575,12 @@ static unsigned char g_sus_seen[96][ACE_SUS_N];
 //  z2: 看门狗 [0xf26cc,0xf2900)   z3: 校验线程 [0xf4650,0xf4a00)   z4: kill簇 [0xf82a0,0xf8400)
 static unsigned char g_zone_frozen[96];
 static int ace_freeze_zone(unsigned long long off) {
-    // v7.34: 区域0扩为巨函数全域——实证 q4 给线程参数+0x10 写死初始状态1
-    // (0x9ea60: movz w8,#1; str w8,[x22,#0x10]), 状态1走 0xaf090 数据处理路径
-    // (NSData length/bytes, 选择子已解密实证), 在旧区域0/1 的缝隙里, 必须盖住
-    if (off >= 0xaeda8ULL && off < 0xbc000ULL) return 0;
+    // v7.35: 区域0合并扩至整个巨函数家族 [0xaeda8,0xc7900) —— 实证链:
+    //  q4 给线程参数+0x10 写死状态1(0x9ea60) → 调度器 b.eq 0xaf090 →
+    //  状态1=遥测上报流水线(设备信息+钥匙串+JSON序列化+哈希+上传, 选择子全解码) →
+    //  服务器裁决无真会话 → kill。v7.34 抓到现行: t3d @0xc7740 (LR=0xaee84)。
+    //  旧区边界 0xbc000 漏掉了 0xc2e2c kill块/0xc6xxx once块/0xc7740 助手, 全部纳入。
+    if (off >= 0xaeda8ULL && off < 0xc7900ULL) return 0;
     if (off >= 0xf26ccULL && off < 0xf2900ULL) return 2;
     if (off >= 0xf4650ULL && off < 0xf4a00ULL) return 3;
     if (off >= 0xf82a0ULL && off < 0xf8400ULL) return 4;
@@ -629,30 +631,29 @@ static void *ACE_flight_recorder(void *arg) {
                     unsigned long long off = pc - g_tgt_base;
                     line[p++] = ' ';
                     for (int k = 28; k >= 0; k -= 4) line[p++] = hd[(off >> k) & 0xf];
-                    // v7.32: 岗哨命中即报(每线程×每岗哨一次, 写直通死也留痕)
-                    // v7.33: 岗哨命中即报; 自毁点(岗哨0-23)且非主/非采样线程 → 当场冻结
-                    // (iOS 禁运行时写 .text, 冻结线程是平台合法的缴械: 枪手停在 svc 前永不开枪)
-                    if (i < 96) {
-                        for (unsigned s = 0; s < ACE_SUS_N; s++) {
-                            unsigned long long so = g_sus_off[s];
-                            if (off >= so && off < so + 0x60ULL && !g_sus_seen[i][s]
-                                && g_ace_ready && !g_ace_busy) {
-                                g_sus_seen[i][s] = 1;
-                                int canFreeze = (s < 24) && list[i] != g_main_th
-                                                && list[i] != self_th;
-                                kern_return_t fkr = 0;
-                                if (canFreeze) fkr = thread_suspend(list[i]);
+                    // v7.33: 区域冻结——专职反篡改线程踩进危险区立即永久挂起(非主/非采样线程)
+                    // v7.35: +桩区LR规则——巨函数每次调 Foundation 都路过桩区(0x14fxxx,
+                    // 靶场内), 此刻 LR 必指回巨函数体 → 一生上百次过桩, 采样必中一次。
+                    // 只在 PC 位于靶场自身代码/桩区时冻结(不在 malloc/objc 内部冻, 防锁死)。
+                    if (i < 96 && !g_zone_frozen[i] && list[i] != g_main_th
+                        && list[i] != self_th) {
+                        int z = ace_freeze_zone(off);
+                        if (z < 0 && off >= 0x14f000ULL && off < 0x150000ULL && lrInT) {
+                            unsigned long long lro = lr - g_tgt_base;
+                            if (lro >= 0xaeda8ULL && lro < 0xc7900ULL) z = 9;
+                        }
+                        if (z >= 0) {
+                            g_zone_frozen[i] = 1;
+                            kern_return_t zkr = thread_suspend(list[i]);
+                            if (g_ace_ready && !g_ace_busy) {
                                 g_ace_busy = 1;
-                                if (canFreeze)
-                                    ACETrace(@"[freeze-kill] t%02u 冻结于自毁点%u @+0x%llx kr=%d (lr+0x%llx)",
-                                             i, s, off, fkr, lrInT ? (lr - g_tgt_base) : 0ULL);
-                                else
-                                    ACETrace(@"[watch] t%02u 路过岗哨%u @+0x%llx (lr+0x%llx)", i, s, off,
-                                             lrInT ? (lr - g_tgt_base) : 0ULL);
+                                ACETrace(@"[zone-freeze] t%02u 区域%d 冻结 @+0x%llx kr=%d (lr+0x%llx)",
+                                         i, z, off, zkr, lrInT ? (lr - g_tgt_base) : 0ULL);
                                 g_ace_busy = 0;
                             }
                         }
                     }
+
                     // v7.33: 区域冻结——专职反篡改线程踩进危险区立即永久挂起(非主/非采样线程)
                     if (i < 96 && !g_zone_frozen[i] && list[i] != g_main_th
                         && list[i] != self_th) {
@@ -1644,7 +1645,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.34 启动 ===");
+            ACETrace(@"=== v7.35 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
