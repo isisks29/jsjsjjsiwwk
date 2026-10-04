@@ -597,6 +597,43 @@ static void *ACE_endtime_keeper(void *arg) {
     }
     return NULL;
 }
+// ═══ v7.23: 时钟一致性守护(中和时间跳变检测) ═══
+// burst 实证: 死前主检线程 PC=0xaeadc(时间跳变检测方法入口), 由 q4 定时流程调入。
+// 判据(0xaef40-0xaef78 实证): wall_base[0x3f65a0]>0 且 派生钟-墙钟基线>30s → exit_group(9)。
+// 派生钟 computed = (mono_sec - mbase[0x3f65c8])/K[0x3ba280] + epoch[0x3f65d0],
+//   mono_sec = mach_absolute_time*num/den([0x3f65b0]) / 1e9。
+// 守护: 每50ms 照靶场自己的公式重算 computed, 与真实墙钟差>5s 就微调 epoch(纯数据写)
+//   → 三个检测分支(30s主检/override/adj)差值恒≈0, 全部安全通过。
+static void *ACE_clock_keeper(void *arg) {
+    (void)arg;
+    for (;;) {
+        usleep(50000);
+        @autoreleasepool { @try {
+            if (!g_tgt_base) continue;
+            volatile double  *wbase = (volatile double *)(g_tgt_base + 0x3f65a0);
+            const volatile uint32_t *tb   = (const volatile uint32_t *)(g_tgt_base + 0x3f65b0);
+            const volatile uint64_t *mbase= (const volatile uint64_t *)(g_tgt_base + 0x3f65c8);
+            volatile double  *epoch = (volatile double *)(g_tgt_base + 0x3f65d0);
+            double K = *(const double *)(g_tgt_base + 0x3ba280);
+            uint64_t abst = mach_absolute_time();
+            uint32_t num = tb[0], den = tb[1];
+            double mono_sec = den ? (double)((abst * (uint64_t)num) / (uint64_t)den) / 1e9 : 0.0;
+            double delta = mono_sec - (double)*mbase;
+            double computed = (K != 0.0 && isfinite(K)) ? (delta / K) : delta;
+            computed += *epoch;
+            double wall = [[NSDate date] timeIntervalSince1970];
+            double diff = wall - computed;
+            if (!(diff < 5.0 && diff > -5.0)) {      // NaN/超差都纠正
+                double ne = *epoch + diff;
+                *epoch = isfinite(ne) ? ne : wall;   // 毒值兜底
+            }
+            // wall_base 保鲜: 靶场 q4 正常会自己刷; 只在停滞/未设时代劳
+            double wb = *wbase;
+            if (!(wb > 0.0) || wall - wb > 15.0 || wall - wb < -30.0) *wbase = wall;
+        } @catch (NSException *e) {} }
+    }
+    return NULL;
+}
 static void *ACE_ctx_monitor(void *arg);   // v7.13 前置声明(定义在下方)
 
 static void ACE_install_v79_threads(void) {
@@ -606,6 +643,7 @@ static void ACE_install_v79_threads(void) {
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_create(&th, &at, ACE_flight_recorder, NULL);
     pthread_create(&th, &at, ACE_endtime_keeper, NULL);
+    pthread_create(&th, &at, ACE_clock_keeper, NULL);   // v7.23: 时钟一致性守护
     pthread_create(&th, &at, ACE_ctx_monitor, NULL);
     
     pthread_attr_destroy(&at);
@@ -1286,7 +1324,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.21 启动 ===");
+            ACETrace(@"=== v7.23 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
