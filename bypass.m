@@ -849,7 +849,15 @@ static void ACE_web_tick(void) {
         uint64_t E = (uint64_t)*endp;
         uint64_t A = E ^ C ^ 0xa5c3e1f7b6d2489aULL;
         *(volatile uint64_t *)(ctx + 0x11a2) = A;
-        uint32_t V8e = *p8e, V92 = *p92, C0 = *(volatile uint32_t *)ctx;
+        uint32_t V8e = *p8e, V92 = *p92;
+        // ═══ v7.36 真凶修复: s20/校验和钉死按 C0=0xffffffff 推导 ═══
+        // 实证链: eq⑫(0xf2128) 校验 ctx[0]==lo32((C>>19)^(s20^0x5f8a16e3)),
+        // 而 ctx[0]=验卡 socket fd(ctx# 监控行实锤: ffffffff→0x61→ffffffff 随
+        // 连接开合翻转)。fd 关闭→安保初始化校验在 <20ms 内完成, tick(20ms)追不上,
+        // 按瞬时 fd 推导的 s20 在校验时必陈旧 → eq⑫⑬必崩 → 0xf2630 → 主线程
+        // svc 自毁(µs级, 一切线程采样抓不到)。两个校验时刻(boot复核/成功后
+        // 安保初始化) ctx[0] 恒为 -1 → 按常量 -1 推导, 竞态物理消失。
+        uint32_t C0 = 0xffffffffu;
         uint32_t s10 = V8e ^ (uint32_t)(C >> 7)  ^ 0x4a9b5206u;
         uint32_t s18 = V92 ^ (uint32_t)(C >> 13) ^ 0x8c1a73e5u;
         uint32_t s20 = C0  ^ (uint32_t)(C >> 19) ^ 0x5f8a16e3u;
@@ -1645,7 +1653,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.35 启动 ===");
+            ACETrace(@"=== v7.36 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
