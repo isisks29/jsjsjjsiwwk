@@ -882,7 +882,30 @@ static void ACE_web_tick(void) {
 }
 static void *ACE_web_keeper(void *arg) {
     (void)arg;
-    for (;;) { usleep(20000); ACE_web_tick(); }
+    // v7.38: C 重播种哨兵——全 text 共 20 处 getentropy 写 C(ctx+0x119a)。门神拦掉
+    // 看门狗/校验线程两个入口重播种后, 游戏功能区仍有 ~17 处可能在游玩中重播种。
+    // 1ms 高频盯 C: 一变立即整发 web_tick 重建导数网(A/s10/s18/s20/chk),
+    // 把"重播种→方程校验"竞态窗口从 20ms 压到 ~1ms; C 稳定时按 20ms 常规刷新。
+    uint64_t lastC = 0;
+    int n20 = 0;
+    for (;;) {
+        usleep(1000);
+        @try {
+            if (g_tgt_base) {
+                uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
+                if (ctx >= 0x100000000ULL) {
+                    uint64_t Cnow = *(volatile uint64_t *)(ctx + 0x119a);
+                    if (Cnow != lastC) {
+                        lastC = Cnow;
+                        ACE_web_tick();   // C 变了(重播种/首建) → 立即重建全部导数
+                        n20 = 0;
+                        continue;
+                    }
+                }
+            }
+            if (++n20 >= 20) { n20 = 0; ACE_web_tick(); }
+        } @catch (NSException *e) {}
+    }
     return NULL;
 }
 // ═══ v7.31: 复核线程冷冻器 ═══
@@ -1383,19 +1406,29 @@ static ACE_pc_fn g_real_pc = NULL;
 static int ACE_pc_gate(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg) {
     if (g_tgt_base && fn) {
         uintptr_t e = (uintptr_t)fn;
-        if (e == g_tgt_base + 0xaeda8ULL) {
-            if (t) *t = (pthread_t)0;
+        // v7.38: 黑名单扩容——看门狗(0xf26cc)/校验线程(0xf4650)入口即 getentropy
+        // 重播种 C(0xf2720/0xf46b4 实证), 播种后 canary 导数网(A/s10/s18/s20/chk)
+        // 全部过期, 安保初始化方程校验读新C比旧导数 → eq⑨-⑬必崩 → 主线程自毁。
+        // 主线程被钥匙串XPC阻塞的几ms恰好给这两线程调度窗口 → 20ms tick 必输。
+        // 拦孵化=根除重播种(v7.18-21 interpose 时代拦截过, 无握手副作用实证)。
+        if (e >= g_tgt_base && e < g_tgt_end) {
+            unsigned long off = (unsigned long)(e - g_tgt_base);
+            if (off == 0xaeda8UL || off == 0xf26ccUL || off == 0xf4650UL) {
+                if (t) *t = (pthread_t)0;
+                if (g_ace_ready && !g_ace_busy) {
+                    g_ace_busy = 1;
+                    ACETrace(@"[gate] 拦下安保线程孵化 entry=+0x%lx %s (假成功)", off,
+                             off == 0xaeda8UL ? "复核巨函数" :
+                             (off == 0xf26ccUL ? "看门狗(C重播种者)" : "校验线程(C重播种者)"));
+                    g_ace_busy = 0;
+                }
+                return 0;
+            }
             if (g_ace_ready && !g_ace_busy) {
                 g_ace_busy = 1;
-                ACETrace(@"[gate] 拦下复核线程孵化 entry=+0xaeda8 (假成功, 杀手未出生)");
+                ACETrace(@"[gate] 靶场线程孵化放行 entry=+0x%lx", off);
                 g_ace_busy = 0;
             }
-            return 0;
-        }
-        if (e >= g_tgt_base && e < g_tgt_end && g_ace_ready && !g_ace_busy) {
-            g_ace_busy = 1;
-            ACETrace(@"[gate] 靶场线程孵化放行 entry=+0x%lx", (unsigned long)(e - g_tgt_base));
-            g_ace_busy = 0;
         }
     }
     return g_real_pc(t, a, fn, arg);
@@ -1703,7 +1736,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.37 启动 ===");
+            ACETrace(@"=== v7.38 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
