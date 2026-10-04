@@ -7,6 +7,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach.h>
+#import <mach/mach_time.h>   // v7.23: mach_absolute_time 声明(新SDK不再随 mach.h 带出)
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <dlfcn.h>
