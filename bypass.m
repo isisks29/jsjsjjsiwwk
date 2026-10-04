@@ -508,6 +508,7 @@ static void *ACE_flight_recorder(void *arg) {
     if (!real_tt) { ACETrace(@"[rec] 真实task_threads解析失败, 线程采样不可用"); return NULL; }
     ACETrace(@"[rec] 采样启动 real_tt=%p", (void *)real_tt);
     int burstfd = -1, was_burst = 0;
+    long long burst_bytes = 0;   // v7.27: burst 文件字节计数(6MB 上限)
     for (;;) {
         long long nowt = (long long)time(NULL);
         int burst = (g_burst_until != 0 && nowt <= g_burst_until);
@@ -515,6 +516,7 @@ static void *ACE_flight_recorder(void *arg) {
             if (burstfd >= 0) close(burstfd);
             NSString *bp2 = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ace_burst.txt"];
             burstfd = open(bp2.fileSystemRepresentation, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            burst_bytes = 0;
             ACETrace(@"[burst] 高精度采样启动 fd=%d", burstfd);
         } else if (!burst && was_burst) {
             if (burstfd >= 0) { close(burstfd); burstfd = -1; }
@@ -529,6 +531,8 @@ static void *ACE_flight_recorder(void *arg) {
         char line[240]; int p = 0;
         memcpy(line, "PC:", 3); p = 3;
         static const char *hd = "0123456789abcdef";
+        char blk[4096]; int bq = 0;   // v7.27: burst 全线程块(单次 write, 降扰动)
+        unsigned sweep = 0;
         for (unsigned i = 0; i < n && p < 200; i++) {
             unsigned long long stt[34];
             memset(stt, 0, sizeof(stt));
@@ -543,21 +547,26 @@ static void *ACE_flight_recorder(void *arg) {
                     line[p++] = ' ';
                     for (int k = 28; k >= 0; k -= 4) line[p++] = hd[(off >> k) & 0xf];
                 }
-                // v7.25: burst 期间「PC 或 LR 在靶场」的线程逐条记录(300µs 粒度, 带线程序号)
-                // 行格式: T/t(PC是否在靶场) + 线程序号2hex + P + 偏移 + L + 偏移
-                if (burstfd >= 0 && (inT || lrInT)) {
-                    char ob[80]; int q = 0;
-                    ob[q++] = inT ? 'T' : 't';
-                    ob[q++] = hd[(i >> 4) & 0xf];
-                    ob[q++] = hd[i & 0xf];
-                    ob[q++] = 'P'; ace_hex16(ob + q, inT ? pc - g_tgt_base : pc); q += 16;
-                    ob[q++] = 'L'; ace_hex16(ob + q, lrInT ? lr - g_tgt_base : lr); q += 16;
-                    ob[q++] = '\n';
-                    write(burstfd, ob, (size_t)q);
+                // v7.27: burst 期间记录【全部线程】——凶手线程死前多在 libsystem(不在靶场),
+                // 旧过滤器把它挡掉了。全线程最后一拍 = 每条线程死前位置, 真凶必现形。
+                if (burstfd >= 0 && bq < 3900) {
+                    blk[bq++] = inT ? 'T' : 't';
+                    blk[bq++] = hd[(i >> 4) & 0xf];
+                    blk[bq++] = hd[i & 0xf];
+                    blk[bq++] = 'P'; ace_hex16(blk + bq, inT ? pc - g_tgt_base : pc); bq += 16;
+                    blk[bq++] = 'L'; ace_hex16(blk + bq, lrInT ? lr - g_tgt_base : lr); bq += 16;
+                    blk[bq++] = '\n';
+                    sweep = i + 1;
                 }
             }
         }
-
+        if (burstfd >= 0 && bq > 0 && burst_bytes < 6 * 1024 * 1024) {
+            char sm[12]; int sq = 0;
+            sm[sq++] = 'S'; sm[sq++] = hd[(sweep >> 4) & 0xf]; sm[sq++] = hd[sweep & 0xf]; sm[sq++] = '\n';
+            write(burstfd, sm, (size_t)sq);
+            int w1 = (int)write(burstfd, blk, (size_t)bq);
+            burst_bytes += sq + (w1 > 0 ? w1 : 0);   // 6MB 上限防写爆
+        }
         
         line[p] = 0;
         vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
@@ -1403,7 +1412,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.26 启动 ===");
+            ACETrace(@"=== v7.27 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
