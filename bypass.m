@@ -308,7 +308,7 @@ static void ACE_report_last_crash(void) {
             NSString *bs = [[NSString alloc] initWithData:bd4 encoding:NSUTF8StringEncoding];
             if (bs) {
                 NSUInteger BL = [bs length];
-                NSString *btail = (BL > 3000) ? [bs substringFromIndex:BL - 3000] : bs;
+                NSString *btail = (BL > 6000) ? [bs substringFromIndex:BL - 6000] : bs;
                 ACETrace(@"===== 上次死前高精度采样(末尾=最接近死亡) =====\n%@", btail);
                 [UIPasteboard generalPasteboard].string =
                     [NSString stringWithFormat:@"[aceburst]\n%@", btail];
@@ -521,37 +521,43 @@ static void *ACE_flight_recorder(void *arg) {
             ACETrace(@"[burst] 采样窗口结束");
         }
         was_burst = burst;
-        usleep(burst ? 1000 : 50000);
+        usleep(burst ? 300 : 50000);   // v7.25: burst 提到 300µs
         if (!g_tgt_base) continue;
         thread_act_array_t list = NULL;
         mach_msg_type_number_t n = 0;
         if (real_tt(mach_task_self(), &list, &n) != KERN_SUCCESS || !list) continue;
         char line[240]; int p = 0;
         memcpy(line, "PC:", 3); p = 3;
+        static const char *hd = "0123456789abcdef";
         for (unsigned i = 0; i < n && p < 200; i++) {
             unsigned long long stt[34];
             memset(stt, 0, sizeof(stt));
             mach_msg_type_number_t c = 68;
             if (thread_get_state(list[i], ACE_ARM64_STATE, (thread_state_t)stt, &c) == 0 && c >= 66) {
                 unsigned long long pc = stt[32];
-                if (pc >= g_tgt_base && pc < g_tgt_end) {
-                    static const char *hd = "0123456789abcdef";
+                unsigned long long lr = stt[30];
+                int inT = (pc >= g_tgt_base && pc < g_tgt_end);
+                int lrInT = (lr >= g_tgt_base && lr < g_tgt_end);
+                if (inT) {
                     unsigned long long off = pc - g_tgt_base;
                     line[p++] = ' ';
                     for (int k = 28; k >= 0; k -= 4) line[p++] = hd[(off >> k) & 0xf];
-                    // v7.17: burst 期间 PC+LR 逐条直写文件(1ms 粒度抓处决瞬间)
-                    if (burstfd >= 0) {
-                        char ob[80]; int q = 0;
-                        ob[q++] = 'P'; ace_hex16(ob + q, off); q += 16;
-                        unsigned long long lr = stt[30];
-                        ob[q++] = 'L';
-                        ace_hex16(ob + q, (lr >= g_tgt_base && lr < g_tgt_end) ? lr - g_tgt_base : lr);
-                        q += 16;
-                        ob[q++] = '\n';
-                        write(burstfd, ob, (size_t)q);
-                    }
+                }
+                // v7.25: burst 期间「PC 或 LR 在靶场」的线程逐条记录(300µs 粒度, 带线程序号)
+                // 行格式: T/t(PC是否在靶场) + 线程序号2hex + P + 偏移 + L + 偏移
+                if (burstfd >= 0 && (inT || lrInT)) {
+                    char ob[80]; int q = 0;
+                    ob[q++] = inT ? 'T' : 't';
+                    ob[q++] = hd[(i >> 4) & 0xf];
+                    ob[q++] = hd[i & 0xf];
+                    ob[q++] = 'P'; ace_hex16(ob + q, inT ? pc - g_tgt_base : pc); q += 16;
+                    ob[q++] = 'L'; ace_hex16(ob + q, lrInT ? lr - g_tgt_base : lr); q += 16;
+                    ob[q++] = '\n';
+                    write(burstfd, ob, (size_t)q);
                 }
             }
+        }
+
         }
         line[p] = 0;
         vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(mach_port_t));
@@ -1397,7 +1403,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.24 启动 ===");
+            ACETrace(@"=== v7.25 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
