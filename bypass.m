@@ -127,8 +127,10 @@ static int ACE_nanosleep(const struct timespec *rqtp, struct timespec *rmtp) {
 // (0xf8308/0xf83d0, getpid+kill 裸svc)就在校验线程函数体内, 且该函数含 AC 01 协议帧
 // 校验(0xf4884 cmp w8,#0xac) → 成功路径孵化校验线程 → 连服务器复核 → 假卡必死。
 // 修法: 拦截 pthread_create, 靶场安保线程(入口+0xf26cc/+0xf4650)直接不孵化。
+static void ACE_ensure_tgt_base(void);   // v7.19 前置声明(定义在镜像识别段之后)
 static int ACE_pthread_create(pthread_t *t, const pthread_attr_t *a,
                               void *(*fn)(void *), void *arg) {
+    if (fn) ACE_ensure_tgt_base();   // v7.19: 构造器期孵化也要能拦——基址现场解析
     if (g_tgt_base && fn) {
         uintptr_t e = (uintptr_t)fn;
         if (e >= g_tgt_base && e < g_tgt_end) {
@@ -878,6 +880,33 @@ static const struct mach_header *ACE_find_target_header(void) {
     }
     return NULL;
 }
+// v7.19: 提前解析靶场基址(pthread_create 拦截在构造器期就要工作, 等不到 install_result_hook)
+static int g_ensure_tried = 0;
+static void ACE_ensure_tgt_base(void) {
+    if (g_tgt_base) return;
+    if (g_ensure_tried > 200) return;   // 找不到就别每次 pthread_create 都全量扫描
+    g_ensure_tried++;
+    const struct mach_header *hdr = ACE_find_target_header();
+    if (!hdr) return;
+    uintptr_t base = (uintptr_t)hdr;
+    uint64_t textsize = 0x3e8000;
+    ACELoadCmdHdr *c = (ACELoadCmdHdr *)(base + sizeof(struct mach_header_64));
+    for (uint32_t i = 0; i < ((const struct mach_header_64 *)hdr)->ncmds; i++) {
+        if (c->cmd == LC_SEGMENT_64) {
+            const ACESegCmd64 *s64 = (const ACESegCmd64 *)c;
+            if (s64->vmaddr == 0 && s64->vmsize > 0 && s64->vmsize < 0x10000000ULL &&
+                strncmp(s64->segname, "__PAGEZERO", 16) != 0) { textsize = s64->vmsize; break; }
+        }
+        c = (ACELoadCmdHdr *)((uintptr_t)c + c->cmdsize);
+    }
+    g_tgt_base = base;
+    g_tgt_end = base + (uintptr_t)textsize;
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[pc] 靶场基址提前解析=%p (构造器期拦截已就绪)", (void *)base);
+        g_ace_busy = 0;
+    }
+}
 // v7.3: symoff/stroff/indirectsymoff 是文件偏移, 必须按段表换算成运行时地址
 static uintptr_t ace_off2va(uintptr_t base, const uint64_t (*smap)[4], unsigned n, uint32_t off) {
     for (unsigned i = 0; i < n; i++) {
@@ -1164,7 +1193,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.18 启动 ===");
+            ACETrace(@"=== v7.19 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
