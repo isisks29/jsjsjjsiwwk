@@ -185,8 +185,7 @@ ACE_INTERPOSE(ACE_task_threads,         task_threads)
 ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
-ACE_INTERPOSE(ACE_nanosleep,            nanosleep)
-ACE_INTERPOSE(ACE_pthread_create,       pthread_create)
+
 
 // ══════════════ 第 0.6 层：验卡结果改写（作业主机制）══════════════
 typedef struct {
@@ -599,7 +598,7 @@ static void *ACE_endtime_keeper(void *arg) {
     return NULL;
 }
 static void *ACE_ctx_monitor(void *arg);   // v7.13 前置声明(定义在下方)
-static void *ACE_bp_installer(void *arg);  // v7.14 前置声明(定义在下方)
+
 static void ACE_install_v79_threads(void) {
     pthread_t th;
     pthread_attr_t at;
@@ -608,7 +607,7 @@ static void ACE_install_v79_threads(void) {
     pthread_create(&th, &at, ACE_flight_recorder, NULL);
     pthread_create(&th, &at, ACE_endtime_keeper, NULL);
     pthread_create(&th, &at, ACE_ctx_monitor, NULL);
-    pthread_create(&th, &at, ACE_bp_installer, NULL);
+    
     pthread_attr_destroy(&at);
     ACETrace(@"v7.9 飞行记录器+EndTime守护已启动");
 }
