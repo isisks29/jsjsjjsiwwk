@@ -208,7 +208,7 @@ typedef struct { uint32_t n_strx; uint8_t n_type; uint8_t n_sect; uint16_t n_des
 static uintptr_t g_tgt_base = 0, g_tgt_end = 0;
 static void *g_saved_slot_val = NULL;
 static int g_rw_dialog = 0, g_rw_boot = 0;
-
+static void ACE_web_tick(void);   // v7.24 前置声明(定义在守护线程段)
 // ═══ v7.4: EndTime 补喂 ═══
 static void ACE_prime_endtime(void) {
     @try {
@@ -225,6 +225,7 @@ static void ACE_prime_endtime(void) {
             ACETrace(@"[prime] EndTime(int64) %lld → %lld (now+3650天)", *endp, target);
             *endp = target;
         }
+        ACE_web_tick();   // v7.24: 到期值一动, 立刻同步重建封印网(消除 canary 失配窗口)
     } @catch (NSException *e) {}
 }
 
@@ -635,6 +636,76 @@ static void *ACE_clock_keeper(void *arg) {
     }
     return NULL;
 }
+// ═══ v7.24: 封印网守护(安保初始化 11 道 canary 校验方程的伪造器) ═══
+// 实证(0xf1eec-0xf2164): 成功后安保初始化校验一张"封印网":
+//   全局链 [0x3ff6a0/a8/ac/b0] = 单调秒种子S的哈希链 + 45000s 新鲜度窗;
+//   ctx 绑定: +0x78(到期)^canary(+0x119a)^magic == +0x11a2; +0x8e/+0x92/ctx[0]
+//   各与 canary 槽(+0x11aa/+0x11b2/+0x11ba, 经 C>>7/>>13/>>19)绑定; +0x11c2=混合校验和。
+// 真流程该网由验卡函数解析服务器成功响应时构建; -404 错误响应 → 网空 →
+// 第一道 cbz [0x3ff6a8] → exit_group(9)。守护: 每 20ms 按同款公式解方程回写。
+static uint32_t ACE_mix32(uint32_t x) {
+    x ^= x >> 15; x *= 0x1f3d6a71u; x ^= x >> 11; x *= 0x8e4b1395u; x ^= x >> 17;
+    return x;
+}
+static void ACE_web_tick(void) {
+    @try {
+        if (!g_tgt_base) return;
+        // ── ① 全局时钟哈希链(时间相关, 持续刷新保证新鲜度窗) ──
+        volatile uint32_t *tb = (volatile uint32_t *)(g_tgt_base + 0x3f6b40);
+        uint32_t num = tb[0], den = tb[1];
+        if (num == 0 || den == 0) {
+            mach_timebase_info_data_t ti; mach_timebase_info(&ti);
+            num = ti.numer; den = ti.denom;
+            tb[0] = num; tb[1] = den;
+        }
+        uint64_t ns = (uint64_t)mach_absolute_time();
+        if (den) ns = ns * num / den;
+        uint64_t S = ns / 1000000000ULL;             // 单调秒 = 校验方的种子
+        uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
+        *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) = S ^ 0xb75e8052badb72a6ULL;
+        uint32_t a8 = ACE_mix32(Slo ^ 0xd18ddb25u);
+        *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8) = a8;
+        uint32_t t2 = a8 ^ 0x1767cedcu;
+        t2 ^= t2 >> 15; t2 *= 0x1f3d6a71u; t2 ^= t2 >> 11; t2 *= 0x8e4b1395u;
+        uint32_t ac = Slo ^ (t2 >> 17) ^ t2;
+        *(volatile uint32_t *)(g_tgt_base + 0x3ff6ac) = ac;
+        uint32_t t3 = ac ^ 0x5d41c293u;
+        t3 ^= t3 >> 15; t3 *= 0x1f3d6a71u; t3 ^= t3 >> 11; t3 *= 0x8e4b1395u;
+        uint32_t b0 = Shi ^ (t3 >> 17) ^ t3;
+        *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0) = b0;
+        // ── ② ctx canary 网(时间无关, 每 tick 自洽重建) ──
+        uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
+        if (ctx < 0x100000000ULL) return;
+        volatile long long *endp = (volatile long long *)(ctx + 0x78);
+        long long nowll = (long long)time(NULL);
+        if (*endp < nowll + 86400LL) *endp = nowll + 3650LL * 86400LL;
+        volatile uint32_t *p8e = (volatile uint32_t *)(ctx + 0x8e);
+        volatile uint32_t *p92 = (volatile uint32_t *)(ctx + 0x92);
+        if (*p8e == 0) *p8e = 0x61636561u;           // 武装标志: 任意非零
+        if (*p92 == 0) *p92 = 0x61636562u;
+        uint64_t C = *(volatile uint64_t *)(ctx + 0x119a);
+        if (C == 0) { C = 0xc6a45bd1a793e995ULL; *(volatile uint64_t *)(ctx + 0x119a) = C; }
+        uint64_t E = (uint64_t)*endp;
+        uint64_t A = E ^ C ^ 0xa5c3e1f7b6d2489aULL;
+        *(volatile uint64_t *)(ctx + 0x11a2) = A;
+        uint32_t V8e = *p8e, V92 = *p92, C0 = *(volatile uint32_t *)ctx;
+        uint32_t s10 = V8e ^ (uint32_t)(C >> 7)  ^ 0x4a9b5206u;
+        uint32_t s18 = V92 ^ (uint32_t)(C >> 13) ^ 0x8c1a73e5u;
+        uint32_t s20 = C0  ^ (uint32_t)(C >> 19) ^ 0x5f8a16e3u;
+        *(volatile uint32_t *)(ctx + 0x11aa) = s10;
+        *(volatile uint32_t *)(ctx + 0x11b2) = s18;
+        *(volatile uint32_t *)(ctx + 0x11ba) = s20;
+        uint32_t m = (uint32_t)(A >> 32) ^ (uint32_t)A;
+        m *= 0x45d9f3b7u; m ^= s10; m *= 0x8e4b1395u; m ^= s18;
+        m *= 0x1f3d6a71u; m ^= s20; m ^= m >> 16;
+        *(volatile uint32_t *)(ctx + 0x11c2) = m;
+    } @catch (NSException *e) {}
+}
+static void *ACE_web_keeper(void *arg) {
+    (void)arg;
+    for (;;) { usleep(20000); ACE_web_tick(); }
+    return NULL;
+}
 static void *ACE_ctx_monitor(void *arg);   // v7.13 前置声明(定义在下方)
 
 static void ACE_install_v79_threads(void) {
@@ -643,7 +714,8 @@ static void ACE_install_v79_threads(void) {
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_create(&th, &at, ACE_flight_recorder, NULL);
-    pthread_create(&th, &at, ACE_endtime_keeper, NULL);
+    // v7.24: endtime keeper 并入 web tick(单写者, 消除竞态)
+    pthread_create(&th, &at, ACE_web_keeper, NULL);      // v7.24: 封印网守护
     pthread_create(&th, &at, ACE_clock_keeper, NULL);   // v7.23: 时钟一致性守护
     pthread_create(&th, &at, ACE_ctx_monitor, NULL);
     
@@ -1325,7 +1397,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             g_ace_busy = 1;
-            ACETrace(@"=== v7.23 启动 ===");
+            ACETrace(@"=== v7.24 启动 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
