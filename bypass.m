@@ -27,6 +27,7 @@
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import <errno.h>
+#include <libkern/OSCacheControl.h>
 
 // ══════════════ 第 0 层：隐身（对靶场的 dyld/调试探测不可见）══════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
