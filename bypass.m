@@ -481,6 +481,7 @@ static int g_exc_skip = 0;
 // → 恢复RW → KERN_SUCCESS重执行。x9=硬件亲手算的读地址, 无可争辩。
 static volatile int g_addrTrapArmed = 0;
 static volatile long g_addrTrapCnt = 0;
+static volatile long g_addrTrapRounds = 0;   // v7.69: 已装弹帧数(限前20帧, 缩小暴露窗口)
 static unsigned long long g_trapPCs[3];
 static unsigned long long g_trapRegs[3][34];
 static void *ACE_exc_server(void *arg) {
@@ -525,21 +526,29 @@ static void *ACE_exc_server(void *arg) {
         rep.head.msgh_local_port = MACH_PORT_NULL;
         rep.head.msgh_id = 2501;
         rep.NDR = NDR_record;
-        if (req.exception == EXC_BAD_ACCESS && g_addrTrapArmed) {
-            // v7.68 地址陷阱: 无条件恢复S链页RW(防其它线程误触卡死), 记录前3次现场
+        if (req.exception == EXC_BAD_ACCESS) {
+            // v7.69 修正: .ips实锤崩溃=NSURLSession后台线程(SkyEye遥测, 读base+0x3fc358)
+            // 撞进陷阱页, 恰逢armed=0间隙 → 旧条件判KERN_FAILURE → SIGBUS死。
+            // 现在: 陷阱页(0x3fc000,16KB)内任何线程的BAD_ACCESS无条件恢复RW+重执行;
+            // 仅 armed && PC在draw门段(0x8cdd4-0x8de8c) 时记录现场(滤后台噪音)。
             uintptr_t faddr = (uintptr_t)req.code[1];
             uintptr_t pgBase = g_tgt_base ? (g_tgt_base + 0x3fc000ULL) : 0;
-            mprotect((void *)pgBase, 16384, PROT_READ | PROT_WRITE);
             if (pgBase && faddr >= pgBase && faddr < pgBase + 16384ULL) {
-                long n = g_addrTrapCnt;
-                if (n < 3) {
-                    g_trapPCs[n] = pc;
-                    int lim = (int)(cnt / 2); if (lim > 34) lim = 34;
-                    for (int i = 0; i < lim; i++) g_trapRegs[n][i] = st[i];
+                mprotect((void *)pgBase, 16384, PROT_READ | PROT_WRITE);
+                if (g_addrTrapArmed && g_tgt_base
+                        && pc >= g_tgt_base + 0x8cdd4ULL && pc < g_tgt_base + 0x8de8cULL) {
+                    long n = g_addrTrapCnt;
+                    if (n < 3) {
+                        g_trapPCs[n] = pc;
+                        int lim = (int)(cnt / 2); if (lim > 34) lim = 34;
+                        for (int i = 0; i < lim; i++) g_trapRegs[n][i] = st[i];
+                    }
+                    g_addrTrapCnt = n + 1;
                 }
-                g_addrTrapCnt = n + 1;
+                rep.retCode = KERN_SUCCESS;   // 重执行故障指令(页已恢复RW)
+            } else {
+                rep.retCode = KERN_FAILURE;   // 陷阱页之外的真野指针 → 常规崩溃流程
             }
-            rep.retCode = KERN_SUCCESS;   // 重执行故障指令(页已恢复RW)
         } else if (req.exception == EXC_BREAKPOINT && pc && g_exc_skip < 64) {
             st[32] = pc + 4;   // 跳过 brk, 拆掉自毁
             cnt = 68;
@@ -2257,16 +2266,19 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
             }
         }
     } @catch (NSException *e) {}
-    // ═══ v7.68 地址陷阱装弹: S链页(base+0x3fc000,16KB)设PROT_NONE ═══
-    if (g_tgt_base) {
-        g_addrTrapCnt = 0;
+    // ═══ v7.69 地址陷阱装弹(仅前20帧, 缩小暴露窗口; 记录不再每帧清零) ═══
+    // unarm顺序: 先恢复RW再清armed — armed=1期间任何残留trap仍被handler无条件救活
+    int doTrap = (g_tgt_base && g_addrTrapRounds < 20);
+    if (doTrap) {
+        g_addrTrapRounds++;
         g_addrTrapArmed = 1;
         mprotect((void *)(g_tgt_base + 0x3fc000ULL), 16384, PROT_NONE);
     }
     if (g_orig_draw) g_orig_draw(self, _cmd, view);
-    g_addrTrapArmed = 0;
-    if (g_tgt_base) mprotect((void *)(g_tgt_base + 0x3fc000ULL), 16384, PROT_READ | PROT_WRITE);
-    // v7.67: 冻结期内先读水印(防keeper防复毒逻辑抹掉证据), 再解冻
+    if (doTrap) {
+        mprotect((void *)(g_tgt_base + 0x3fc000ULL), 16384, PROT_READ | PROT_WRITE);
+        g_addrTrapArmed = 0;
+    }
     uint32_t wm0 = 0, wm1 = 0, wm2 = 0;
     @try {
         if (g_tgt_base) {
@@ -3011,7 +3023,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.68 启动（+地址陷阱: PROT_NONE钓出原实现真实读地址+全寄存器现场, 硬件亲口招供）===");
+            ACETrace(@"=== v7.69 启动（陷阱修复: handler无条件救活陷阱页BAD_ACCESS+PC过滤记录+仅前20帧装弹）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
