@@ -2099,7 +2099,37 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
             }
         }
     } @catch (NSException *e) {}
+        // ═══ v7.63 帧内同步快照喂值 — 物理消除跨线程撕裂 ═══
+    // verdict已裁决: origOff=8cdd4✓ tb=125/3/1✓ 失败分支=帧数(100%) b0每帧1→0
+    // 第一帧preH=0→postH=1, 而事前评估bits=0x0全过。同线程同地址同公式结果却不同,
+    // 唯一未排除的物理变量 = keeper(后台线程,1ms/20ms)在原实现读门期间改写S链:
+    // keeper写序是先S(0x3ff6a0)后a8/ac/b0 → 原实现若读到"新S+旧a8"则eq②必挂。
+    // 手段: 冻结keeper→等在途tick落地(usleep 2ms)→主线程同步写一组同源自洽快照
+    // →调原实现→解冻。撕裂窗口=0(单线程串行)。
+    // 裁决: 面板出/失败分支=0 → 撕裂实锤+交付; 仍100%失败 → 撕裂证伪,
+    // 下一步帧内dump S链槽原始值+各门期望值逐项对照。
+    g_freeze_web = 1;
+    usleep(2000);
+    @try {
+        if (g_tgt_base) {
+            mach_timebase_info_data_t ti3; mach_timebase_info(&ti3);
+            uint64_t Ss = (mach_absolute_time() * (uint64_t)ti3.numer / (uint64_t)ti3.denom) / 1000000ULL;
+            uint32_t SloS = (uint32_t)Ss, ShiS = (uint32_t)(Ss >> 32);
+            uint32_t a8s = ACE_mix32((SloS ^ ShiS) ^ 0xd18ddb25u);
+            uint32_t t2s = a8s ^ 0x1767cedcu;
+            t2s ^= t2s >> 15; t2s *= 0x1f3d6a71u; t2s ^= t2s >> 11; t2s *= 0x8e4b1395u;
+            uint32_t acs = SloS ^ (t2s >> 17) ^ t2s;
+            uint32_t t3s = acs ^ 0x5d41c293u;
+            t3s ^= t3s >> 15; t3s *= 0x1f3d6a71u; t3s ^= t3s >> 11; t3s *= 0x8e4b1395u;
+            uint32_t b0s = ShiS ^ (t3s >> 17) ^ t3s;
+            *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL) = a8s;
+            *(volatile uint32_t *)(g_tgt_base + 0x3ff6acULL) = acs;
+            *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0ULL) = b0s;
+            *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) = Ss ^ 0xb75e8052badb72a6ULL;
+        }
+    } @catch (NSException *e) {}
     if (g_orig_draw) g_orig_draw(self, _cmd, view);
+    g_freeze_web = 0;
     // ── post: 当场验尸 ──
     @try {
         uint8_t postB0 = vsw ? *vsw : 0;
@@ -2793,7 +2823,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.62 启动（+帧级裁决探针: 原实现前后读hidden/byte0+IMP偏移, 一次调用当场裁决失败分支归属）===");
+            ACETrace(@"=== v7.63 启动（+帧内同步快照喂值: 冻结keeper→写自洽S链→调原实现, 物理消除撕裂）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
