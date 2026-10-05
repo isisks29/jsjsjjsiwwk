@@ -27,6 +27,7 @@
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import <errno.h>
+#import <sys/mman.h>      // v7.68: 地址陷阱 mprotect
 #include <libkern/OSCacheControl.h>
 
 // ══════════════ 第 0 层：隐身（对靶场的 dyld/调试探测不可见）══════════════
@@ -472,6 +473,16 @@ typedef struct {
 } ACEExcReply;
 static mach_port_t g_exc_port = 0;
 static int g_exc_skip = 0;
+// ═══ v7.68 地址陷阱: PROT_NONE 让原实现对 S 链页的第一次读亲口报出真实地址 ═══
+// 门段代码指纹一致+数值python复算一致+无写者, 硬件仍100%判挂在前四门 →
+// 唯一未直接验证的物理量 = adrp 在硬件上算出的实际读取地址与现场寄存器。
+// 快照后把 base+0x3fc000(16KB, 覆盖0x3ff6a0-6b0)设PROT_NONE → 原实现门1
+// ldr w8,[x9](0x8ce24)触发EXC_BAD_ACCESS → handler记录PC+fault地址+全寄存器
+// → 恢复RW → KERN_SUCCESS重执行。x9=硬件亲手算的读地址, 无可争辩。
+static volatile int g_addrTrapArmed = 0;
+static volatile long g_addrTrapCnt = 0;
+static unsigned long long g_trapPCs[3];
+static unsigned long long g_trapRegs[3][34];
 static void *ACE_exc_server(void *arg) {
     (void)arg;
     for (;;) {
@@ -514,7 +525,22 @@ static void *ACE_exc_server(void *arg) {
         rep.head.msgh_local_port = MACH_PORT_NULL;
         rep.head.msgh_id = 2501;
         rep.NDR = NDR_record;
-        if (req.exception == EXC_BREAKPOINT && pc && g_exc_skip < 64) {
+        if (req.exception == EXC_BAD_ACCESS && g_addrTrapArmed) {
+            // v7.68 地址陷阱: 无条件恢复S链页RW(防其它线程误触卡死), 记录前3次现场
+            uintptr_t faddr = (uintptr_t)req.code[1];
+            uintptr_t pgBase = g_tgt_base ? (g_tgt_base + 0x3fc000ULL) : 0;
+            mprotect((void *)pgBase, 16384, PROT_READ | PROT_WRITE);
+            if (pgBase && faddr >= pgBase && faddr < pgBase + 16384ULL) {
+                long n = g_addrTrapCnt;
+                if (n < 3) {
+                    g_trapPCs[n] = pc;
+                    int lim = (int)(cnt / 2); if (lim > 34) lim = 34;
+                    for (int i = 0; i < lim; i++) g_trapRegs[n][i] = st[i];
+                }
+                g_addrTrapCnt = n + 1;
+            }
+            rep.retCode = KERN_SUCCESS;   // 重执行故障指令(页已恢复RW)
+        } else if (req.exception == EXC_BREAKPOINT && pc && g_exc_skip < 64) {
             st[32] = pc + 4;   // 跳过 brk, 拆掉自毁
             cnt = 68;
             g_exc_skip++;
@@ -2231,7 +2257,15 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
             }
         }
     } @catch (NSException *e) {}
+    // ═══ v7.68 地址陷阱装弹: S链页(base+0x3fc000,16KB)设PROT_NONE ═══
+    if (g_tgt_base) {
+        g_addrTrapCnt = 0;
+        g_addrTrapArmed = 1;
+        mprotect((void *)(g_tgt_base + 0x3fc000ULL), 16384, PROT_NONE);
+    }
     if (g_orig_draw) g_orig_draw(self, _cmd, view);
+    g_addrTrapArmed = 0;
+    if (g_tgt_base) mprotect((void *)(g_tgt_base + 0x3fc000ULL), 16384, PROT_READ | PROT_WRITE);
     // v7.67: 冻结期内先读水印(防keeper防复毒逻辑抹掉证据), 再解冻
     uint32_t wm0 = 0, wm1 = 0, wm2 = 0;
     @try {
@@ -2273,9 +2307,26 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         uint64_t nowNs2 = mach_absolute_time() * (uint64_t)ti2.numer / (uint64_t)ti2.denom;
         if (nowNs2 - vLastNs > 1000000000ULL && vCnt < 60) {
             vLastNs = nowNs2; vCnt++;
-            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 执行期改写=%ld 水印:自初始化=%ld 未到达=%ld(本帧槽=%x/%x/%x) | preH=%d→postH=%d b0:%d→%d",
-                     g_vTot, g_vFail, g_xw, g_wmHit, g_wmMiss, wm0, wm1, wm2,
+            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 执行期改写=%ld 水印:自初始化=%ld 未到达=%ld(槽=%x/%x/%x) 陷阱=%ld | preH=%d→postH=%d b0:%d→%d",
+                     g_vTot, g_vFail, g_xw, g_wmHit, g_wmMiss, wm0, wm1, wm2, g_addrTrapCnt,
                      preHid, postHid, (int)preB0, (int)postB0);
+            // v7.68: 陷阱现场一次性输出(前3次) — x9=硬件亲手算的门1读地址
+            static int trapLogged = 0;
+            if (!trapLogged && g_addrTrapCnt > 0) {
+                trapLogged = 1;
+                for (int n = 0; n < 3 && n < (int)g_addrTrapCnt; n++) {
+                    unsigned long long tpc = g_trapPCs[n];
+                    unsigned long long r8 = g_trapRegs[n][8], r9 = g_trapRegs[n][9];
+                    unsigned long long r10 = g_trapRegs[n][10], r22 = g_trapRegs[n][22];
+                    ACETrace(@"[trap#%d] PC=+%llx x8=+%llx x9=+%llx x10=+%llx x22=%llx (门1@8ce24时x9应=3ff6a8)",
+                             n,
+                             (unsigned long long)(tpc >= g_tgt_base ? tpc - g_tgt_base : tpc),
+                             (unsigned long long)(r8 >= g_tgt_base && r8 < g_tgt_base + 0x400000ULL ? r8 - g_tgt_base : r8),
+                             (unsigned long long)(r9 >= g_tgt_base && r9 < g_tgt_base + 0x400000ULL ? r9 - g_tgt_base : r9),
+                             (unsigned long long)(r10 >= g_tgt_base && r10 < g_tgt_base + 0x400000ULL ? r10 - g_tgt_base : r10),
+                             (unsigned long long)r22);
+                }
+            }
             g_vTot = 0; g_vFail = 0; g_xw = 0; g_wmHit = 0; g_wmMiss = 0;
         }
     } @catch (NSException *e) {}
@@ -2960,7 +3011,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.67 启动（+执行水印: 时间门自初始化陷阱, 硬件级判定执行流到达深度）===");
+            ACETrace(@"=== v7.68 启动（+地址陷阱: PROT_NONE钓出原实现真实读地址+全寄存器现场, 硬件亲口招供）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
