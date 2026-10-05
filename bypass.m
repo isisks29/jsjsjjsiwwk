@@ -1592,6 +1592,66 @@ static id ACE_dc(id self, SEL _cmd) {
     } @catch (NSException *e) {}
     return g_orig_dc ? g_orig_dc(self, _cmd) : nil;
 }
+// ═══ v7.44: 观察者注册探针 + 安保通知补发（面板激活链）═══
+// 靶场唯一 UI 创建观察者由 sub_11fa5c 注册, invoke=sub_11ffb0=建 UIView 加
+// keyWindow(左上角按钮/面板)。它等的通知由安保init尾段 0xf25c0 发出——安保init
+// 已被空操作(v7.43) → 通知没人发 → 面板不出。修法: 挂注册API现场捕获通知名,
+// 「授权成功」后补发。sub_11ffb0 幂等+内部svc均为getentropy(良性), 补发安全。
+#define ACE_OBS_MAX 8
+static NSString *g_obs_names[ACE_OBS_MAX];
+static int g_obs_n = 0;
+static void ACE_obs_capture(NSString *name, const char *api, uintptr_t ra) {
+    if (!name || ![name isKindOfClass:[NSString class]]) return;
+    @synchronized ([NSMutableArray class]) {
+        for (int i = 0; i < g_obs_n; i++)
+            if ([g_obs_names[i] isEqualToString:name]) return;
+        if (g_obs_n < ACE_OBS_MAX) g_obs_names[g_obs_n++] = [name copy];
+    }
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[obs] %s 注册观察者 name=[%@] caller=TGT+0x%lx", api, name,
+                 (unsigned long)(ra - g_tgt_base));
+        g_ace_busy = 0;
+    }
+}
+static id (*g_orig_addObs4)(id, SEL, NSString *, id, id, void *) = NULL;
+static id ACE_addObs4(id self, SEL _cmd, NSString *name, id obj, id queue, void *blk) {
+    @try {
+        uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+        if (g_tgt_base && ra >= g_tgt_base && ra < g_tgt_end)
+            ACE_obs_capture(name, "addObserverForName", ra);
+    } @catch (NSException *e) {}
+    return g_orig_addObs4 ? g_orig_addObs4(self, _cmd, name, obj, queue, blk) : nil;
+}
+static void (*g_orig_addObsSel)(id, SEL, id, SEL, NSString *, id) = NULL;
+static void ACE_addObsSel(id self, SEL _cmd, id observer, SEL sel, NSString *name, id obj) {
+    @try {
+        uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+        if (g_tgt_base && ra >= g_tgt_base && ra < g_tgt_end)
+            ACE_obs_capture(name, "addObserverSel", ra);
+    } @catch (NSException *e) {}
+    if (g_orig_addObsSel) g_orig_addObsSel(self, _cmd, observer, sel, name, obj);
+}
+static void ACE_post_sec_notif(int attempt) {
+    @try {
+        NSString *names[ACE_OBS_MAX]; int n;
+        @synchronized ([NSMutableArray class]) {
+            n = g_obs_n;
+            for (int i = 0; i < n; i++) names[i] = g_obs_names[i];
+        }
+        if (n == 0) { ACETrace(@"[notif-post] 尝试%d: 尚未捕获观察者通知名", attempt); return; }
+        NSNotificationCenter *c = [NSNotificationCenter defaultCenter];
+        for (int i = 0; i < n; i++) {
+            ACETrace(@"[notif-post] 尝试%d: 代发[%@] (激活UI创建链, 观察者幂等)", attempt, names[i]);
+            [c postNotificationName:names[i] object:nil];
+        }
+    } @catch (NSException *e) { ACETrace(@"[notif-post] 异常: %@", e); }
+}
+static void ACE_schedule_sec_posts(void) {
+    dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(1); });
+    dispatch_after(dispatch_time(0, 3000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(2); });
+    dispatch_after(dispatch_time(0, 6000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(3); });
+}
 static void ACE_install_notif_probe(void) {
     @try {
         Method m = class_getInstanceMethod([NSNotificationCenter class],
@@ -1601,9 +1661,18 @@ static void ACE_install_notif_probe(void) {
         // v7.41: defaultCenter 类方法探针(走廊二分)
         Method mdc = class_getClassMethod([NSNotificationCenter class],
                                           @selector(defaultCenter));
-        if (mdc) g_orig_dc = (id (*)(id, SEL))method_setImplementation(mdc, (IMP)ACE_dc);
-        ACETrace(@"通知中心探针已挂=%d defaultCenter=%d",
-                 g_orig_post2 != NULL, g_orig_dc != NULL);
+        // v7.44: 两个观察者注册API探针(捕获靶场等的通知名, 供补发)
+        Method m4 = class_getInstanceMethod([NSNotificationCenter class],
+                @selector(addObserverForName:object:queue:usingBlock:));
+        if (m4) g_orig_addObs4 = (id (*)(id, SEL, NSString *, id, id, void *))
+            method_setImplementation(m4, (IMP)ACE_addObs4);
+        Method m5 = class_getInstanceMethod([NSNotificationCenter class],
+                @selector(addObserver:selector:name:object:));
+        if (m5) g_orig_addObsSel = (void (*)(id, SEL, id, SEL, NSString *, id))
+            method_setImplementation(m5, (IMP)ACE_addObsSel);
+        ACETrace(@"通知中心探针已挂=%d defaultCenter=%d 观察者探针=%d%d",
+                 g_orig_post2 != NULL, g_orig_dc != NULL,
+                 g_orig_addObs4 != NULL, g_orig_addObsSel != NULL);
     } @catch (NSException *e) { ACETrace(@"notif探针异常: %@", e); }
 }
 // ═══ v7.43: 安保init block劫持空操作 ═══
@@ -1923,6 +1992,10 @@ static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
             [m containsString:@"到期"] || [m containsString:@"激活"]) {
             ACE_dump_ctx_full(@"成功弹窗");
         }
+        // v7.44: 「授权成功」= 验卡终点, 替空操作的安保init补发通知激活面板UI
+        if ([t containsString:@"授权成功"] || [t containsString:@"激活成功"]) {
+            ACE_schedule_sec_posts();
+        }
         g_ace_busy = 0;
     }
     return ((id (*)(id, SEL, id, id, NSInteger))g_alert_imp)(cls, _cmd, title, msg, style);
@@ -1947,7 +2020,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.43 启动（隐身层+安保init劫持 激活中）===");
+            ACETrace(@"=== v7.44 启动（隐身层+安保init劫持+通知补发 激活中）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -1977,6 +2050,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             @try { ACE_install_tel_hooks(); } @catch (NSException *e) { ACETrace(@"[tel] 安装异常: %@", e); }
             g_ace_busy = 0;
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
+            dispatch_after(dispatch_time(0, 8000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(0); });
             @try { ACE_start_net_probe(); } @catch (NSException *e) { ACETrace(@"[probe] 启动异常: %@", e); }
         }
     });
