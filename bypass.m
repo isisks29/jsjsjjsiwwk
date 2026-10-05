@@ -484,6 +484,61 @@ static volatile long g_addrTrapCnt = 0;
 static volatile long g_addrTrapRounds = 0;   // v7.69: 已装弹帧数(限前20帧, 缩小暴露窗口)
 static unsigned long long g_trapPCs[3];
 static unsigned long long g_trapRegs[3][34];
+// ═══ v7.71 信号层陷阱救援 — .ips 实锤 Mach 层收不到陷阱异常(重抢端口也没用,
+// Umeng 收集链在信号层截住), 但 _sigtramp→信号链可达。sigaction 抢回 SIGBUS/SIGSEGV:
+// si_addr 在陷阱页内 → mprotect RW → return 重执行故障指令; 并从 ucontext 记录
+// PC + 全寄存器(x9=门1硬件亲手算的读地址, 核心情报)。
+// 页外地址 → 转发旧 handler(Umeng/我方crash catcher), 保持崩溃上报链。
+static struct sigaction g_oldBus, g_oldSegv;
+static volatile int g_sigTrapReady = 0;
+static void ACE_trap_signal_handler(int sig, siginfo_t *si, void *uc) {
+    uintptr_t fa = (uintptr_t)(si ? si->si_addr : NULL);
+    uintptr_t pgBase = g_tgt_base ? (g_tgt_base + 0x3fc000ULL) : 0;
+    if (pgBase && fa >= pgBase && fa < pgBase + 16384ULL) {
+        mprotect((void *)pgBase, 16384, PROT_READ | PROT_WRITE);
+#if defined(__APPLE__)
+        if (uc) {
+            ucontext_t *uct = (ucontext_t *)uc;
+            uint64_t pc = (uint64_t)uct->uc_mcontext->__ss.__pc;
+            if (g_addrTrapArmed && g_tgt_base
+                    && pc >= g_tgt_base + 0x8cdd4ULL && pc < g_tgt_base + 0x8de8cULL) {
+                long n = g_addrTrapCnt;
+                if (n < 3) {
+                    g_trapPCs[n] = pc;
+                    for (int i = 0; i < 29; i++)
+                        g_trapRegs[n][i] = (unsigned long long)uct->uc_mcontext->__ss.__x[i];
+                    g_trapRegs[n][29] = (unsigned long long)uct->uc_mcontext->__ss.__fp;
+                    g_trapRegs[n][30] = (unsigned long long)uct->uc_mcontext->__ss.__lr;
+                    g_trapRegs[n][31] = (unsigned long long)uct->uc_mcontext->__ss.__sp;
+                    g_trapRegs[n][32] = pc;
+                }
+                g_addrTrapCnt = n + 1;
+            }
+        }
+#endif
+        return;   // 重执行故障指令(页已恢复RW)
+    }
+    // 陷阱页外: 恢复旧 handler 重发, 保持原崩溃链
+    struct sigaction *oldp = (sig == SIGBUS) ? &g_oldBus : &g_oldSegv;
+    if (oldp->sa_sigaction || oldp->sa_handler) sigaction(sig, oldp, NULL);
+    else signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void ACE_arm_signal_trap(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = ACE_trap_signal_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (!g_sigTrapReady) {
+        sigaction(SIGBUS, &sa, &g_oldBus);     // 保存旧handler(Umeng/crash catcher)供转发
+        sigaction(SIGSEGV, &sa, &g_oldSegv);
+        g_sigTrapReady = 1;
+    } else {
+        sigaction(SIGBUS, &sa, NULL);          // 重抢(防被再覆盖)
+        sigaction(SIGSEGV, &sa, NULL);
+    }
+}
 static void *ACE_exc_server(void *arg) {
     (void)arg;
     for (;;) {
@@ -2270,24 +2325,23 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                 }
             }
         }
-    } @catch (NSException *e) {}
-    // ═══ v7.69 地址陷阱装弹(仅前20帧, 缩小暴露窗口; 记录不再每帧清零) ═══
-    // unarm顺序: 先恢复RW再清armed — armed=1期间任何残留trap仍被handler无条件救活
+    } @catch (NSException *e) {}// ═══ v7.71 装弹: 信号层救援为主通道 + draw调用@try兜底(防异常穿透致页面残留) ═══
     int doTrap = (g_tgt_base && g_addrTrapRounds < 20);
     if (doTrap) {
         g_addrTrapRounds++;
-        // v7.70: 装弹前重抢 task 异常端口 — v7.69 .ips 实锤陷阱异常流到
-        // _sigtramp→UmengSignalHandler→NSException→abort(keeper/ctx_monitor两线程同死),
-        // 即端口已被 Umeng SDK(初始化晚于我方 constructor)覆盖, handler 收不到 trap。
-        // 每帧装弹前用真身 task_set_exception_ports 重新注册抢回(仅前20帧, µs级开销)。
-        if (g_real_tsep && g_exc_port)
+        ACE_arm_signal_trap();   // sigaction 抢回 SIGBUS/SIGSEGV(每帧重抢防覆盖)
+        if (g_real_tsep && g_exc_port)   // Mach 层双保险(能收到算赚)
             g_real_tsep(mach_task_self(),
                         EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BREAKPOINT,
                         g_exc_port, EXCEPTION_DEFAULT, ACE_ARM64_STATE);
         g_addrTrapArmed = 1;
         mprotect((void *)(g_tgt_base + 0x3fc000ULL), 16384, PROT_NONE);
     }
-    if (g_orig_draw) g_orig_draw(self, _cmd, view);
+    @try {
+        if (g_orig_draw) g_orig_draw(self, _cmd, view);
+    } @catch (NSException *e) {
+        ACETrace(@"[trap] draw异常穿透已兜底(页面即将恢复): %@", e);
+    }
     if (doTrap) {
         mprotect((void *)(g_tgt_base + 0x3fc000ULL), 16384, PROT_READ | PROT_WRITE);
         g_addrTrapArmed = 0;
@@ -3036,7 +3090,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.70 启动（陷阱崩溃修复: 装弹前重抢异常端口(Umeng覆盖实锤) + 自家线程武装期自旋）===");
+            ACETrace(@"=== v7.71 启动（信号层陷阱救援: sigaction抢回SIGBUS/SEGV+ucontext取x9+draw异常@try兜底防残留）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
