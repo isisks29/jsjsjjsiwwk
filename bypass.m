@@ -1999,6 +1999,73 @@ static void ACE_install_visible_ball(void) {
         ACETrace(@"[visball] ★可见球已装左上角(2,26 45×45), 点击=切换原生面板显隐");
     } @catch (NSException *e) { ACETrace(@"[visball] 异常: %@", e); }
 }
+// ═══ v7.57: 绘制层活体门仪表 ═══
+// 悖论: sub_11ffb0/巡检员sub_120e28/drawInMTKView 三个执行者读同一组16门,
+// 我们冻结态评估全过, 执行时却全失败(inv早退/拆台/MTKView hidden=1)。
+// 不再猜原因: swizzle drawInMTKView:, 调原实现前【当场】(=执行瞬间真值)评估16门,
+// 记录失败门位图+活值(限流1条/秒)。让执行者自己招供哪道门、读到了什么。
+// 位图: bit0=a8零 bit1=eq② bit2=eq③ bit3=eq④ bit4=时间门 bit5=ctx空 bit6=p8e
+//       bit7=p92 bit8=C零 bit9=eq⑨ bit10=eq⑩ bit11=eq⑪ bit12=eq⑫ bit13=eq⑬
+static void (*g_orig_draw)(id, SEL, id) = NULL;
+static void (*g_orig_73)(id, SEL, id) = NULL;
+static void ACE_hook_73(id self, SEL _cmd, id n) {
+    @try { ACETrace(@"[73] _0x73C9A1E5: 被调用(后台/resign通知→可能藏面板) notif=%@", n); } @catch (NSException *e) {}
+    if (g_orig_73) g_orig_73(self, _cmd, n);
+}
+static void ACE_hook_draw(id self, SEL _cmd, id view) {
+    @try {
+        if (g_tgt_base) {
+            static uint64_t lastNs = 0; static int cnt = 0;
+            mach_timebase_info_data_t ti; mach_timebase_info(&ti);
+            uint64_t nowNs = mach_absolute_time() * (uint64_t)ti.numer / (uint64_t)ti.denom;
+            if (cnt < 30 && nowNs - lastNs > 1000000000ULL) {
+                lastNs = nowNs;
+                uintptr_t B = g_tgt_base;
+                uint64_t S = *(volatile uint64_t *)(B + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
+                uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
+                uint32_t a8 = *(volatile uint32_t *)(B + 0x3ff6a8ULL);
+                uint32_t ac = *(volatile uint32_t *)(B + 0x3ff6acULL);
+                uint32_t b0 = *(volatile uint32_t *)(B + 0x3ff6b0ULL);
+                uint32_t e2 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);
+                uint32_t G = ACE_pmix32(a8 ^ 0x1767cedcu);
+                uint32_t e3 = (Slo ^ (G >> 17)) ^ G;
+                uint32_t H = ACE_pmix32(ac ^ 0x5d41c293u);
+                uint32_t e4 = (Shi ^ (H >> 17)) ^ H;
+                uint64_t ms = nowNs / 1000000ULL;
+                uintptr_t ctx = *(volatile uintptr_t *)(B + 0x3ff698ULL);
+                uint32_t p8e = 0, p92 = 0, c0 = 0, s10 = 0, s18 = 0, s20 = 0, chk = 0;
+                uint64_t C = 0, A = 0, E = 0;
+                if (ctx >= 0x100000000ULL) {
+                    p8e = *(volatile uint32_t *)(ctx + 0x8e); p92 = *(volatile uint32_t *)(ctx + 0x92);
+                    C = *(volatile uint64_t *)(ctx + 0x119a); A = *(volatile uint64_t *)(ctx + 0x11a2);
+                    E = *(volatile uint64_t *)(ctx + 0x78); c0 = *(volatile uint32_t *)ctx;
+                    s10 = *(volatile uint32_t *)(ctx + 0x11aa); s18 = *(volatile uint32_t *)(ctx + 0x11b2);
+                    s20 = *(volatile uint32_t *)(ctx + 0x11ba); chk = *(volatile uint32_t *)(ctx + 0x11c2);
+                }
+                uint32_t m = (uint32_t)(A >> 32) ^ (uint32_t)A;
+                m *= 0x45d9f3b7u; m ^= s10; m *= 0x8e4b1395u; m ^= s18;
+                m *= 0x1f3d6a71u; m ^= s20; m ^= m >> 16;
+                int f1 = (a8 == 0), f2 = (a8 != e2), f3 = (ac != e3), f4 = (b0 != e4);
+                int f5 = (ms < S || ms - S > 45000ULL);
+                int f6 = (ctx < 0x100000000ULL), f7 = (p8e == 0), f8 = (p92 == 0), f9 = (C == 0);
+                int f10 = (E != (C ^ A ^ 0xa5c3e1f7b6d2489aULL));
+                int f11 = (p8e != ((uint32_t)(C >> 7) ^ s10 ^ 0x4a9b5206u));
+                int f12 = (p92 != ((uint32_t)(C >> 13) ^ s18 ^ 0x8c1a73e5u));
+                int f13 = (c0 != ((uint32_t)(C >> 19) ^ s20 ^ 0x5f8a16e3u));
+                int f14 = (chk != m);
+                unsigned bits = (unsigned)(f1 | f2 << 1 | f3 << 2 | f4 << 3 | f5 << 4 | f6 << 5 |
+                                           f7 << 6 | f8 << 7 | f9 << 8 | f10 << 9 | f11 << 10 |
+                                           f12 << 11 | f13 << 12 | f14 << 13);
+                int hid = (int)((UIView *)self).hidden;
+                ACETrace(@"[drawgate] 活体评估 bits=0x%x c0=%x age=%lld hidden=%d S=%llu C=%llx",
+                         bits, c0, (long long)(ms - S), hid, (unsigned long long)S, (unsigned long long)C);
+                cnt++;
+            }
+        }
+    } @catch (NSException *e) {}
+    if (g_orig_draw) g_orig_draw(self, _cmd, view);
+}
+
 // ═══ v7.54: 原生面板复刻构建(主攻路线) ═══
 // 全局机制(全部F级, 反汇编逐条解码):
 // ① sub_11fa5c(启动即跑,[disp]+0x11fa5c实证): 注册通知观察者(block#1@0x3e9358→sub_11ffb0)
@@ -2060,6 +2127,14 @@ static void ACE_native_panel_build(int tag) {
             ACETrace(@"[native] tag%d: MTKView init返nil(Metal失败?), 本次中止", tag);
             return;
         }
+        // v7.57: 绘制层仪表挂载 — drawInMTKView: 活体门评估 + 后台通知处理器日志
+        @try {
+            Method md = class_getInstanceMethod(clsM, NSSelectorFromString(@"drawInMTKView:"));
+            if (md && !g_orig_draw) g_orig_draw = (void (*)(id, SEL, id))method_setImplementation(md, (IMP)ACE_hook_draw);
+            Method m73 = class_getInstanceMethod(clsM, NSSelectorFromString(@"_0x73C9A1E5:"));
+            if (m73 && !g_orig_73) g_orig_73 = (void (*)(id, SEL, id))method_setImplementation(m73, (IMP)ACE_hook_73);
+            ACETrace(@"[native] draw仪表已挂 draw=%d 73=%d", !!g_orig_draw, !!g_orig_73);
+        } @catch (NSException *e) { ACETrace(@"[native] draw仪表挂载异常: %@", e); }
         id ball = ((id (*)(id, SEL, void *, CGRect))objc_msgSend)([clsBall alloc], sF2,
                                                                   cfg, CGRectMake(489, 58, 45, 45));
         ((void (*)(id, SEL, id))objc_msgSend)(kw, @selector(addSubview:), ball);
@@ -2628,7 +2703,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.56 启动（+挂起巡检timer+byte0守护+撕裂侦测: 面板保卫战胜负手）===");
+            ACETrace(@"=== v7.57 启动（+drawInMTKView活体门仪表: 让执行者自己招供哪门挂）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
