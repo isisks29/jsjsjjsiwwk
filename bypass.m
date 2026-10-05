@@ -1633,7 +1633,7 @@ static void ACE_install_result_hook(void) {
     // 直写 file-backed RX 页 → EXC_BAD_ACCESS)。本版改 vm_write(Dobby 同款内核写,
     // 返回 kr 不崩) + vm_protect(+VM_PROT_COPY 造 COW 私有副本)兜底, 落点全部经
     // capstone 核验跳到真 epilogue(帧完整)。全拒才日志 kr0, 不会 v7.32 式闪退。
-    ACE_disarm_kills();
+    // ACE_disarm_kills();   // v7.42: iOS18代码签名监视器封死运行时改码, 永久停用
     g_saved_slot_val = *slot;
 
     *slot = (void *)ACE_dispatch_async_hook;
