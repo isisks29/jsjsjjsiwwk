@@ -564,10 +564,13 @@ static void *ACE_exc_server(void *arg) {
 }
 typedef kern_return_t (*ACE_tsep_fn)(mach_port_t, exception_mask_t, exception_handler_t,
                                      exception_behavior_t, thread_state_flavor_t);
+static ACE_tsep_fn g_real_tsep = 0;   // v7.70: 保存真身, 装弹前重抢端口用
 static void ACE_install_exc_server(void) {
-    // task_set_exception_ports 被我们自己的 interpose 拦着, 必须 dlsym(RTLD_NEXT) 拿真身注册
+    // 注意: task_set_exception_ports 被我们自己的 interpose 拦着,
+    // 必须用 dlsym(RTLD_NEXT) 拿到真身来注册, 否则注册调用本身会被吞掉。
     ACE_tsep_fn real_tsep = (ACE_tsep_fn)dlsym(RTLD_NEXT, "task_set_exception_ports");
     if (!real_tsep) { ACETrace(@"真实 task_set_exception_ports 未找到"); return; }
+    g_real_tsep = real_tsep;
     kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port);
     if (kr != KERN_SUCCESS) { ACETrace(@"异常端口分配失败 kr=%d", kr); return; }
     mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port, MACH_MSG_TYPE_MAKE_SEND);
@@ -979,6 +982,7 @@ static void *ACE_web_keeper(void *arg) {
     int n20 = 0;
     for (;;) {
         usleep(1000);
+        while (g_addrTrapArmed) usleep(200);   // v7.70: 武装期不碰陷阱页(防自伤SIGBUS→Umeng→abort)
         @try {
             if (g_tgt_base) {
                 uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
@@ -1195,6 +1199,7 @@ static void *ACE_ctx_monitor(void *arg) {
     unsigned long seq = 0;
     for (;;) {
         usleep(20000);
+        while (g_addrTrapArmed) usleep(200);   // v7.70: 武装期不碰陷阱页(防自伤)
         @try {
             if (!g_tgt_base) continue;
             uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
@@ -2271,6 +2276,14 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
     int doTrap = (g_tgt_base && g_addrTrapRounds < 20);
     if (doTrap) {
         g_addrTrapRounds++;
+        // v7.70: 装弹前重抢 task 异常端口 — v7.69 .ips 实锤陷阱异常流到
+        // _sigtramp→UmengSignalHandler→NSException→abort(keeper/ctx_monitor两线程同死),
+        // 即端口已被 Umeng SDK(初始化晚于我方 constructor)覆盖, handler 收不到 trap。
+        // 每帧装弹前用真身 task_set_exception_ports 重新注册抢回(仅前20帧, µs级开销)。
+        if (g_real_tsep && g_exc_port)
+            g_real_tsep(mach_task_self(),
+                        EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BREAKPOINT,
+                        g_exc_port, EXCEPTION_DEFAULT, ACE_ARM64_STATE);
         g_addrTrapArmed = 1;
         mprotect((void *)(g_tgt_base + 0x3fc000ULL), 16384, PROT_NONE);
     }
@@ -3023,7 +3036,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.69 启动（陷阱修复: handler无条件救活陷阱页BAD_ACCESS+PC过滤记录+仅前20帧装弹）===");
+            ACETrace(@"=== v7.70 启动（陷阱崩溃修复: 装弹前重抢异常端口(Umeng覆盖实锤) + 自家线程武装期自旋）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
