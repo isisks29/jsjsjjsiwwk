@@ -2036,6 +2036,31 @@ static void ACE_hook_73(id self, SEL _cmd, id n) {
     @try { ACETrace(@"[73] _0x73C9A1E5: 被调用(后台/resign通知→可能藏面板) notif=%@", n); } @catch (NSException *e) {}
     if (g_orig_73) g_orig_73(self, _cmd, n);
 }
+// ═══ v7.66: setHidden: 调用者取证 ═══
+// class_addMethod 给靶场 MTKView 类加 override(只影响该类实例, 不动系统UIView),
+// __builtin_return_address(0) = bl objc_msgSend 的返回地址(经stub/msgSend尾跳LR不变):
+//   0x8d0e4 = draw失败分支(0x8d0e0 bl) | 0x8d140 = draw成功分支(0x8d13c bl)
+//   0x8c7c0 = init段 | 其它偏移 = 未列明的调用者(全dylib仅5处setHidden, 出现其它值=大新闻)
+static void (*g_orig_setHidden)(id, SEL, BOOL) = NULL;
+static void ACE_hook_setHidden(id self, SEL _cmd, BOOL h) {
+    @try {
+        void *ra = __builtin_return_address(0);
+        uintptr_t ro = (uintptr_t)ra;
+        uintptr_t off = (g_tgt_base && ro >= g_tgt_base && ro < g_tgt_base + 0x3e8000ULL)
+                        ? (ro - g_tgt_base) : 0;
+        static uint64_t shLast = 0; static long shCnt = 0;
+        mach_timebase_info_data_t ti; mach_timebase_info(&ti);
+        uint64_t now = (mach_absolute_time() * (uint64_t)ti.numer / (uint64_t)ti.denom) / 1000000ULL;
+        shCnt++;
+        if (now - shLast > 1000ULL) {
+            shLast = now;
+            ACETrace(@"[setHidden] h=%d caller=%llx(8d0e4=失败分支 8d140=成功分支 8c7c0=init) 1s次数=%ld self=%p",
+                     (int)h, (unsigned long long)off, shCnt, (__bridge void *)self);
+            shCnt = 0;
+        }
+    } @catch (NSException *e) {}
+    if (g_orig_setHidden) g_orig_setHidden(self, _cmd, h);
+}
 static void ACE_hook_draw(id self, SEL _cmd, id view) {
     g_drawCalls++;   // v7.58: 渲染循环计数(1s复查据此决定是否手动驱动)
     // ═══ v7.62 帧级裁决探针 ═══
@@ -2148,6 +2173,15 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                     [cs appendFormat:@"%x:%x%s ", (unsigned)(uintptr_t)cOff[i], cw, cw == cExp[i] ? "" : "!!"];
                 }
                 ACETrace(@"[code2] draw门码字(偏移:运行时,!!=与文件不符) 失配=%d %@", cBad, cs);
+                // v7.66 code3: 门段 0x8cdd4-0x8d140 全部220条指令逐字哈希(顺序敏感),
+                // 期望值由文件离线算出 → 彻底排除"代码不符"(含ldr地址/movz常数等未抽验指令)
+                uint32_t fp = 0;
+                for (uintptr_t o = 0x8cdd4ULL; o < 0x8d140ULL; o += 4) {
+                    uint32_t w = *(volatile uint32_t *)(g_tgt_base + o);
+                    fp = ((fp ^ w) * 0x9e3779b1u) + (uint32_t)o;
+                }
+                ACETrace(@"[code3] 门段全220字指纹=%08x 期望=af35b8b2 %s",
+                         fp, fp == 0xaf35b8b2u ? "✓全段一致" : "★★★不一致=代码被换!");
             }
             static uint64_t rdLast = 0;
             if (Ss - rdLast > 1000ULL) {
@@ -2310,8 +2344,14 @@ static void ACE_native_panel_build(int tag) {
             if (md && !g_orig_draw) g_orig_draw = (void (*)(id, SEL, id))method_setImplementation(md, (IMP)ACE_hook_draw);
             Method m73 = class_getInstanceMethod(clsM, NSSelectorFromString(@"_0x73C9A1E5:"));
             if (m73 && !g_orig_73) g_orig_73 = (void (*)(id, SEL, id))method_setImplementation(m73, (IMP)ACE_hook_73);
-            ACETrace(@"[native] draw仪表已挂 draw=%d 73=%d origIMP偏移=%llx(应=8cdd4)",
-                     !!g_orig_draw, !!g_orig_73,
+            // v7.66: setHidden: 调用者取证 — 取UIView原实现, 给靶场类加override
+            if (!g_orig_setHidden) {
+                Method msh = class_getInstanceMethod([UIView class], @selector(setHidden:));
+                if (msh) g_orig_setHidden = (void (*)(id, SEL, BOOL))method_getImplementation(msh);
+                class_addMethod(clsM, @selector(setHidden:), (IMP)ACE_hook_setHidden, "v@:B");
+            }
+            ACETrace(@"[native] draw仪表已挂 draw=%d 73=%d setHidden取证=%d origIMP偏移=%llx(应=8cdd4)",
+                     !!g_orig_draw, !!g_orig_73, !!g_orig_setHidden,
                      (unsigned long long)(g_orig_draw ? ((uintptr_t)g_orig_draw - g_tgt_base) : 0));
         } @catch (NSException *e) { ACETrace(@"[native] draw仪表挂载异常: %@", e); }
         id ball = ((id (*)(id, SEL, void *, CGRect))objc_msgSend)([clsBall alloc], sF2,
@@ -2901,7 +2941,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.65 启动（+执行期写者探针: 原实现返回后即刻回读S链vs快照, 第三方写者当场现形）===");
+            ACETrace(@"=== v7.66 启动（+setHidden调用者LR取证 + 门段220字全量指纹核验）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
