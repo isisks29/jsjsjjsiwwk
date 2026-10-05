@@ -1700,6 +1700,13 @@ static void ACE_post_sec_notif(int attempt) {
         if (n == 0) { ACETrace(@"[notif-post] 尝试%d: 尚未捕获观察者通知名", attempt); return; }
         NSNotificationCenter *c = [NSNotificationCenter defaultCenter];
         for (int i = 0; i < n; i++) {
+            // v7.58: 生命周期通知不再代发 — v7.57 实锤: WillResignActive/DidEnterBackground
+            // 会触发靶场 [73] 后台处理器(暂停/藏面板), 等于自己打自己。只代发业务通知。
+            if ([names[i] containsString:@"ResignActive"] || [names[i] containsString:@"Background"] ||
+                [names[i] containsString:@"Foreground"]) {
+                ACETrace(@"[notif-post] 尝试%d: 跳过生命周期通知[%@]", attempt, names[i]);
+                continue;
+            }
             ACETrace(@"[notif-post] 尝试%d: 代发[%@] (激活UI创建链, 观察者幂等)", attempt, names[i]);
             [c postNotificationName:names[i] object:nil];
         }
@@ -2008,11 +2015,21 @@ static void ACE_install_visible_ball(void) {
 //       bit7=p92 bit8=C零 bit9=eq⑨ bit10=eq⑩ bit11=eq⑪ bit12=eq⑫ bit13=eq⑬
 static void (*g_orig_draw)(id, SEL, id) = NULL;
 static void (*g_orig_73)(id, SEL, id) = NULL;
+static volatile int g_drawCalls = 0;   // v7.58: drawInMTKView 被调次数
+// v7.58: 手动渲染驱动 — displayLink 不转时以 60fps 调 [mtk draw]
+// (MTKView 公共方法: 一帧完整渲染+present, 与 displayLink 驱动等价)
+static void ACE_drive_draw(id m) {
+    @try {
+        if (m) ((void (*)(id, SEL))objc_msgSend)(m, NSSelectorFromString(@"draw"));
+    } @catch (NSException *e) {}
+    dispatch_after(dispatch_time(0, 16000000LL), dispatch_get_main_queue(), ^{ ACE_drive_draw(m); });
+}
 static void ACE_hook_73(id self, SEL _cmd, id n) {
     @try { ACETrace(@"[73] _0x73C9A1E5: 被调用(后台/resign通知→可能藏面板) notif=%@", n); } @catch (NSException *e) {}
     if (g_orig_73) g_orig_73(self, _cmd, n);
 }
 static void ACE_hook_draw(id self, SEL _cmd, id view) {
+    g_drawCalls++;   // v7.58: 渲染循环计数(1s复查据此决定是否手动驱动)
     @try {
         if (g_tgt_base) {
             static uint64_t lastNs = 0; static int cnt = 0;
@@ -2173,6 +2190,20 @@ static void ACE_native_panel_build(int tag) {
         ACETrace(@"[native] ★tag%d: 原生面板复刻构建完成! flag=1 开关%d→%d 面板窗=%p 球=%p",
                  tag, (int)sw0, (int)*sw, (void *)pwin, (__bridge void *)ball);
         ACE_install_visible_ball();
+        // v7.58: 渲染器戳醒 + 状态 dump — drawInMTKView 从未被调用(v7.57 [drawgate]零行)
+        //    = displayLink 没转。显式 setPaused:NO + setNeedsDisplay, 并 dump 视图/窗链
+        //    状态(mtk.window/superview/paused + 面板窗 hidden/level/scene)一次看清断点。
+        @try {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(mtk, NSSelectorFromString(@"setPaused:"), NO);
+            ((void (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"setNeedsDisplay"));
+            UIWindow *mw = ((id (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"window"));
+            id sv = ((id (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"superview"));
+            BOOL pz = ((BOOL (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"isPaused"));
+            UIWindow *pw = (__bridge UIWindow *)(void *)pwin;
+            ACETrace(@"[native] 渲染器戳醒: mtk.window=%p superview=%p paused=%d | 面板窗=%p hidden=%d level=%g scene=%d",
+                     (__bridge void *)mw, (__bridge void *)sv, (int)pz,
+                     (__bridge void *)pw, (int)pw.hidden, (double)pw.windowLevel, pw.windowScene ? 1 : 0);
+        } @catch (NSException *e) { ACETrace(@"[native] 戳醒异常: %@", e); }
         // 1s+5s 双复查: 被拆则自动重建(上限3次, 防死循环)
         dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{
             @try {
@@ -2181,6 +2212,11 @@ static void ACE_native_panel_build(int tag) {
                 uint8_t s2 = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
                 uintptr_t m2 = *(volatile uintptr_t *)(g_tgt_base + 0x3fc328ULL);
                 ACETrace(@"[native] 1s复查: flag=%d 开关=%d 面板窗=%p 槽328=%p", (int)(*f2 & 1), (int)s2, (void *)w2, (void *)m2);
+                // v7.58: draw 零次 = displayLink 没转 → 60fps 手动驱动 [mtk draw]
+                if (g_drawCalls == 0 && mtk) {
+                    ACETrace(@"[native] displayLink未转(draw=0次) → 启动60fps手动驱动");
+                    ACE_drive_draw(mtk);
+                }
                 if (!(*f2 & 1) && g_rebuildCnt < 3) {
                     g_rebuildCnt++; g_nativeBuilt = NO;
                     ACETrace(@"[native] 被拆! 0.5s后重建(第%d/3次)", g_rebuildCnt);
@@ -2703,7 +2739,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.57 启动（+drawInMTKView活体门仪表: 让执行者自己招供哪门挂）===");
+            ACETrace(@"=== v7.58 启动（+停发生命周期通知+渲染器戳醒+窗链状态dump）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
