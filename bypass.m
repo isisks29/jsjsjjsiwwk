@@ -1777,34 +1777,56 @@ static void ACE_build_panel_direct(int attempt) {
         ACE_gates_dump("pre");
         uint8_t tb0 = *(volatile uint8_t *)(g_tgt_base + 0x3fc354ULL);
         mach_timebase_info_data_t ti; mach_timebase_info(&ti);
-        // ④ v7.51 栈帧毒值探针 — 终极裁决"inv 到底执行没执行 sub_11ffb0 序言":
-        //    sub_11ffb0 序言 = sub sp,#0x150 + 6条stp 存 x19-x30 到 [新sp+0xf0..0x148]
-        //    = [我方sp0-0x60 .. sp0-0x8]。ARM64 无红区, sp 下方内存空闲可预填毒值。
-        //    inv 后毒值被覆盖(12槽) = 序言真执行了; 完好 = inv 根本没进目标函数体。
-        //    附带收割 x30(pz[36])=调用点返回地址 / x29(pz[35])=帧指针, 铁证调用链。
-        uintptr_t sp0;
+        // ④ v7.52 毒值探针加强版 — v7.51 结果(脏8/12, x29槽=靶场基址, x30槽=0,
+        //    x28/x27槽干净)自相矛盾: sub_11ffb0 序言第一条 stp 就写 x28/x27, 若序言
+        //    跑过这两槽必脏。候选解释: A)编译器在读sp0后挪了sp(毒值窗错位) B)inv执行的
+        //    不是 sub_11ffb0。本版: 毒值窗扩到128槽防漂移 + inv后回读sp对照 + 脏槽
+        //    逐个dump(相对sp0偏移+值) + 运行时代码字节核验 + attempt2绕过invoke直调
+        //    函数体对照 + 计时改内联 mrs cntvct(消灭 mach_absolute_time 调用污染)。
+        if (attempt <= 1) {
+            volatile uint32_t *code = (volatile uint32_t *)(g_tgt_base + 0x11ffacULL);
+            ACETrace(@"[code] 运行时+0x11ffac起6字: %08x %08x %08x %08x %08x %08x",
+                     code[0], code[1], code[2], code[3], code[4], code[5]);
+            ACETrace(@"[code] 文件期望:            14000001 d10543ff a90f6ffc a91067fa a9115ff8 a91257f6");
+            volatile uint64_t *blkw = (volatile uint64_t *)(g_tgt_base + 0x3e9358ULL);
+            ACETrace(@"[blk] isa=%llx flags=%llx invoke=%llx desc=%llx (文件flags=50000000 desc=3e9338)",
+                     (unsigned long long)blkw[0], (unsigned long long)blkw[1],
+                     (unsigned long long)blkw[2], (unsigned long long)blkw[3]);
+        }
+        uintptr_t sp0, sp1;
         __asm__ volatile("mov %0, sp" : "=r"(sp0));
-        volatile uint64_t *pz = (volatile uint64_t *)(sp0 - 0x148ULL);
-        for (int i = 0; i < 41; i++) pz[i] = 0xDEADBEEFCAFEBABEULL;
-        uint64_t t0 = mach_absolute_time();
-        inv(nil);
-        uint64_t t1 = mach_absolute_time();
-        int dirty = 0;
-        for (int i = 25; i <= 36; i++) if (pz[i] != 0xDEADBEEFCAFEBABEULL) dirty++;
-        uint64_t sv29 = pz[35], sv30 = pz[36], sv28 = pz[25], sv27 = pz[26];
+        volatile uint64_t *pz = (volatile uint64_t *)(sp0 - 0x248ULL);   // 毒值窗=[sp0-0x248, sp0+0x58)
+        for (int i = 0; i < 96; i++) pz[i] = 0xDEADBEEFCAFEBABEULL;
+        uint64_t t0, t1;
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t0));
+        if (attempt == 2) {
+            void (*direct)(id) = (void (*)(id))(g_tgt_base + 0x11ffb0ULL);  // 对照: 绕过invoke指针直调函数体
+            direct(nil);
+        } else {
+            inv(nil);
+        }
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t1));
+        __asm__ volatile("mov %0, sp" : "=r"(sp1));
+        int dirty = 0, didx[16]; uint64_t dval[16];
+        for (int i = 0; i < 96 && dirty < 16; i++)
+            if (pz[i] != 0xDEADBEEFCAFEBABEULL) { didx[dirty] = i - 73; dval[dirty] = pz[i]; dirty++; }
         g_freeze_web = 0;
         uint8_t tb1 = *(volatile uint8_t *)(g_tgt_base + 0x3fc354ULL);
         unsigned long ns = (unsigned long)((t1 - t0) * (uint64_t)ti.numer / (uint64_t)ti.denom);
         ACE_gates_dump("post");
-        ACETrace(@"[panel] 尝试%d: flag=%d tb=%d→%d 耗时=%lu.%03lums invoke=%p",
-                 attempt, (int)(*flag & 1), tb0, tb1, ns / 1000000UL, (ns % 1000000UL) / 1000UL, (void *)inv);
-        ACETrace(@"[stack] 尝试%d: 毒值脏槽=%d/12 x29=%llx x30=%llx x28=%llx x27=%llx (脏≥12=序言真跑了; 0=inv没进函数体!)",
-                 attempt, dirty, (unsigned long long)sv29, (unsigned long long)sv30,
-                 (unsigned long long)sv28, (unsigned long long)sv27);
+        ACETrace(@"[panel] 尝试%d(%s): flag=%d tb=%d→%d 耗时=%lu.%03lums invoke=%p",
+                 attempt, attempt == 2 ? "直调对照" : "invoke", (int)(*flag & 1), tb0, tb1,
+                 ns / 1000000UL, (ns % 1000000UL) / 1000UL, (void *)inv);
+        ACETrace(@"[stack] 尝试%d: 脏槽=%d sp漂移=%lld字节", attempt, dirty,
+                 (long long)(sp1 - sp0));
+        if (attempt <= 1)
+            for (int i = 0; i < dirty && i < 12; i++)
+                ACETrace(@"[stack|d] sp0%+d字 = %llx", didx[i] * 8, (unsigned long long)dval[i]);
         if (*flag & 1)
             ACETrace(@"[panel] ★尝试%d: 面板构建完成! 盲点左上角出面板", attempt);
     } @catch (NSException *e) { ACETrace(@"[panel] 异常: %@", e); }
 }
+
 static void ACE_schedule_sec_posts(void) {
     dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(1); ACE_build_panel_direct(1); });
     dispatch_after(dispatch_time(0, 3000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(2); ACE_build_panel_direct(2); });
@@ -2304,7 +2326,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.51 启动（+栈帧毒值探针: 裁决inv是否真进函数体）===");
+            ACETrace(@"=== v7.52 启动（+毒值窗扩大/sp漂移核验/代码字节核验/直调对照）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
