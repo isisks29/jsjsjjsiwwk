@@ -855,7 +855,15 @@ static void ACE_web_tick(void) {
         uint64_t S = ns / 1000000ULL;             // v7.26: 单调毫秒(靶场时间门魔数=除1e6, 实证)
         uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
         *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) = S ^ 0xb75e8052badb72a6ULL;
-        uint32_t a8 = ACE_mix32(Slo ^ 0xd18ddb25u);
+        // v7.50 真凶修复: eq② 真式 = mix32((Slo^Shi)^0xd18ddb25), 输入含 ^Shi!
+        // 铁证A(iconOnClick 未混淆版): 0x111c3c lsr x8,x26,#0x20(=Shi) →
+        //   0x111c44 eor w11,w26,w22(Slo^key) → 0x111c48 eor w11,w11,w8(再^Shi) → mix32。
+        // 铁证B(sub_11ffb0 混淆版): 0x120058 载常数 0x79986fe7, 0x120060-78 四 bic/orr
+        //   构造 (Slo^k)^(Shi^k)=Slo^Shi, 0x12007c-84 再 ^0xd18ddb25 → 同一公式。
+        // 旧喂值 mix32(Slo^key) 缺 ^Shi: Shi=0(uptime<49.7天)时侥幸等价, Shi≠0 时
+        // eq②必挂→门3(0x12010c)早退——无[kw]、无[initF]、flag不置位、invoke秒回,
+        // 而 eq@panel 快照用同款错式评估→"全过"假象。与 v7.46-49 全部症状吻合。
+        uint32_t a8 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);
         *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8) = a8;
         uint32_t t2 = a8 ^ 0x1767cedcu;
         t2 ^= t2 >> 15; t2 *= 0x1f3d6a71u; t2 ^= t2 >> 11; t2 *= 0x8e4b1395u;
@@ -1172,7 +1180,7 @@ static void ACE_eq_snapshot(const char *tag) {
         uint32_t ac = *(volatile uint32_t *)(g_tgt_base + 0x3ff6ac);
         uint32_t b0 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0);
         uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
-        uint32_t e2 = ACE_mix32(Slo ^ 0xd18ddb25u);
+        uint32_t e2 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);   // v7.50: 真式含^Shi
         uint32_t G  = ACE_pmix32(a8 ^ 0x1767cedcu);
         uint32_t e3 = (Slo ^ (G >> 17)) ^ G;
         uint32_t H  = ACE_pmix32(ac ^ 0x5d41c293u);
@@ -1667,7 +1675,79 @@ static void ACE_post_sec_notif(int attempt) {
         }
     } @catch (NSException *e) { ACETrace(@"[notif-post] 异常: %@", e); }
 }
-// ═══ v7.47: 直调观察者block建面板 + 全门禁诊断 ═══
+// ═══ v7.50: 黑匣子逐门评估仪 — sub_11ffb0 全部16道入口门按反汇编真式逐条评估 ═══
+// v7.49 铁证: [kw] 探针对其他 caller(+0xd1a0c/+0xe7940/+0xe5fec)都响了, 唯独 inv
+// 期间没有 caller=+0x120580 → sub_11ffb0 确实在窗口段之前的值门区早退, 而 eq@panel
+// 快照说全过 → 快照模型与真门禁存在出入。v7.50 已找到并修复一处(eq② 缺 ^Shi,
+// 见 web_tick 注释), 本仪器用【与反汇编逐指令对齐的真式】再全量核一遍 16 道门,
+// 并附带三件测深工具: ①timebase 标志[0x3fc354](到达时间门才置1=免费路径示踪剂)
+// ②inv 耗时(µs级, 早退深度不同耗时不同) ③inv 前后各评估一次(抓执行瞬间翻转)。
+static void ACE_gates_dump(const char *tag) {
+    @try {
+        if (!g_tgt_base) return;
+        uintptr_t B = g_tgt_base;
+        int g1 = ((*(volatile uint8_t *)(B + 0x3fc348ULL)) & 1) == 0;          // 门1 幂等旗须0
+        uint64_t S   = *(volatile uint64_t *)(B + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
+        uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
+        uint32_t a8  = *(volatile uint32_t *)(B + 0x3ff6a8ULL);
+        uint32_t ac  = *(volatile uint32_t *)(B + 0x3ff6acULL);
+        uint32_t b0  = *(volatile uint32_t *)(B + 0x3ff6b0ULL);
+        int g2 = (a8 != 0);                                                     // 门2 a8≠0
+        uint32_t e2 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);                     // 门3 eq②真式
+        int g3 = (a8 == e2);
+        uint32_t G = ACE_pmix32(a8 ^ 0x1767cedcu);                              // 门4 eq③
+        int g4 = (ac == ((Slo ^ (G >> 17)) ^ G));
+        uint32_t H = ACE_pmix32(ac ^ 0x5d41c293u);                              // 门5 eq④
+        int g5 = (b0 == ((Shi ^ (H >> 17)) ^ H));
+        // 门6/7 时间门: 严格用靶场自己的 timebase 槽[0x3fc34c/350](0x12027c ldp),
+        // 槽未初始化时才回退系统值——若槽被写坏(denom=0/魔改), 这里能当场看出
+        uint32_t tbInit = *(volatile uint32_t *)(B + 0x3fc354ULL);
+        uint32_t tn = *(volatile uint32_t *)(B + 0x3fc34cULL);
+        uint32_t td = *(volatile uint32_t *)(B + 0x3fc350ULL);
+        if (!tbInit || !td) { mach_timebase_info_data_t ti; mach_timebase_info(&ti); tn = ti.numer; td = ti.denom; }
+        uint64_t ms = td ? (((uint64_t)mach_absolute_time() * tn) / td) / 1000000ULL : 0;
+        int g6 = (ms >= S);                                                     // 门6 b.lo
+        int g7 = ((ms - S) <= 45000ULL);                                        // 门7 b.hi
+        uintptr_t ctx = *(volatile uintptr_t *)(B + 0x3ff698ULL);
+        int g8 = (ctx >= 0x100000000ULL);                                       // 门8 ctx守卫
+        int g9 = 0, g10 = 0, g11 = 0, g12 = 0, g13 = 0, g14 = 0, g15 = 0, g16 = 0;
+        uint32_t c0 = 0, s20 = 0, chk = 0;
+        uint64_t C = 0;
+        if (g8) {
+            uint32_t p8e = *(volatile uint32_t *)(ctx + 0x8e);
+            uint32_t p92 = *(volatile uint32_t *)(ctx + 0x92);
+            C   = *(volatile uint64_t *)(ctx + 0x119a);
+            uint64_t A = *(volatile uint64_t *)(ctx + 0x11a2);
+            uint64_t E = *(volatile uint64_t *)(ctx + 0x78);
+            c0  = *(volatile uint32_t *)ctx;
+            uint32_t s10 = *(volatile uint32_t *)(ctx + 0x11aa);
+            uint32_t s18 = *(volatile uint32_t *)(ctx + 0x11b2);
+            s20 = *(volatile uint32_t *)(ctx + 0x11ba);
+            chk = *(volatile uint32_t *)(ctx + 0x11c2);
+            g9  = (p8e != 0);                                                   // 门9  0x120338
+            g10 = (p92 != 0);                                                   // 门10 0x120340
+            g11 = (C != 0);                                                     // 门11 0x120350
+            g12 = (E == (C ^ A ^ 0xa5c3e1f7b6d2489aULL));                       // 门12 eq⑨
+            g13 = (p8e == ((uint32_t)(C >> 7)  ^ s10 ^ 0x4a9b5206u));           // 门13 eq⑩
+            g14 = (p92 == ((uint32_t)(C >> 13) ^ s18 ^ 0x8c1a73e5u));           // 门14 eq⑪
+            g15 = (c0  == ((uint32_t)(C >> 19) ^ s20 ^ 0x5f8a16e3u));           // 门15 eq⑫
+            uint32_t m = (uint32_t)(A >> 32) ^ (uint32_t)A;                     // 门16 eq⑬
+            m *= 0x45d9f3b7u; m ^= s10; m *= 0x8e4b1395u; m ^= s18;
+            m *= 0x1f3d6a71u; m ^= s20; m ^= m >> 16;
+            g16 = (chk == m);
+        }
+        ACETrace(@"[gates@%s] %d%d%d%d%d%d%d|%d%d%d%d%d%d%d%d%d (1=过)",
+                 tag, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16);
+        ACETrace(@"[gates@%s|raw] S=%llu Shi=%u age=%lld tb=%u/%u init=%u c0=%x",
+                 tag, (unsigned long long)S, Shi, (long long)(ms - S), tn, td, tbInit, c0);
+        if (!g3)  ACETrace(@"[gates@%s|G3] a8=%x 真式=%x 旧式(无Shi)=%x", tag, a8, e2, ACE_mix32(Slo ^ 0xd18ddb25u));
+        if (!g5)  ACETrace(@"[gates@%s|G5] b0=%x 真式=%x", tag, b0, (Shi ^ (H >> 17)) ^ H);
+        if (!g15) ACETrace(@"[gates@%s|G15] c0=%x 期望=%x (C>>19=%x s20=%x)", tag, c0,
+                           (uint32_t)(C >> 19) ^ s20 ^ 0x5f8a16e3u, (uint32_t)(C >> 19), s20);
+        if (!g16) ACETrace(@"[gates@%s|G16] chk=%x", tag, chk);
+    } @catch (NSException *e) {}
+}
+// ═══ v7.50: 直调建面板(仪表版) — 修冻结顺序bug + ctx[0]稳定等待 + 测深三件套 ═══
 static void ACE_build_panel_direct(int attempt) {
     @try {
         if (!g_tgt_base) return;
@@ -1679,30 +1759,37 @@ static void ACE_build_panel_direct(int attempt) {
         uintptr_t blk = g_tgt_base + 0x3e9358ULL;
         void (*inv)(id) = (void (*)(id))*(uintptr_t *)(blk + 0x10);
         if (!inv) { ACETrace(@"[panel] 尝试%d: invoke指针为空", attempt); return; }
-        // ① 门禁全评估(13方程+时间门, 1=FAIL)
-        ACE_eq_snapshot("panel");
-        // ② 窗口状态
-        @try {
-            UIApplication *app = [UIApplication sharedApplication];
-            UIWindow *kw = app.keyWindow;
-            ACETrace(@"[panel] 尝试%d 窗口: keyWindow=%p windows数=%lu",
-                     attempt, (__bridge void *)kw, (unsigned long)[app.windows count]);
-        } @catch (NSException *e) {}
-        // ③ 冻结喂值 → 直调 → 解冻
+        // ① v7.50: ctx[0] 稳定等待——eq⑫按 c0=0xffffffff 钉死喂 s20, 若 inv 瞬间
+        //    ctx[0] 恰为活 fd(验卡socket开合会翻转, v7.43日志实证 5/0x26/0x6f/0x71),
+        //    门15 必挂。等它回 -1 再进(最多500ms, 超时也进, gates_dump 会抓到)。
+        uintptr_t ctx = *(volatile uintptr_t *)(g_tgt_base + 0x3ff698ULL);
+        int waited = 0;
+        while (ctx >= 0x100000000ULL && (*(volatile uint32_t *)ctx) != 0xffffffffu && waited < 100) {
+            usleep(5000); waited++;
+        }
+        if (waited) ACETrace(@"[panel] 尝试%d: 等ctx[0]回-1 花了%dms", attempt, waited * 5);
+        // ② v7.50 顺序修复: 先喂(真式, 含^Shi)后冻——旧版先冻后喂, "最后喂一次"被
+        //    冻结旗早退跳过(等于没喂), S 链年龄凭空多 0-20ms 且可能不自洽。
+        ACE_web_tick();
         g_freeze_web = 1;
-        ACE_web_tick();          // 冻结前最后喂一次, 保证 S 链新鲜且自洽
-        usleep(2000);            // 让在途的 web_keeper tick 落地
-        if (attempt == 1)
-            ACETrace(@"[panel] 尝试%d: 冻结喂值, 直调观察者invoke=%p", attempt, (void *)inv);
+        usleep(3000);            // 静默期: 在途 keeper tick 落地(它们见冻结旗早退)
+        // ③ 黑匣子: pre 全门评估 + timebase 标志 + 计时 → inv → post 全门评估
+        ACE_gates_dump("pre");
+        uint8_t tb0 = *(volatile uint8_t *)(g_tgt_base + 0x3fc354ULL);
+        mach_timebase_info_data_t ti; mach_timebase_info(&ti);
+        uint64_t t0 = mach_absolute_time();
         inv(nil);
+        uint64_t t1 = mach_absolute_time();
         g_freeze_web = 0;
+        uint8_t tb1 = *(volatile uint8_t *)(g_tgt_base + 0x3fc354ULL);
+        unsigned long ns = (unsigned long)((t1 - t0) * (uint64_t)ti.numer / (uint64_t)ti.denom);
+        ACE_gates_dump("post");
+        ACETrace(@"[panel] 尝试%d: flag=%d tb=%d→%d 耗时=%lu.%03lums invoke=%p",
+                 attempt, (int)(*flag & 1), tb0, tb1, ns / 1000000UL, (ns % 1000000UL) / 1000UL, (void *)inv);
         if (*flag & 1)
             ACETrace(@"[panel] ★尝试%d: 面板构建完成! 盲点左上角出面板", attempt);
-        else
-            ACETrace(@"[panel] 尝试%d: invoke返回但标志未置位(门禁失败, 看[eq@panel]哪条=1)", attempt);
     } @catch (NSException *e) { ACETrace(@"[panel] 异常: %@", e); }
 }
-
 static void ACE_schedule_sec_posts(void) {
     dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(1); ACE_build_panel_direct(1); });
     dispatch_after(dispatch_time(0, 3000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(2); ACE_build_panel_direct(2); });
@@ -2202,7 +2289,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.49 启动（+修正init签名+keyWindow探针）===");
+            ACETrace(@"=== v7.50 启动（+eq②真式^Shi修复+黑匣子逐门仪表）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
