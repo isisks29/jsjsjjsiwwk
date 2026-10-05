@@ -2135,7 +2135,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             g_ace_busy = 0;
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
             dispatch_after(dispatch_time(0, 8000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(0); });
-            dispatch_after(dispatch_time(0, 10000000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("boot10s"); })
+            dispatch_after(dispatch_time(0, 10000000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("boot10s"); });
             @try { ACE_start_net_probe(); } @catch (NSException *e) { ACETrace(@"[probe] 启动异常: %@", e); }
         }
     });
