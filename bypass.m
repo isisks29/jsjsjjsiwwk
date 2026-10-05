@@ -491,6 +491,7 @@ static unsigned long long g_trapRegs[3][34];
 // 页外地址 → 转发旧 handler(Umeng/我方crash catcher), 保持崩溃上报链。
 static struct sigaction g_oldBus, g_oldSegv;
 static volatile int g_sigTrapReady = 0;
+static volatile long g_jumpCnt = 0;   // v7.72: 绕门手术执行次数
 static void ACE_trap_signal_handler(int sig, siginfo_t *si, void *uc) {
     uintptr_t fa = (uintptr_t)(si ? si->si_addr : NULL);
     uintptr_t pgBase = g_tgt_base ? (g_tgt_base + 0x3fc000ULL) : 0;
@@ -513,6 +514,15 @@ static void ACE_trap_signal_handler(int sig, siginfo_t *si, void *uc) {
                     g_trapRegs[n][32] = pc;
                 }
                 g_addrTrapCnt = n + 1;
+                // ═══ v7.72 绕门手术 ═══
+                // 门1陷阱点(0x8ce24)时 x23=self、x19=retain(view)、sp栈帧均已就绪;
+                // 成功分支0x8d12c起的 x22/x20/x21/w20 全部由分支自身重装载,
+                // 不依赖门段计算值。直接把 PC 改写到 setHidden:NO 成功分支入口,
+                // 物理跳过挂掉的 eq②③④。页已恢复RW, 分支读 0x3ff660 等不再陷阱。
+                if (pc == g_tgt_base + 0x8ce24ULL) {
+                    uct->uc_mcontext->__ss.__pc = g_tgt_base + 0x8d12cULL;
+                    g_jumpCnt++;
+                }
             }
         }
 #endif
@@ -2325,8 +2335,10 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                 }
             }
         }
-    } @catch (NSException *e) {}// ═══ v7.71 装弹: 信号层救援为主通道 + draw调用@try兜底(防异常穿透致页面残留) ═══
-    int doTrap = (g_tgt_base && g_addrTrapRounds < 20);
+    } @catch (NSException *e) {}
+    // ═══ v7.72 装弹: 常驻武装 — 手术必须每帧执行, 漏一帧该帧就走失败分支
+    // setHidden:YES 把面板再藏回去。信号 handler 页内无条件救援兜住其他线程。 ═══
+    int doTrap = (g_tgt_base != 0);
     if (doTrap) {
         g_addrTrapRounds++;
         ACE_arm_signal_trap();   // sigaction 抢回 SIGBUS/SIGSEGV(每帧重抢防覆盖)
@@ -2386,8 +2398,8 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         uint64_t nowNs2 = mach_absolute_time() * (uint64_t)ti2.numer / (uint64_t)ti2.denom;
         if (nowNs2 - vLastNs > 1000000000ULL && vCnt < 60) {
             vLastNs = nowNs2; vCnt++;
-            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 执行期改写=%ld 水印:自初始化=%ld 未到达=%ld(槽=%x/%x/%x) 陷阱=%ld | preH=%d→postH=%d b0:%d→%d",
-                     g_vTot, g_vFail, g_xw, g_wmHit, g_wmMiss, wm0, wm1, wm2, g_addrTrapCnt,
+            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 手术跳=%ld 执行期改写=%ld 水印:自初始化=%ld 未到达=%ld(槽=%x/%x/%x) 陷阱=%ld | preH=%d→postH=%d b0:%d→%d",
+                     g_vTot, g_vFail, g_jumpCnt, g_xw, g_wmHit, g_wmMiss, wm0, wm1, wm2, g_addrTrapCnt,
                      preHid, postHid, (int)preB0, (int)postB0);
             // v7.68: 陷阱现场一次性输出(前3次) — x9=硬件亲手算的门1读地址
             static int trapLogged = 0;
@@ -3090,7 +3102,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.71 启动（信号层陷阱救援: sigaction抢回SIGBUS/SEGV+ucontext取x9+draw异常@try兜底防残留）===");
+            ACETrace(@"=== v7.72 启动（绕门手术: 门1陷阱点PC改写→0x8d12c成功分支, 常驻武装每帧跳, 物理绕过eq②③④）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
