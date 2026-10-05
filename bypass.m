@@ -2571,7 +2571,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== ACETrace(@"=== v7.54 启动（+原生面板复刻构建+自建可见球: 全局机制已完全解码）===");
+            ACETrace(@"=== v7.54 启动（+原生面板复刻构建+自建可见球: 全局机制已完全解码）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
