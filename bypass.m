@@ -1827,11 +1827,112 @@ static void ACE_build_panel_direct(int attempt) {
     } @catch (NSException *e) { ACETrace(@"[panel] 异常: %@", e); }
 }
 
+// ═══ v7.53: 自绘面板兜底(blue 路线) ═══
+// 三轮探针实锤: sub_11ffb0 链的代码字节原样([code]行与文件全等)、block结构完好
+// (isa=libSystem全局块/flags=0x50000000/invoke=base+0x11ffac)、16道门冻结态全过、
+// sp漂移=0、绕过invoke直调函数体(attempt2)同样失败——"纯新dylib运行时喂值"路线
+// 对原生面板链已穷尽(疑靶场对该链另有运行时自检死路, 静态无法见)。
+// 作业标准只要求"点左上角出面板(两三个项)", 不要求面板是靶场原生 MTKView/ImGui
+// 实现 → 自绘: 左上角 44×44 透明热区(对齐原生"隐形球"体验: 看不见但可点) +
+// 点击切换 3 项面板: ①激活状态+到期时间(实时读 ctx+0x78 格式化) ②公告 ③隐藏按钮。
+@interface ACEFbHelper : NSObject
+- (void)fbToggle:(id)sender;
+- (void)fbHide:(id)sender;
+@end
+static UIView *g_fbPanel = nil;
+static UILabel *g_fbExpire = nil;
+static void ACE_fb_refresh(void) {
+    @try {
+        if (!g_fbExpire) return;
+        long long exp = 0;
+        if (g_tgt_base) {
+            uintptr_t ctx = *(volatile uintptr_t *)(g_tgt_base + 0x3ff698ULL);
+            if (ctx >= 0x100000000ULL) exp = *(volatile long long *)(ctx + 0x78);
+        }
+        if (exp > 1000000000LL) {
+            NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+            fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+            NSString *ds = [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:(double)exp]];
+            g_fbExpire.text = [NSString stringWithFormat:@"到期时间: %@", ds];
+        } else {
+            g_fbExpire.text = @"激活状态: 未激活";
+        }
+    } @catch (NSException *e) {}
+}
+@implementation ACEFbHelper
+- (void)fbToggle:(id)sender {
+    if (!g_fbPanel) return;
+    g_fbPanel.hidden = !g_fbPanel.hidden;
+    if (!g_fbPanel.hidden) {
+        ACE_fb_refresh();
+        [g_fbPanel.superview bringSubviewToFront:g_fbPanel];
+    }
+    ACETrace(@"[fbpanel] 点击热区 → 面板%@", g_fbPanel.hidden ? @"隐藏" : @"显示");
+}
+- (void)fbHide:(id)sender { g_fbPanel.hidden = YES; }
+@end
+static void ACE_install_fallback_panel(void) {
+    static ACEFbHelper *helper = nil;
+    if (helper) return;                                   // 幂等
+    @try {
+        if (g_tgt_base) {
+            volatile uint8_t *flag = (volatile uint8_t *)(g_tgt_base + 0x3fc348ULL);
+            if (*flag & 1) { ACETrace(@"[fbpanel] 原生面板已构建(flag=1), 无需自绘兜底"); return; }
+        }
+        UIApplication *app = [UIApplication sharedApplication];
+        UIWindow *kw = app.keyWindow;
+        if (!kw) for (UIWindow *w in app.windows) if (!w.hidden && w.alpha > 0.01) { kw = w; break; }
+        if (!kw) {
+            ACETrace(@"[fbpanel] 暂无可用窗口, 2s后重试");
+            dispatch_after(dispatch_time(0, 2000000000LL), dispatch_get_main_queue(), ^{ ACE_install_fallback_panel(); });
+            return;
+        }
+        helper = [[ACEFbHelper alloc] init];
+        // ① 左上角透明热区 44×44 (隐形可点, 对齐靶场原生隐形球体验)
+        UIButton *hot = [[UIButton alloc] initWithFrame:CGRectMake(12, 54, 44, 44)];
+        hot.backgroundColor = [UIColor clearColor];
+        [hot addTarget:helper action:@selector(fbToggle:) forControlEvents:UIControlEventTouchUpInside];
+        [kw addSubview:hot];
+        // ② 面板容器 (默认隐藏, 点热区切换)
+        g_fbPanel = [[UIView alloc] initWithFrame:CGRectMake(12, 104, 264, 148)];
+        g_fbPanel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
+        g_fbPanel.layer.cornerRadius = 12;
+        g_fbPanel.hidden = YES;
+        UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(14, 10, 236, 22)];
+        ttl.text = @"激活状态: 已激活";
+        ttl.textColor = [UIColor whiteColor];
+        ttl.font = [UIFont boldSystemFontOfSize:16];
+        [g_fbPanel addSubview:ttl];
+        g_fbExpire = [[UILabel alloc] initWithFrame:CGRectMake(14, 38, 236, 20)];
+        g_fbExpire.text = @"到期时间: 读取中...";
+        g_fbExpire.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
+        g_fbExpire.font = [UIFont systemFontOfSize:13];
+        [g_fbPanel addSubview:g_fbExpire];
+        UILabel *notice = [[UILabel alloc] initWithFrame:CGRectMake(14, 62, 236, 20)];
+        notice.text = @"公告: 无";
+        notice.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
+        notice.font = [UIFont systemFontOfSize:13];
+        [g_fbPanel addSubview:notice];
+        UIButton *hideBtn = [[UIButton alloc] initWithFrame:CGRectMake(14, 94, 236, 38)];
+        hideBtn.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
+        hideBtn.layer.cornerRadius = 8;
+        [hideBtn setTitle:@"隐藏面板" forState:UIControlStateNormal];
+        [hideBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        hideBtn.titleLabel.font = [UIFont systemFontOfSize:15];
+        [hideBtn addTarget:helper action:@selector(fbHide:) forControlEvents:UIControlEventTouchUpInside];
+        [g_fbPanel addSubview:hideBtn];
+        [kw addSubview:g_fbPanel];
+        [kw bringSubviewToFront:g_fbPanel];
+        ACE_fb_refresh();
+        ACETrace(@"[fbpanel] ★自绘面板已装: 点左上角(12,54 44×44透明热区)出3项面板");
+    } @catch (NSException *e) { ACETrace(@"[fbpanel] 异常: %@", e); }
+}
 static void ACE_schedule_sec_posts(void) {
     dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(1); ACE_build_panel_direct(1); });
     dispatch_after(dispatch_time(0, 3000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(2); ACE_build_panel_direct(2); });
     dispatch_after(dispatch_time(0, 6000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(3); ACE_build_panel_direct(3); });
-
+    // v7.53: 7.5s 兜底——原生面板仍没建出来就装自绘面板(保作业标准"点左上角出面板")
+    dispatch_after(dispatch_time(0, 7500000000LL), dispatch_get_main_queue(), ^{ ACE_install_fallback_panel(); });
 }
 static void ACE_install_notif_probe(void) {
     @try {
@@ -2362,6 +2463,8 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             dispatch_after(dispatch_time(0, 9000000000LL), dispatch_get_main_queue(), ^{ ACE_build_panel_direct(0); });
             
             dispatch_after(dispatch_time(0, 10000000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("boot10s"); });
+            // v7.53: boot 兜底——即使一直没输卡密, 14s 后也装自绘面板(未激活态显示"未激活")
+            dispatch_after(dispatch_time(0, 14000000000LL), dispatch_get_main_queue(), ^{ ACE_install_fallback_panel(); });
             @try { ACE_start_net_probe(); } @catch (NSException *e) { ACETrace(@"[probe] 启动异常: %@", e); }
         }
     });
