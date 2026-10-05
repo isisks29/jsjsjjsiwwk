@@ -2151,7 +2151,11 @@ static void ACE_install_ball_probe(void) {
 // 本版: 全参透传 + 无条件日志(这些钩子只在面板构建时触发, 无刷屏风险)。
 static id (*g_orig_initC)(id, SEL, void *) = NULL;
 static id (*g_orig_initB)(id, SEL, void *) = NULL;
-static id (*g_orig_initM)(id, SEL, void *, id, id, id) = NULL;
+// v7.55 签名修复(.ips 实锤): initWithFrame:::: 真签名 = (void* cfg, id 容器, id 桥接, CGRect d0-d3)。
+// v7.49 旧钩子第6参声明为 id → ARC 进函数即 objc_retain(x5残留垃圾=0x1) → SIGSEGV
+// (崩溃栈: objc_retain+8 ← ACE_hook_initM+76 ← ACE_native_panel_build+492, far=0x1)。
+// 修复: 对象参数一律 void*(ARC 不 retain), CGRect 按真签名透传 d0-d3。
+static id (*g_orig_initM)(id, SEL, void *, void *, void *, CGRect) = NULL;
 static id ACE_hook_initC(id self, SEL _cmd, void *fp) {
     ACETrace(@"[initF] 容器_C8E2A541 initWithFrame:(%p) 被调用!", fp);
     id r = g_orig_initC ? g_orig_initC(self, _cmd, fp) : self;
@@ -2164,13 +2168,13 @@ static id ACE_hook_initB(id self, SEL _cmd, void *fp) {
     ACETrace(@"[initF] 桥接init返回 %p", (__bridge void *)r);
     return r;
 }
-static id ACE_hook_initM(id self, SEL _cmd, void *fp, id a1, id a2, id a3) {
-    ACETrace(@"[initF] MTKView_1E6B7A93 initWithFrame::::(%p,%p,%p,%p) 被调用!",
-             fp, (__bridge void *)a1, (__bridge void *)a2, (__bridge void *)a3);
-    id r = g_orig_initM ? g_orig_initM(self, _cmd, fp, a1, a2, a3) : self;
-    ACETrace(@"[initF] MTKView init返回 %p %s", (__bridge void *)r,
-             r ? "" : "★★nil=Metal创建失败");
-    return r;
+static id ACE_hook_initM(id self, SEL _cmd, void *fp, void *a1, void *a2, CGRect r) {
+    ACETrace(@"[initF] MTKView_1E6B7A93 initWithFrame::::(cfg=%p,容器=%p,桥接=%p,rect={%g,%g,%g,%g}) 被调用!",
+             fp, a1, a2, r.origin.x, r.origin.y, r.size.width, r.size.height);
+    id rr = g_orig_initM ? g_orig_initM(self, _cmd, fp, a1, a2, r) : self;
+    ACETrace(@"[initF] MTKView init返回 %p %s", (__bridge void *)rr,
+             rr ? "" : "★★nil=Metal创建失败");
+    return rr;
 }
 // v7.49: keyWindow 探针 —— sub_11ffb0 只在过完全部15道值门后才调 keyWindow
 // (0x12057c)。[kw]行出现=值门全过实锤; inv期间不出现=方程模型有误, 需逐门二分。
@@ -2195,7 +2199,7 @@ static void ACE_install_init_probe(void) {
                  if (m) g_orig_initB = (id (*)(id, SEL, void *))method_setImplementation(m, (IMP)ACE_hook_initB); }
         Class mk = NSClassFromString(@"_0x1E6B7A93");
         if (mk) { Method m = class_getInstanceMethod(mk, NSSelectorFromString(@"initWithFrame::::"));
-                 if (m) g_orig_initM = (id (*)(id, SEL, void *, id, id, id))method_setImplementation(m, (IMP)ACE_hook_initM); }
+                 if (m) g_orig_initM = (id (*)(id, SEL, void *, void *, void *, CGRect))method_setImplementation(m, (IMP)ACE_hook_initM); }
         Method kw = class_getInstanceMethod([UIApplication class], @selector(keyWindow));
         if (kw) g_orig_keyWin = (UIWindow *(*)(id, SEL))method_setImplementation(kw, (IMP)ACE_hook_keyWin);
         ACETrace(@"[initF] v7.49探针已挂 容器=%d 桥接=%d MTKView=%d keyWindow=%d",
@@ -2571,7 +2575,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.54 启动（+原生面板复刻构建+自建可见球: 全局机制已完全解码）===");
+            ACETrace(@"=== v7.55 启动（+initM钩子签名修复: .ips实锤objc_retain(0x1)崩溃点）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
