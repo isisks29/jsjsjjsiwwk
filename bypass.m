@@ -2126,6 +2126,63 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
             *(volatile uint32_t *)(g_tgt_base + 0x3ff6acULL) = acs;
             *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0ULL) = b0s;
             *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) = Ss ^ 0xb75e8052badb72a6ULL;
+            // ═══ v7.64 双探针(冻结后/调原实现前) ═══
+            // 探针A[code2]: draw门9个关键指令字 运行时 vs 文件 —— 从未核验过draw函数体,
+            //   若运行时≠文件 → 之前全部静态分析对象错误(谜团根源)
+            // 探针B[rawdump]: S链四槽+ctx全字段原始值&期望值 —— 离线独立复算,
+            //   抓"评估代码自身bug"(评估与喂值同源会互相包庇); 回读≠刚写=存在外部写者
+            static int c2Once = 0;
+            if (!c2Once) {
+                c2Once = 1;
+                static const uintptr_t cOff[9] = { 0x8ce28ULL, 0x8ce88ULL, 0x8cebcULL, 0x8cec4ULL,
+                                                   0x8cf00ULL, 0x8cf58ULL, 0x8cf64ULL, 0x8d0acULL, 0x8d0b0ULL };
+                static const uint32_t cExp[9] = { 0x34001468u, 0x6b0b015fu, 0x4a4946ccu, 0x6b09017fu,
+                                                  0x6b08013fu, 0xeb160108u, 0x54000a88u, 0x6b09011fu, 0x540003e0u };
+                NSMutableString *cs = [NSMutableString string];
+                int cBad = 0;
+                for (int i = 0; i < 9; i++) {
+                    uint32_t cw = *(volatile uint32_t *)(g_tgt_base + cOff[i]);
+                    if (cw != cExp[i]) cBad++;
+                    [cs appendFormat:@"%x:%x%s ", (unsigned)(uintptr_t)cOff[i], cw, cw == cExp[i] ? "" : "!!"];
+                }
+                ACETrace(@"[code2] draw门码字(偏移:运行时,!!=与文件不符) 失配=%d %@", cBad, cs);
+            }
+            static uint64_t rdLast = 0;
+            if (Ss - rdLast > 1000ULL) {
+                rdLast = Ss;
+                uint64_t Sraw = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL);
+                uint32_t a8r = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL);
+                uint32_t acr = *(volatile uint32_t *)(g_tgt_base + 0x3ff6acULL);
+                uint32_t b0r = *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0ULL);
+                ACETrace(@"[rawdump] S槽=%llx 解=%llu a8=%x(写=%x) ac=%x(写=%x) b0=%x(写=%x)",
+                         (unsigned long long)Sraw, (unsigned long long)Ss,
+                         a8r, a8s, acr, acs, b0r, b0s);
+                uintptr_t rctx = *(volatile uintptr_t *)(g_tgt_base + 0x3ff698ULL);
+                if (rctx >= 0x100000000ULL) {
+                    uint64_t rC = *(volatile uint64_t *)(rctx + 0x119a);
+                    uint64_t rA = *(volatile uint64_t *)(rctx + 0x11a2);
+                    uint64_t rE = *(volatile uint64_t *)(rctx + 0x78);
+                    uint32_t rc0 = *(volatile uint32_t *)rctx;
+                    uint32_t rs10 = *(volatile uint32_t *)(rctx + 0x11aa);
+                    uint32_t rs18 = *(volatile uint32_t *)(rctx + 0x11b2);
+                    uint32_t rs20 = *(volatile uint32_t *)(rctx + 0x11ba);
+                    uint32_t rchk = *(volatile uint32_t *)(rctx + 0x11c2);
+                    uint32_t rp8e = *(volatile uint32_t *)(rctx + 0x8e);
+                    uint32_t rp92 = *(volatile uint32_t *)(rctx + 0x92);
+                    uint32_t xp8e = (uint32_t)(rC >> 7) ^ rs10 ^ 0x4a9b5206u;
+                    uint32_t xp92 = (uint32_t)(rC >> 13) ^ rs18 ^ 0x8c1a73e5u;
+                    uint32_t xc0 = (uint32_t)(rC >> 19) ^ rs20 ^ 0x5f8a16e3u;
+                    uint64_t xE = rC ^ rA ^ 0xa5c3e1f7b6d2489aULL;
+                    uint32_t xm = (uint32_t)(rA >> 32) ^ (uint32_t)rA;
+                    xm *= 0x45d9f3b7u; xm ^= rs10; xm *= 0x8e4b1395u; xm ^= rs18;
+                    xm *= 0x1f3d6a71u; xm ^= rs20; xm ^= xm >> 16;
+                    ACETrace(@"[rawdump2] C=%llx A=%llx E=%llx(期=%llx) c0=%x(期=%x)",
+                             (unsigned long long)rC, (unsigned long long)rA,
+                             (unsigned long long)rE, (unsigned long long)xE, rc0, xc0);
+                    ACETrace(@"[rawdump3] p8e=%x(期=%x) p92=%x(期=%x) chk=%x(期=%x) s10=%x s18=%x s20=%x",
+                             rp8e, xp8e, rp92, xp92, rchk, xm, rs10, rs18, rs20);
+                }
+            }
         }
     } @catch (NSException *e) {}
     if (g_orig_draw) g_orig_draw(self, _cmd, view);
@@ -2823,7 +2880,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.63 启动（+帧内同步快照喂值: 冻结keeper→写自洽S链→调原实现, 物理消除撕裂）===");
+            ACETrace(@"=== v7.64 启动（+双探针: draw码字运行时核验 + S链/ctx原始值dump离线复算）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
