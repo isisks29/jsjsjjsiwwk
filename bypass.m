@@ -1663,10 +1663,40 @@ static void ACE_post_sec_notif(int attempt) {
         }
     } @catch (NSException *e) { ACETrace(@"[notif-post] 异常: %@", e); }
 }
+// ═══ v7.46: 直调观察者block构建面板UI(绕过不可靠的通知投递) ═══
+// 静态地图(全实证): 面板构建函数=sub_11ffb0(观察者block@0x3e9358的invoke=base+0x11ffac)。
+// 16道门(S链①-④+45s时间门+ctx eq⑨-⑬+keyWindow)全喂得过; 幂等标志[0x3fc348]bit0
+// 仅在末尾addSubview成功后才置位→失败早退不置位→可重试。通知投递在混淆环境不可靠,
+// 改直调invoke: 读__DATA 0x3e9368拿invoke指针(=base+0x11ffac), 当block调用。
+static void ACE_build_panel_direct(int attempt) {
+    @try {
+        if (!g_tgt_base) return;
+        volatile uint8_t *flag = (volatile uint8_t *)(g_tgt_base + 0x3fc348ULL);
+        if (*flag & 1) {
+            if (attempt == 1) ACETrace(@"[panel] 幂等标志已置位=面板早已构建, 不再重建");
+            return;
+        }
+        uintptr_t blk = g_tgt_base + 0x3e9358ULL;
+        void (*inv)(id) = (void (*)(id))*(uintptr_t *)(blk + 0x10);
+        if (!inv) { ACETrace(@"[panel] 尝试%d: invoke指针为空", attempt); return; }
+        if (attempt == 1)
+            ACETrace(@"[panel] 尝试%d: 直调观察者invoke=%p (门禁前快照 a8=%u S=%llu)",
+                     attempt, (void *)inv,
+                     *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL),
+                     (unsigned long long)(*(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL));
+        inv(nil);   // block invoke 首参=block指针, sub_11ffb0忽略参数只读全局→安全
+        if (*flag & 1)
+            ACETrace(@"[panel] ★尝试%d: 面板构建完成! 幂等标志已置位(盲点左上角出面板)", attempt);
+        else
+            ACETrace(@"[panel] 尝试%d: invoke返回但标志未置位=某门禁静默失败(查上方快照)", attempt);
+    } @catch (NSException *e) { ACETrace(@"[panel] 异常: %@", e); }
+}
+
 static void ACE_schedule_sec_posts(void) {
-    dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(1); });
-    dispatch_after(dispatch_time(0, 3000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(2); });
-    dispatch_after(dispatch_time(0, 6000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(3); });
+    dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(1); ACE_build_panel_direct(1); });
+    dispatch_after(dispatch_time(0, 3000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(2); ACE_build_panel_direct(2); });
+    dispatch_after(dispatch_time(0, 6000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(3); ACE_build_panel_direct(3); });
+
 }
 static void ACE_install_notif_probe(void) {
     @try {
@@ -2103,7 +2133,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.45 启动（+第二S链喂值+悬浮球探针+UI盘点）===");
+            ACETrace(@"=== v7.46 启动（+直调观察者建面板）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -2135,6 +2165,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             g_ace_busy = 0;
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
             dispatch_after(dispatch_time(0, 8000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(0); });
+            dispatch_after(dispatch_time(0, 9000000000LL), dispatch_get_main_queue(), ^{ ACE_build_panel_direct(0); });
             dispatch_after(dispatch_time(0, 10000000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("boot10s"); });
             @try { ACE_start_net_probe(); } @catch (NSException *e) { ACETrace(@"[probe] 启动异常: %@", e); }
         }
