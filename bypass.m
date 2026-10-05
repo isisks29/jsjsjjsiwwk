@@ -1776,6 +1776,39 @@ static void ACE_install_ball_probe(void) {
                  g_orig_iconClick != NULL, g_orig_ballTouch != NULL);
     } @catch (NSException *e) { ACETrace(@"[ball] 探针异常: %@", e); }
 }
+// ═══ v7.48: 视图构建链探针(定位 sub_11ffb0 在哪步失败) ═══
+static id (*g_orig_initC)(id, SEL) = NULL;
+static id (*g_orig_initM)(id, SEL) = NULL;
+static id ACE_hook_initC(id self, SEL _cmd) {
+    id r = g_orig_initC ? g_orig_initC(self, _cmd) : self;
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[initF] 容器_C8E2A541 initWithFrame: → %p", (__bridge void *)r);
+        g_ace_busy = 0;
+    }
+    return r;
+}
+static id ACE_hook_initM(id self, SEL _cmd) {
+    id r = g_orig_initM ? g_orig_initM(self, _cmd) : self;
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[initF] MTKView_1E6B7A93 initWithFrame:::: → %p %s", (__bridge void *)r,
+                 r ? "" : "★★返回nil=Metal创建失败");
+        g_ace_busy = 0;
+    }
+    return r;
+}
+static void ACE_install_init_probe(void) {
+    @try {
+        Class c = NSClassFromString(@"_0xC8E2A541");
+        if (c) { Method m = class_getInstanceMethod(c, NSSelectorFromString(@"initWithFrame:"));
+                 if (m) g_orig_initC = (id (*)(id, SEL))method_setImplementation(m, (IMP)ACE_hook_initC); }
+        Class mk = NSClassFromString(@"_0x1E6B7A93");
+        if (mk) { Method m = class_getInstanceMethod(mk, NSSelectorFromString(@"initWithFrame::::"));
+                 if (m) g_orig_initM = (id (*)(id, SEL))method_setImplementation(m, (IMP)ACE_hook_initM); }
+        ACETrace(@"[initF] 构建链探针已挂 容器=%d MTKView=%d", g_orig_initC != NULL, g_orig_initM != NULL);
+    } @catch (NSException *e) { ACETrace(@"[initF] 探针异常: %@", e); }
+}
 static void ACE_ui_scan(const char *when) {
     @try {
         NSMutableArray *stack = [NSMutableArray array];
@@ -2144,7 +2177,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.47 启动（+门禁诊断+冻结喂值直调建面板）===");
+            ACETrace(@"=== v7.48 启动（+视图构建链探针）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -2171,6 +2204,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
                 }
                 ACE_install_notif_probe();   // v7.40: 通知中心探针(安保尾段传感器)
                 ACE_install_ball_probe();    // v7.45: 悬浮球探针(iconOnClick/touches)
+                ACE_install_init_probe();    // v7.48: 视图构建链探针(容器/MTKView init)
             } @catch (NSException *e) { ACETrace(@"探针挂设异常: %@", e); }
             @try { ACE_install_tel_hooks(); } @catch (NSException *e) { ACETrace(@"[tel] 安装异常: %@", e); }
             g_ace_busy = 0;
