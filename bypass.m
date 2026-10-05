@@ -2153,6 +2153,16 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
             *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0ULL) = b0s;
             *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) = Ss ^ 0xb75e8052badb72a6ULL;
             snapS = Ss; snapA8 = a8s; snapAc = acs; snapB0 = b0s;   // v7.65: 留档
+            
+            // ═══ v7.67 执行水印: 时间门自初始化陷阱 ═══
+            // flag=0 + numer/denom=deadbeef。原实现若执行到 0x8cf10-24(时间门自初始化),
+            // 会亲自调 mach_timebase_info 写回 125/3 并置 flag=1 —— 这是硬件级
+            // "执行流到过此处"的印章, 不是模拟推断:
+            //   返回后槽=125/3/1 → 门1/eq②③④全部硬件级通过! 挂点=时间门或ctx段
+            //   返回后槽=deadbeef/0 → 执行没到时间门 → 前四门之一硬件判挂
+            //     (与python/C双重复算矛盾 → 差异在寄存器装载层, 排查对象=明确5条指令)
+            volatile uint32_t *wtb = (volatile uint32_t *)(g_tgt_base + 0x3f2900ULL);
+            wtb[0] = 0xdeadbeefu; wtb[1] = 0xdeadbeefu; wtb[2] = 0u;
             // ═══ v7.64 双探针(冻结后/调原实现前) ═══
             // 探针A[code2]: draw门9个关键指令字 运行时 vs 文件 —— 从未核验过draw函数体,
             //   若运行时≠文件 → 之前全部静态分析对象错误(谜团根源)
@@ -2222,6 +2232,14 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         }
     } @catch (NSException *e) {}
     if (g_orig_draw) g_orig_draw(self, _cmd, view);
+    // v7.67: 冻结期内先读水印(防keeper防复毒逻辑抹掉证据), 再解冻
+    uint32_t wm0 = 0, wm1 = 0, wm2 = 0;
+    @try {
+        if (g_tgt_base) {
+            volatile uint32_t *rtb = (volatile uint32_t *)(g_tgt_base + 0x3f2900ULL);
+            wm0 = rtb[0]; wm1 = rtb[1]; wm2 = rtb[2];
+        }
+    } @catch (NSException *e) {}
     g_freeze_web = 0;
     // ── post: 当场验尸 ──
     @try {
@@ -2235,7 +2253,9 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         // 逻辑上只剩唯一解释: 原实现执行期间(几十µs~ms窗口)有第三方改写S链——
         // g_freeze_web只冻我方keeper, 冻不住靶场自己的喂值线程; 冻结期[Schain]探测器
         // 也停摆=无人监测。post即刻回读四槽与快照比对, 执行期写者当场现形。
-        static volatile long g_xw = 0;
+        static volatile long g_xw = 0, g_wmHit = 0, g_wmMiss = 0;
+        // v7.67: 水印判定 — 125/3/1=原实现亲自自初始化过=执行流到过时间门
+        if (wm0 == 125u && wm1 == 3u && wm2 == 1u) g_wmHit++; else g_wmMiss++;
         if (snapS && g_tgt_base) {
             uint64_t xS = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
             uint32_t x8 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL);
@@ -2253,11 +2273,10 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         uint64_t nowNs2 = mach_absolute_time() * (uint64_t)ti2.numer / (uint64_t)ti2.denom;
         if (nowNs2 - vLastNs > 1000000000ULL && vCnt < 60) {
             vLastNs = nowNs2; vCnt++;
-            volatile uint32_t *vtb = (volatile uint32_t *)(g_tgt_base + 0x3f2900ULL);
-            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 执行期改写=%ld | 本帧preH=%d→postH=%d b0:%d→%d | tb=%u/%u/%u",
-                     g_vTot, g_vFail, g_xw, preHid, postHid, (int)preB0, (int)postB0,
-                     vtb[0], vtb[1], vtb[2]);
-            g_vTot = 0; g_vFail = 0; g_xw = 0;
+            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 执行期改写=%ld 水印:自初始化=%ld 未到达=%ld(本帧槽=%x/%x/%x) | preH=%d→postH=%d b0:%d→%d",
+                     g_vTot, g_vFail, g_xw, g_wmHit, g_wmMiss, wm0, wm1, wm2,
+                     preHid, postHid, (int)preB0, (int)postB0);
+            g_vTot = 0; g_vFail = 0; g_xw = 0; g_wmHit = 0; g_wmMiss = 0;
         }
     } @catch (NSException *e) {}
 }
@@ -2941,7 +2960,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.66 启动（+setHidden调用者LR取证 + 门段220字全量指纹核验）===");
+            ACETrace(@"=== v7.67 启动（+执行水印: 时间门自初始化陷阱, 硬件级判定执行流到达深度）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
