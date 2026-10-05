@@ -242,11 +242,15 @@ typedef struct { uint32_t n_strx; uint8_t n_type; uint8_t n_sect; uint16_t n_des
 static uintptr_t g_tgt_base = 0, g_tgt_end = 0;
 static void *g_saved_slot_val = NULL;
 static int g_rw_dialog = 0, g_rw_boot = 0;
+static volatile int g_freeze_web = 0;   // v7.47: 直调建面板期间冻结喂值(防跨tick不自洽)
 static void ACE_web_tick(void);   // v7.24 前置声明(定义在守护线程段)
 // ═══ v7.4: EndTime 补喂 ═══
 static void ACE_prime_endtime(void) {
     @try {
         if (!g_tgt_base) return;
+                // v7.47: 直调建面板期间冻结喂值——sub_11ffb0 入口门+建后门多次读 S 链,
+        // 若喂值线程在读间隙刷新 S, 会读到跨 tick 的不自洽快照 → 门失败。
+        if (g_freeze_web) return;
         uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
         if (ctx < 0x100000000ULL) return;
         // v7.21 铁证修正: 0xe411c 无配置分支用 scvtf 把 ctx+0x78 当有符号整数转 double。
@@ -1663,32 +1667,39 @@ static void ACE_post_sec_notif(int attempt) {
         }
     } @catch (NSException *e) { ACETrace(@"[notif-post] 异常: %@", e); }
 }
-// ═══ v7.46: 直调观察者block构建面板UI(绕过不可靠的通知投递) ═══
-// 静态地图(全实证): 面板构建函数=sub_11ffb0(观察者block@0x3e9358的invoke=base+0x11ffac)。
-// 16道门(S链①-④+45s时间门+ctx eq⑨-⑬+keyWindow)全喂得过; 幂等标志[0x3fc348]bit0
-// 仅在末尾addSubview成功后才置位→失败早退不置位→可重试。通知投递在混淆环境不可靠,
-// 改直调invoke: 读__DATA 0x3e9368拿invoke指针(=base+0x11ffac), 当block调用。
+// ═══ v7.47: 直调观察者block建面板 + 全门禁诊断 ═══
 static void ACE_build_panel_direct(int attempt) {
     @try {
         if (!g_tgt_base) return;
         volatile uint8_t *flag = (volatile uint8_t *)(g_tgt_base + 0x3fc348ULL);
         if (*flag & 1) {
-            if (attempt == 1) ACETrace(@"[panel] 幂等标志已置位=面板早已构建, 不再重建");
+            if (attempt == 1) ACETrace(@"[panel] 幂等标志已置位=面板早已构建, 盲点左上角即可");
             return;
         }
         uintptr_t blk = g_tgt_base + 0x3e9358ULL;
         void (*inv)(id) = (void (*)(id))*(uintptr_t *)(blk + 0x10);
         if (!inv) { ACETrace(@"[panel] 尝试%d: invoke指针为空", attempt); return; }
+        // ① 门禁全评估(13方程+时间门, 1=FAIL)
+        ACE_eq_snapshot("panel");
+        // ② 窗口状态
+        @try {
+            UIApplication *app = [UIApplication sharedApplication];
+            UIWindow *kw = app.keyWindow;
+            ACETrace(@"[panel] 尝试%d 窗口: keyWindow=%p windows数=%lu",
+                     attempt, (__bridge void *)kw, (unsigned long)[app.windows count]);
+        } @catch (NSException *e) {}
+        // ③ 冻结喂值 → 直调 → 解冻
+        g_freeze_web = 1;
+        ACE_web_tick();          // 冻结前最后喂一次, 保证 S 链新鲜且自洽
+        usleep(2000);            // 让在途的 web_keeper tick 落地
         if (attempt == 1)
-            ACETrace(@"[panel] 尝试%d: 直调观察者invoke=%p (门禁前快照 a8=%u S=%llu)",
-                     attempt, (void *)inv,
-                     *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL),
-                     (unsigned long long)(*(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL));
-        inv(nil);   // block invoke 首参=block指针, sub_11ffb0忽略参数只读全局→安全
+            ACETrace(@"[panel] 尝试%d: 冻结喂值, 直调观察者invoke=%p", attempt, (void *)inv);
+        inv(nil);
+        g_freeze_web = 0;
         if (*flag & 1)
-            ACETrace(@"[panel] ★尝试%d: 面板构建完成! 幂等标志已置位(盲点左上角出面板)", attempt);
+            ACETrace(@"[panel] ★尝试%d: 面板构建完成! 盲点左上角出面板", attempt);
         else
-            ACETrace(@"[panel] 尝试%d: invoke返回但标志未置位=某门禁静默失败(查上方快照)", attempt);
+            ACETrace(@"[panel] 尝试%d: invoke返回但标志未置位(门禁失败, 看[eq@panel]哪条=1)", attempt);
     } @catch (NSException *e) { ACETrace(@"[panel] 异常: %@", e); }
 }
 
@@ -2133,7 +2144,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.46 启动（+直调观察者建面板）===");
+            ACETrace(@"=== v7.47 启动（+门禁诊断+冻结喂值直调建面板）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -2166,6 +2177,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
             dispatch_after(dispatch_time(0, 8000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(0); });
             dispatch_after(dispatch_time(0, 9000000000LL), dispatch_get_main_queue(), ^{ ACE_build_panel_direct(0); });
+            
             dispatch_after(dispatch_time(0, 10000000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("boot10s"); });
             @try { ACE_start_net_probe(); } @catch (NSException *e) { ACETrace(@"[probe] 启动异常: %@", e); }
         }
