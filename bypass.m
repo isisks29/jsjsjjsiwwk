@@ -2108,6 +2108,7 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
     // →调原实现→解冻。撕裂窗口=0(单线程串行)。
     // 裁决: 面板出/失败分支=0 → 撕裂实锤+交付; 仍100%失败 → 撕裂证伪,
     // 下一步帧内dump S链槽原始值+各门期望值逐项对照。
+    uint64_t snapS = 0; uint32_t snapA8 = 0, snapAc = 0, snapB0 = 0;   // v7.65: 快照写入值(post对照用)
     g_freeze_web = 1;
     usleep(2000);
     @try {
@@ -2126,6 +2127,7 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
             *(volatile uint32_t *)(g_tgt_base + 0x3ff6acULL) = acs;
             *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0ULL) = b0s;
             *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) = Ss ^ 0xb75e8052badb72a6ULL;
+            snapS = Ss; snapA8 = a8s; snapAc = acs; snapB0 = b0s;   // v7.65: 留档
             // ═══ v7.64 双探针(冻结后/调原实现前) ═══
             // 探针A[code2]: draw门9个关键指令字 运行时 vs 文件 —— 从未核验过draw函数体,
             //   若运行时≠文件 → 之前全部静态分析对象错误(谜团根源)
@@ -2193,16 +2195,35 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         int postHid = (int)((UIView *)self).hidden;
         g_vTot++;
         if (preB0 && postB0 == 0) g_vFail++;   // byte0被清=原实现走了失败分支(0x8d0c4)
+        // ═══ v7.65 执行期写者探针 ═══
+        // v7.64已实锤: 码字=文件、快照回读=写入、python离线复算14门全过, 原实现仍100%
+        // 走失败分支(全dylib唯一跳向该区的路径=14门, 0x8dd08是canary路径已排除)。
+        // 逻辑上只剩唯一解释: 原实现执行期间(几十µs~ms窗口)有第三方改写S链——
+        // g_freeze_web只冻我方keeper, 冻不住靶场自己的喂值线程; 冻结期[Schain]探测器
+        // 也停摆=无人监测。post即刻回读四槽与快照比对, 执行期写者当场现形。
+        static volatile long g_xw = 0;
+        if (snapS && g_tgt_base) {
+            uint64_t xS = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
+            uint32_t x8 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL);
+            uint32_t xc = *(volatile uint32_t *)(g_tgt_base + 0x3ff6acULL);
+            uint32_t xb = *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0ULL);
+            if (xS != snapS || x8 != snapA8 || xc != snapAc || xb != snapB0) {
+                g_xw++;
+                if (g_xw <= 5)
+                    ACETrace(@"[xw] ★执行期写者! 快照S=%llu a8=%x ac=%x b0=%x → 执行后S=%llu a8=%x ac=%x b0=%x",
+                             (unsigned long long)snapS, snapA8, snapAc, snapB0,
+                             (unsigned long long)xS, x8, xc, xb);
+            }
+        }
         mach_timebase_info_data_t ti2; mach_timebase_info(&ti2);
         uint64_t nowNs2 = mach_absolute_time() * (uint64_t)ti2.numer / (uint64_t)ti2.denom;
         if (nowNs2 - vLastNs > 1000000000ULL && vCnt < 60) {
             vLastNs = nowNs2; vCnt++;
             volatile uint32_t *vtb = (volatile uint32_t *)(g_tgt_base + 0x3f2900ULL);
-            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld | 本帧preH=%d→postH=%d b0:%d→%d | tb=%u/%u/%u | origOff=%llx(应=8cdd4)",
-                     g_vTot, g_vFail, preHid, postHid, (int)preB0, (int)postB0,
-                     vtb[0], vtb[1], vtb[2],
-                     (unsigned long long)((uintptr_t)g_orig_draw - g_tgt_base));
-            g_vTot = 0; g_vFail = 0;
+            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 执行期改写=%ld | 本帧preH=%d→postH=%d b0:%d→%d | tb=%u/%u/%u",
+                     g_vTot, g_vFail, g_xw, preHid, postHid, (int)preB0, (int)postB0,
+                     vtb[0], vtb[1], vtb[2]);
+            g_vTot = 0; g_vFail = 0; g_xw = 0;
         }
     } @catch (NSException *e) {}
 }
@@ -2880,7 +2901,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.64 启动（+双探针: draw码字运行时核验 + S链/ctx原始值dump离线复算）===");
+            ACETrace(@"=== v7.65 启动（+执行期写者探针: 原实现返回后即刻回读S链vs快照, 第三方写者当场现形）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
