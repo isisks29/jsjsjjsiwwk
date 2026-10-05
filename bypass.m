@@ -128,6 +128,22 @@ static void ACETrace(NSString *fmt, ...) {
 static uintptr_t g_tgt_base, g_tgt_end;      // 前置声明(定义在第 2 段)
 static uintptr_t g_self_base;                // 前置声明(定义在第 2 段)
 static int g_ace_ready, g_ace_busy;
+// ═══ v7.41: _exit interpose（补上未设防暗杀通道）═══
+// 导入表实证靶场同时导入 exit / abort / _exit。此前只挂了 exit+abort，
+// _exit(9) 是完全裸的：不产崩溃文件、瞬死、无信号——与全部死相吻合。
+// 这里挂起并记录 caller 偏移（区分是靶场哪条 kill 分支开的枪）。
+static int g_hit__exit = 0;
+static void ACE__exit(int code) {
+    g_hit__exit++;
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    if (g_tgt_base && ra >= g_tgt_base && ra < g_tgt_end)
+        ACETrace(@"[_exit!!] code=%d caller=TGT+0x%lx (挂起拦截)",
+                 code, (unsigned long)(ra - g_tgt_base));
+    else
+        ACETrace(@"[_exit!!] code=%d caller=%p (挂起拦截)", code, (void *)ra);
+    for (;;) sleep(86400);
+}
+
 static int g_hit_nsl = 0;
 static int ACE_nanosleep(const struct timespec *rqtp, struct timespec *rmtp) {
     uintptr_t ra = (uintptr_t)__builtin_return_address(0);
@@ -203,6 +219,7 @@ ACE_INTERPOSE(ACE_task_threads,         task_threads)
 ACE_INTERPOSE(ACE_task_set_exception_ports, task_set_exception_ports)
 ACE_INTERPOSE(ACE_exit,                 exit)
 ACE_INTERPOSE(ACE_abort,                abort)
+ACE_INTERPOSE(ACE__exit,                _exit)   // v7.41: 补暗杀通道
 
 
 // ══════════════ 第 0.6 层：验卡结果改写（作业主机制）══════════════
@@ -1436,29 +1453,76 @@ static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
 // 每处 svc 后必跟 brk#1 或 movz x0,#9(第二道保险)。补丁: svc→movz x0,#0(假装退出
 // 码返回), 后一条→ret(安全检查失败路径变成正常返回)。进程从此打不死。
 // 若 vm_protect 失败(签名不允许改 .text) → 日志报 fail=24, 换静态重打包方案。
+// ═══ v7.41: 裸 svc 自毁点缴械（正确落点版，非 v7.32 的盲目 ret）═══
+// 全部 24 处 kill = 裸 svc #0x80 系统调用(exit/kill)，interpose 拦不住。
+// v7.32 曾用 svc→movz x0,#0; ret 盲改，但反汇编实证多数 kill 在【函数中部】，
+// 裸 ret 不恢复 sp/x29/x30 → 栈损坏换姿势崩；且 brk+4 常落进下一函数序言或
+// __Unwind_Resume。本版落点全部经 capstone 逐字节核验:
+//   · 23 处 → b 跳到所在函数【真 epilogue】(ldp/add sp→ret, 帧完整恢复)
+//   · 1 处(0xae820 纯 die 桩, 全函数无返回路径) → 原地合成 ldp x29,x30,[sp],#0x10; ret
+// 写通道: vm_write(Dobby 同款, 靶场导入表实证本进程代码页可写)。vm_write 被拒
+// 则回退 vm_protect(+VM_PROT_COPY 强制 COW 私有副本, 非 v7.32 的 RWX)直写再恢复 RX。
+// 每点写前验原指令==svc、写后回读校验, 全失败则日志报 kr0(需转静态重打包)。
+static int ACE_write_code(uintptr_t at, const uint32_t *words, unsigned n) {
+    mach_msg_type_number_t len = n * 4;
+    kern_return_t kr = vm_write(mach_task_self(), (vm_address_t)at,
+                                (vm_offset_t)(uintptr_t)words, len);
+    if (kr == KERN_SUCCESS) return 0;
+    // 回退: vm_protect + VM_PROT_COPY 造可写私有副本 → 直写 → 恢复 RX
+    vm_address_t page = (vm_address_t)at & ~(vm_address_t)0x3FFF;
+    kern_return_t kp = vm_protect(mach_task_self(), page, 0x4000, 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kp != KERN_SUCCESS) return (int)kr;   // 报第一次(vm_write)的 kr
+    volatile uint32_t *p = (volatile uint32_t *)at;
+    for (unsigned i = 0; i < n; i++) p[i] = words[i];
+    vm_protect(mach_task_self(), page, 0x4000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    return 0;
+}
 static int ACE_disarm_kills(void) {
-    static const unsigned kills[] = {
-        0x9f668, 0xa6220, 0xa62b8, 0xa630c, 0xa69d0, 0xa6ae8, 0xae820, 0xc2e34,
-        0xefe34, 0xefe40, 0xf1738, 0xf1744, 0xf1768, 0xf1774, 0xf9580, 0xf958c,
-        0xd1818, 0xd183c, 0xf8308, 0xf83d0, 0x31c14, 0xe61c0, 0xe6224, 0xf2668
+    // 23 处: kill偏移 → b epilogue (capstone 已验证编码)
+    static const unsigned int koff[] = {
+        0x31c14U, 0x9f668U, 0xa6220U, 0xa62b8U, 0xa630cU, 0xa69d0U,
+        0xa6ae8U, 0xc2e34U, 0xd1818U, 0xd183cU, 0xe61c0U, 0xe6224U,
+        0xefe34U, 0xefe40U, 0xf1738U, 0xf1744U, 0xf1768U, 0xf1774U,
+        0xf2668U, 0xf8308U, 0xf83d0U, 0xf9580U, 0xf958cU,
     };
-    int ok = 0, fail = 0;
-    for (unsigned k = 0; k < sizeof(kills) / sizeof(kills[0]); k++) {
-        uintptr_t at = g_tgt_base + kills[k];
-        vm_address_t page = (vm_address_t)at & ~(vm_address_t)0x3FFF;
-        kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, 0,
-                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-        if (kr != KERN_SUCCESS) { fail++; continue; }
-        volatile uint32_t *svc = (volatile uint32_t *)at;
-        if (*svc == 0xd4001001u) {        // svc #0x80
-            *svc = 0xd2800000u;           // movz x0, #0
-            *(svc + 1) = 0xd65f03c0u;     // brk/movz → ret
-            sys_icache_invalidate((void *)at, 8);
-            ok++;
-        } else { fail++; }
+    static const unsigned int kpatch[] = {
+        0x17ffffd6U, 0x17ffff02U, 0x17fff0d4U, 0x17fff0aeU,
+        0x17fff099U, 0x17ffffedU, 0x17ffffceU, 0x17ffcda5U,
+        0x17fffff0U, 0x17ffffe7U, 0x17ffffdfU, 0x17ffffc6U,
+        0x17fffff0U, 0x17ffffedU, 0x17fffff0U, 0x17ffffedU,
+        0x17ffffe4U, 0x17ffffe1U, 0x17ffffe5U, 0x17fffebbU,
+        0x17fffe89U, 0x17fffa1dU, 0x17fffa1aU,
+    };
+    const uint32_t SVC = 0xd4001001U;   // svc #0x80
+    int ok = 0, fail = 0, mism = 0, kr0 = 0, hkr = 0;
+    for (unsigned i = 0; i < sizeof(koff) / sizeof(koff[0]); i++) {
+        uintptr_t at = g_tgt_base + koff[i];
+        volatile uint32_t *p = (volatile uint32_t *)at;
+        if (*p != SVC) { mism++; continue; }          // 非svc=偏移漂移, 绝不动
+        uint32_t w = kpatch[i];
+        int r = ACE_write_code(at, &w, 1);
+        if (r && !hkr) { kr0 = r; hkr = 1; }
+        if (*p != w) { fail++; continue; }            // 回读校验
+        sys_icache_invalidate((void *)at, 4);
+        ok++;
     }
-    ACETrace(@"[disarm] 自毁点缴械: 成功=%d 失败=%d%s", ok, fail,
-             (fail && !ok) ? " (vm_protect 全拒=签名限制改不了 .text, 需换方案)" : "");
+    // 特殊: 0xae820 纯 die 桩(sub_ae808 无返回路径) → 合成 ldp x29,x30,[sp],#0x10; ret
+    {
+        uintptr_t at = g_tgt_base + 0xae820U;
+        volatile uint32_t *p = (volatile uint32_t *)at;
+        if (*p == SVC) {
+            uint32_t syn[2] = { 0xa8c17bfdU, 0xd65f03c0U };
+            int r = ACE_write_code(at, syn, 2);
+            if (r && !hkr) { kr0 = r; hkr = 1; }
+            if (p[0] == syn[0] && p[1] == syn[1]) {
+                sys_icache_invalidate((void *)at, 8); ok++;
+            } else fail++;
+        } else mism++;
+    }
+    ACETrace(@"[disarm] svc自毁点缴械: 成功=%d 失败=%d 偏移不符=%d kr0=%d%s",
+             ok, fail, mism, kr0,
+             (ok == 0 && kr0) ? " (vm_write+vm_protect全拒=代码签名禁改页, 需转静态重打包)" : "");
     return ok;
 }
 // ═══ v7.37: 复核线程孵化门神 ═══
@@ -1510,15 +1574,39 @@ static void ACE_post2(id self, SEL _cmd, NSString *name, id obj) {
     } @catch (NSException *e) {}
     if (g_orig_post2) g_orig_post2(self, _cmd, name, obj);
 }
+// v7.41: 走廊二分器 —— defaultCenter 在安保初始化尾段(0xf216c)被调, 位置在
+// canary 方程区【之后】、postNotification(0xf25c0)【之前】。据 [nc] 行是否出现二分:
+//   出现 = 方程区已过, 死亡在 VM解密通知名/postNotification 段;
+//   不出现 = 死亡在 q4 epilogue/方程区(0xf1ef0-0xf2164)内。
+static id (*g_orig_dc)(id, SEL) = NULL;
+static id ACE_dc(id self, SEL _cmd) {
+    @try {
+        uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+        if (g_tgt_base && ra >= g_tgt_base && ra < g_tgt_end
+            && g_ace_ready && !g_ace_busy) {
+            g_ace_busy = 1;
+            ACETrace(@"[nc] defaultCenter caller=TGT+0x%lx",
+                     (unsigned long)(ra - g_tgt_base));
+            g_ace_busy = 0;
+        }
+    } @catch (NSException *e) {}
+    return g_orig_dc ? g_orig_dc(self, _cmd) : nil;
+}
 static void ACE_install_notif_probe(void) {
     @try {
         Method m = class_getInstanceMethod([NSNotificationCenter class],
                                            @selector(postNotificationName:object:));
         if (m) g_orig_post2 = (void (*)(id, SEL, NSString *, id))
             method_setImplementation(m, (IMP)ACE_post2);
-        ACETrace(@"通知中心探针已挂=%d", g_orig_post2 != NULL);
+        // v7.41: defaultCenter 类方法探针(走廊二分)
+        Method mdc = class_getClassMethod([NSNotificationCenter class],
+                                          @selector(defaultCenter));
+        if (mdc) g_orig_dc = (id (*)(id, SEL))method_setImplementation(mdc, (IMP)ACE_dc);
+        ACETrace(@"通知中心探针已挂=%d defaultCenter=%d",
+                 g_orig_post2 != NULL, g_orig_dc != NULL);
     } @catch (NSException *e) { ACETrace(@"notif探针异常: %@", e); }
 }
+
 static void ACE_install_result_hook(void) {
     const struct mach_header *hdr = ACE_find_target_header();
     if (!hdr) { ACETrace(@"结果hook: 未找到靶场镜像(按指令签名扫描)"); return; }
@@ -1541,11 +1629,13 @@ static void ACE_install_result_hook(void) {
     if (!slot) { ACETrace(@"结果hook: 未找到 _dispatch_async 指针槽"); return; }
     g_tgt_base = base;
     g_tgt_end = base + (uintptr_t)textsize;
-    // v7.33: 撤销运行时写 .text —— iOS 对 file-backed RX 页禁止加 W(代码签名强制),
-    // v7.32 实证: ACE_disarm_kills 第一个写点即 EXC_BAD_ACCESS → 启动 ~1s 闪退。
-    // 改用「岗哨冻结」(thread_suspend, 纯 Mach API 不碰代码页), 见 flight_recorder。
-    // ACE_disarm_kills();
+    // v7.41: 重新启用运行时缴械 —— v7.32 崩溃是【工具用错】(vm_protect 加 RWX 后
+    // 直写 file-backed RX 页 → EXC_BAD_ACCESS)。本版改 vm_write(Dobby 同款内核写,
+    // 返回 kr 不崩) + vm_protect(+VM_PROT_COPY 造 COW 私有副本)兜底, 落点全部经
+    // capstone 核验跳到真 epilogue(帧完整)。全拒才日志 kr0, 不会 v7.32 式闪退。
+    ACE_disarm_kills();
     g_saved_slot_val = *slot;
+
     *slot = (void *)ACE_dispatch_async_hook;
     ACETrace(@"结果hook 已安装: 靶场基址=%p __TEXT=0x%llx 槽=%p 原值=%p → %p",
              (void *)base, (unsigned long long)textsize, slot, g_saved_slot_val,
@@ -1663,8 +1753,8 @@ static void ACE_setup_button(void) {
             btn.layer.cornerRadius = 14;
             btn.clipsToBounds = YES;
             [g_rootVC.view addSubview:btn];
-            ACETrace(@"interpose命中: tsep=%d taskThreads=%d exit=%d abort=%d (tsep>0=隐身层实锤生效)",
-                     g_hit_tsep, g_hit_tt, g_hit_exit, g_hit_abort);
+            ACETrace(@"interpose命中: tsep=%d taskThreads=%d exit=%d abort=%d _exit=%d (tsep>0=隐身层实锤生效)",
+                     g_hit_tsep, g_hit_tt, g_hit_exit, g_hit_abort, g_hit__exit);
             ACETrace(@"悬浮按钮已显示：点一下=复制全部日志，按住可拖动");
         } @catch (NSException *e) { ACETrace(@"按钮创建失败: %@", e); }
     }
@@ -1822,7 +1912,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.4 启动 ===");
+            ACETrace(@"=== v7.41 启动（隐身层+svc缴械 激活中）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
