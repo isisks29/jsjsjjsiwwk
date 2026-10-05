@@ -1606,6 +1606,24 @@ static void ACE_install_notif_probe(void) {
                  g_orig_post2 != NULL, g_orig_dc != NULL);
     } @catch (NSException *e) { ACETrace(@"notif探针异常: %@", e); }
 }
+// ═══ v7.43: 安保init block劫持空操作 ═══
+// 死亡链实锤: 输卡密→sub_d27ac真连服务器→TEST123得-404真失败→失败处理器sub_dcf88
+// →弹错误UIAlert(completion=安保init block@0x3e9230)→用户点掉→安保init(0xf177c)跑
+// →canary区9决策点→dispatcher(0xf2630)→svc exit_group(0xf2668)裸自毁。
+// 安保init是全局block, invoke指针存可写__DATA(0x3e9240)。改它=改__DATA一个指针
+// (与已成功的dispatch_async槽/pthread_create槽同类, 不碰代码页, iOS18合规)。
+static volatile int g_secinit_hit = 0;
+static void ACE_secinit_noop(void *block) {
+    (void)block;
+    if (!g_secinit_hit) {
+        g_secinit_hit = 1;
+        if (g_ace_ready && !g_ace_busy) {
+            g_ace_busy = 1;
+            ACETrace(@"[secinit] ★安保init被劫持为空操作—自毁链已掐断(存活)");
+            g_ace_busy = 0;
+        }
+    }
+}
 
 static void ACE_install_result_hook(void) {
     const struct mach_header *hdr = ACE_find_target_header();
@@ -1651,6 +1669,23 @@ static void ACE_install_result_hook(void) {
         ACETrace(@"[gate] pthread_create槽已改写: %p(%s) → %p", pcold, pcdi.dli_fname, (void *)ACE_pc_gate);
     } else {
         ACETrace(@"[gate] pthread_create槽验证失败不改写: %p", pcold);
+    }
+        // ═══ v7.43 核心: 劫持安保init block invoke指针(__DATA 0x3e9240) ═══
+    // block@0x3e9230 invoke字段=0x3e9240, 运行时(dyld rebase后)=base+0xf177c。
+    // 全靶场仅此1处被dispatch(失败处理器弹窗completion), 安保init无其他指针引用,
+    // ctx已由验卡函数先calloc → 换空操作安全。写前校验现值防偏移漂移。
+    {
+        volatile uintptr_t *sinv = (volatile uintptr_t *)(base + 0x3e9240ULL);
+        uintptr_t cur = *sinv;
+        uintptr_t expect = base + 0xf177cULL;
+        if (cur == expect || cur == 0xf177cULL) {
+            *sinv = (uintptr_t)(void *)ACE_secinit_noop;
+            ACETrace(@"[secinit] 安保init invoke槽已劫持: 0x%lx → %p (自毁触发链掐断)",
+                     (unsigned long)cur, (void *)ACE_secinit_noop);
+        } else {
+            ACETrace(@"[secinit] 槽值0x%lx≠base+0xf177c(0x%lx), 未改(疑偏移漂移)",
+                     (unsigned long)cur, (unsigned long)expect);
+        }
     }
 }
 // ══════════════ 屏幕悬浮按钮（日志导出）═══════════════
@@ -1912,7 +1947,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.42 启动（隐身层+svc缴械 激活中）===");
+            ACETrace(@"=== v7.43 启动（隐身层+安保init劫持 激活中）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
