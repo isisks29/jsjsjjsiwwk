@@ -871,10 +871,12 @@ static void ACE_web_tick(void) {
         *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8) = a8;
         uint32_t t2 = a8 ^ 0x1767cedcu;
         t2 ^= t2 >> 15; t2 *= 0x1f3d6a71u; t2 ^= t2 >> 11; t2 *= 0x8e4b1395u;
-                // v7.59 真凶修复: drawInMTKView(唯一活消费者)的 eq③ 用常数 K=0x8e4b1395 当 Slo 位
-        // (0x8cebc eor w12,w21,w9,lsr#17, w21=乘法常数无重写, 逐条核验); sub_11ffb0/iconOnClick/
-        // 巡检员是 Slo 版但已全部绕开/挂起。喂 K 版 ac 渲染器每帧全过 → setHidden:NO → 面板出。
-        uint32_t ac = 0x8e4b1395u ^ (t2 >> 17) ^ t2;
+        // v7.61 回滚修正: v7.59 误读反汇编(把 w22 抄成 w21)。0x8cebc 原始字节
+        // 0x4a4946cc = EOR w12, w22, w9, LSR #17, w22 = x22(S明文)低32位(0x8ce58)。
+        // eq③真式 = Slo ^ (t2>>17) ^ t2 — 与第二链 ac8c(从未改过)同构一致。
+        // K版错喂 → 真实eq③挂 + eq④连锁挂(t3以ac槽为输入) → 每帧失败分支
+        // hidden=1+清byte0(=v7.59/60全部观测); 我方评估同用K式 → bits=0x0假象。
+        uint32_t ac = Slo ^ (t2 >> 17) ^ t2;
         *(volatile uint32_t *)(g_tgt_base + 0x3ff6ac) = ac;
         uint32_t t3 = ac ^ 0x5d41c293u;
         t3 ^= t3 >> 15; t3 *= 0x1f3d6a71u; t3 ^= t3 >> 11; t3 *= 0x8e4b1395u;
@@ -1218,7 +1220,7 @@ static void ACE_eq_snapshot(const char *tag) {
         uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
         uint32_t e2 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);   // v7.50: 真式含^Shi
         uint32_t G  = ACE_pmix32(a8 ^ 0x1767cedcu);
-        uint32_t e3 = (0x8e4b1395u ^ (G >> 17)) ^ G;   // v7.59: K版(drawInMTKView真式)
+        uint32_t e3 = (Slo ^ (G >> 17)) ^ G;   // v7.61: Slo版(0x8cebc原始字节实证, v7.59 K版系误读)
         uint32_t H  = ACE_pmix32(ac ^ 0x5d41c293u);
         uint32_t e4 = (Shi ^ (H >> 17)) ^ H;
         mach_timebase_info_data_t ti;
@@ -1739,7 +1741,7 @@ static void ACE_gates_dump(const char *tag) {
         uint32_t e2 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);                     // 门3 eq②真式
         int g3 = (a8 == e2);
         uint32_t G = ACE_pmix32(a8 ^ 0x1767cedcu);                              // 门4 eq③
-        int g4 = (ac == ((0x8e4b1395u ^ (G >> 17)) ^ G));   // v7.59: K版(drawInMTKView真式)
+        int g4 = (ac == ((Slo ^ (G >> 17)) ^ G));   // v7.61: Slo版(原始字节实证)
         uint32_t H = ACE_pmix32(ac ^ 0x5d41c293u);                              // 门5 eq④
         int g5 = (b0 == ((Shi ^ (H >> 17)) ^ H));
         // 门6/7 时间门: 严格用靶场自己的 timebase 槽[0x3fc34c/350](0x12027c ldp),
@@ -2051,7 +2053,7 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                 uint32_t b0 = *(volatile uint32_t *)(B + 0x3ff6b0ULL);
                 uint32_t e2 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);
                 uint32_t G = ACE_pmix32(a8 ^ 0x1767cedcu);
-                uint32_t e3 = (0x8e4b1395u ^ (G >> 17)) ^ G;   // v7.59: K版
+                uint32_t e3 = (Slo ^ (G >> 17)) ^ G;   // v7.61: Slo版
                 uint32_t H = ACE_pmix32(ac ^ 0x5d41c293u);
                 uint32_t e4 = (Shi ^ (H >> 17)) ^ H;
                 uint64_t ms = nowNs / 1000000ULL;
@@ -2760,7 +2762,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.60 启动（+时基槽矫治: draw时间门毒槽修复, 面板出帧最后一公里）===");
+            ACETrace(@"=== v7.61 启动（eq③回滚Slo版: 0x8cebc原始字节0x4a4946cc实证w22=Slo, v7.59 K版系误读）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
