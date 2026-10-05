@@ -2038,6 +2038,18 @@ static void ACE_hook_73(id self, SEL _cmd, id n) {
 }
 static void ACE_hook_draw(id self, SEL _cmd, id view) {
     g_drawCalls++;   // v7.58: 渲染循环计数(1s复查据此决定是否手动驱动)
+    // ═══ v7.62 帧级裁决探针 ═══
+    // 铁三角矛盾: 事前评估bits=0x0 + hidden恒1 + 全线性扫描实证全dylib只有5处
+    // setHidden(写YES唯一=0x8d0e0失败分支)。裁决法: 失败分支必清byte0(0x8d0c4 strb wzr),
+    // 成功分支第一句必setHidden:NO(0x8d13c) → 同一次调用前后读byte0/hidden即可分辨:
+    //   failCnt高 = 原实现真走失败分支(评估与执行输入有别) | postH=0又翻1 = 外部写者
+    //   origOff≠0x8cdd4 = 我们调的根本不是靶场那段门代码(整个谜团翻案)
+    static volatile long g_vTot = 0, g_vFail = 0;
+    static uint64_t vLastNs = 0; static int vCnt = 0;
+    volatile uint8_t *vsw = g_tgt_base ? (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL) : NULL;
+    int preHid = (int)((UIView *)self).hidden;
+    if (vsw) *vsw = (uint8_t)g_panelWant;   // 置期望值, 失败分支若清0即可检出
+    uint8_t preB0 = vsw ? *vsw : 0;
     @try {
         if (g_tgt_base) {
             static uint64_t lastNs = 0; static int cnt = 0;
@@ -2081,14 +2093,31 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                 unsigned bits = (unsigned)(f1 | f2 << 1 | f3 << 2 | f4 << 3 | f5 << 4 | f6 << 5 |
                                            f7 << 6 | f8 << 7 | f9 << 8 | f10 << 9 | f11 << 10 |
                                            f12 << 11 | f13 << 12 | f14 << 13);
-                int hid = (int)((UIView *)self).hidden;
                 ACETrace(@"[drawgate] 活体评估 bits=0x%x c0=%x age=%lld hidden=%d S=%llu C=%llx",
-                         bits, c0, (long long)(ms - S), hid, (unsigned long long)S, (unsigned long long)C);
+                         bits, c0, (long long)(ms - S), preHid, (unsigned long long)S, (unsigned long long)C);
                 cnt++;
             }
         }
     } @catch (NSException *e) {}
     if (g_orig_draw) g_orig_draw(self, _cmd, view);
+    // ── post: 当场验尸 ──
+    @try {
+        uint8_t postB0 = vsw ? *vsw : 0;
+        int postHid = (int)((UIView *)self).hidden;
+        g_vTot++;
+        if (preB0 && postB0 == 0) g_vFail++;   // byte0被清=原实现走了失败分支(0x8d0c4)
+        mach_timebase_info_data_t ti2; mach_timebase_info(&ti2);
+        uint64_t nowNs2 = mach_absolute_time() * (uint64_t)ti2.numer / (uint64_t)ti2.denom;
+        if (nowNs2 - vLastNs > 1000000000ULL && vCnt < 60) {
+            vLastNs = nowNs2; vCnt++;
+            volatile uint32_t *vtb = (volatile uint32_t *)(g_tgt_base + 0x3f2900ULL);
+            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld | 本帧preH=%d→postH=%d b0:%d→%d | tb=%u/%u/%u | origOff=%llx(应=8cdd4)",
+                     g_vTot, g_vFail, preHid, postHid, (int)preB0, (int)postB0,
+                     vtb[0], vtb[1], vtb[2],
+                     (unsigned long long)((uintptr_t)g_orig_draw - g_tgt_base));
+            g_vTot = 0; g_vFail = 0;
+        }
+    } @catch (NSException *e) {}
 }
 
 // ═══ v7.54: 原生面板复刻构建(主攻路线) ═══
@@ -2173,7 +2202,9 @@ static void ACE_native_panel_build(int tag) {
             if (md && !g_orig_draw) g_orig_draw = (void (*)(id, SEL, id))method_setImplementation(md, (IMP)ACE_hook_draw);
             Method m73 = class_getInstanceMethod(clsM, NSSelectorFromString(@"_0x73C9A1E5:"));
             if (m73 && !g_orig_73) g_orig_73 = (void (*)(id, SEL, id))method_setImplementation(m73, (IMP)ACE_hook_73);
-            ACETrace(@"[native] draw仪表已挂 draw=%d 73=%d", !!g_orig_draw, !!g_orig_73);
+            ACETrace(@"[native] draw仪表已挂 draw=%d 73=%d origIMP偏移=%llx(应=8cdd4)",
+                     !!g_orig_draw, !!g_orig_73,
+                     (unsigned long long)(g_orig_draw ? ((uintptr_t)g_orig_draw - g_tgt_base) : 0));
         } @catch (NSException *e) { ACETrace(@"[native] draw仪表挂载异常: %@", e); }
         id ball = ((id (*)(id, SEL, void *, CGRect))objc_msgSend)([clsBall alloc], sF2,
                                                                   cfg, CGRectMake(489, 58, 45, 45));
@@ -2762,7 +2793,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.61 启动（eq③回滚Slo版: 0x8cebc原始字节0x4a4946cc实证w22=Slo, v7.59 K版系误读）===");
+            ACETrace(@"=== v7.62 启动（+帧级裁决探针: 原实现前后读hidden/byte0+IMP偏移, 一次调用当场裁决失败分支归属）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
