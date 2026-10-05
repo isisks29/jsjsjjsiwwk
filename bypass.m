@@ -861,6 +861,22 @@ static void ACE_web_tick(void) {
         t3 ^= t3 >> 15; t3 *= 0x1f3d6a71u; t3 ^= t3 >> 11; t3 *= 0x8e4b1395u;
         uint32_t b0 = Shi ^ (t3 >> 17) ^ t3;
         *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0) = b0;
+        // ── ①b v7.45: 第二S链(0x3ff680-690) = iconOnClick 的面板门禁 ──
+        // 实证: 点悬浮球→第一链canary→45s时间门→ctx eq⑨-⑬→查第二链([0x3ff688]≠0
+        // +镜像方程+7分钟窗)→全过才翻转面板可见字节(_0xE4C8719B byte[0]^=1)。
+        // 第二链原由复核线程(已被拦)在真验卡成功后写 → 恒0 → 面板永不出。
+        // 全靶场读它的只有 iconOnClick(失败=静默return,无kill) → 喂它零风险。
+        *(volatile uint64_t *)(g_tgt_base + 0x3ff680) = S ^ 0xb75e8052badb72a6ULL;
+        uint32_t a88 = ACE_mix32(((uint32_t)S ^ 0xd18ddb25u) ^ Shi);
+        *(volatile uint32_t *)(g_tgt_base + 0x3ff688) = a88;
+        uint32_t g2 = a88 ^ 0x1767cedcu;
+        g2 ^= g2 >> 15; g2 *= 0x1f3d6a71u; g2 ^= g2 >> 11; g2 *= 0x8e4b1395u;  // pmix
+        uint32_t ac8c = Slo ^ (g2 >> 17) ^ g2;
+        *(volatile uint32_t *)(g_tgt_base + 0x3ff68c) = ac8c;
+        uint32_t h2 = ac8c ^ 0x5d41c293u;
+        h2 ^= h2 >> 15; h2 *= 0x1f3d6a71u; h2 ^= h2 >> 11; h2 *= 0x8e4b1395u;  // pmix
+        uint32_t b090 = Shi ^ (h2 >> 17) ^ h2;
+        *(volatile uint32_t *)(g_tgt_base + 0x3ff690) = b090;
         // ── ② ctx canary 网(时间无关, 每 tick 自洽重建) ──
         uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
         if (ctx < 0x100000000ULL) return;
@@ -1675,6 +1691,71 @@ static void ACE_install_notif_probe(void) {
                  g_orig_addObs4 != NULL, g_orig_addObsSel != NULL);
     } @catch (NSException *e) { ACETrace(@"notif探针异常: %@", e); }
 }
+// ═══ v7.45: 悬浮球探针 + UI 盘点扫描 ═══
+static void (*g_orig_iconClick)(id, SEL) = NULL;
+static void ACE_icon_click(id self, SEL _cmd) {
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[ball] iconOnClick 触发(开始过S链门禁)");
+        g_ace_busy = 0;
+    }
+    if (g_orig_iconClick) g_orig_iconClick(self, _cmd);
+    @try {
+        void *st = ((void *(*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"_0xE4C8719B"));
+        if (st && g_ace_ready && !g_ace_busy) {
+            g_ace_busy = 1;
+            ACETrace(@"[ball] 门禁结果: 面板标志byte[0]=%d (1=面板应已显示, 0=被静默拒绝)",
+                     *(volatile uint8_t *)st);
+            g_ace_busy = 0;
+        }
+    } @catch (NSException *e) {}
+}
+static void (*g_orig_ballTouch)(id, SEL, void *, void *) = NULL;
+static void ACE_ball_touch(id self, SEL _cmd, void *a, void *b) {
+    @try {
+        UIView *v = (UIView *)self;
+        if (g_ace_ready && !g_ace_busy) {
+            g_ace_busy = 1;
+            ACETrace(@"[ball] touchesBegan 命中! frame=(%g,%g,%g,%g)",
+                     v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height);
+            g_ace_busy = 0;
+        }
+    } @catch (NSException *e) {}
+    if (g_orig_ballTouch) g_orig_ballTouch(self, _cmd, a, b);
+}
+static void ACE_install_ball_probe(void) {
+    @try {
+        Class ball = NSClassFromString(@"_0xD4E9A3C7");
+        if (!ball) { ACETrace(@"[ball] 类_0xD4E9A3C7不存在"); return; }
+        Method m1 = class_getInstanceMethod(ball, NSSelectorFromString(@"iconOnClick"));
+        if (m1) g_orig_iconClick = (void (*)(id, SEL))method_setImplementation(m1, (IMP)ACE_icon_click);
+        Method m2 = class_getInstanceMethod(ball, NSSelectorFromString(@"touchesBegan:withEvent:"));
+        if (m2) g_orig_ballTouch = (void (*)(id, SEL, void *, void *))method_setImplementation(m2, (IMP)ACE_ball_touch);
+        ACETrace(@"[ball] 悬浮球探针已挂 iconOnClick=%d touches=%d",
+                 g_orig_iconClick != NULL, g_orig_ballTouch != NULL);
+    } @catch (NSException *e) { ACETrace(@"[ball] 探针异常: %@", e); }
+}
+static void ACE_ui_scan(const char *when) {
+    @try {
+        NSMutableArray *stack = [NSMutableArray array];
+        for (UIWindow *w in [[UIApplication sharedApplication] windows]) [stack addObject:w];
+        int logged = 0;
+        while ([stack count] > 0 && logged < 40) {
+            UIView *v = (UIView *)[stack lastObject];
+            [stack removeLastObject];
+            for (UIView *s in [v subviews]) [stack addObject:s];
+            NSString *cn = NSStringFromClass([v class]);
+            if ([cn hasPrefix:@"_0x"]) {
+                ACETrace(@"[ui-scan/%s] %s frame=(%g,%g,%g,%g) hidden=%d alpha=%g", when,
+                         cn.UTF8String, v.frame.origin.x, v.frame.origin.y,
+                         v.frame.size.width, v.frame.size.height, (int)v.hidden, v.alpha);
+                logged++;
+            }
+        }
+        if (logged == 0)
+            ACETrace(@"[ui-scan/%s] 未发现靶场自建视图(观察者可能没跑/窗口未挂)", when);
+    } @catch (NSException *e) { ACETrace(@"[ui-scan] 异常: %@", e); }
+}
 // ═══ v7.43: 安保init block劫持空操作 ═══
 // 死亡链实锤: 输卡密→sub_d27ac真连服务器→TEST123得-404真失败→失败处理器sub_dcf88
 // →弹错误UIAlert(completion=安保init block@0x3e9230)→用户点掉→安保init(0xf177c)跑
@@ -1995,6 +2076,8 @@ static id ACE_alert_init(id cls, SEL _cmd, id title, id msg, NSInteger style) {
         // v7.44: 「授权成功」= 验卡终点, 替空操作的安保init补发通知激活面板UI
         if ([t containsString:@"授权成功"] || [t containsString:@"激活成功"]) {
             ACE_schedule_sec_posts();
+            dispatch_after(dispatch_time(0, 2500000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("成功后2.5s"); });
+            dispatch_after(dispatch_time(0, 8000000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("成功后8s"); });
         }
         g_ace_busy = 0;
     }
@@ -2020,7 +2103,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.44 启动（隐身层+安保init劫持+通知补发 激活中）===");
+            ACETrace(@"=== v7.45 启动（+第二S链喂值+悬浮球探针+UI盘点）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -2046,11 +2129,13 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
                     ACETrace(@"Alert 探针已挂");
                 }
                 ACE_install_notif_probe();   // v7.40: 通知中心探针(安保尾段传感器)
+                ACE_install_ball_probe();    // v7.45: 悬浮球探针(iconOnClick/touches)
             } @catch (NSException *e) { ACETrace(@"探针挂设异常: %@", e); }
             @try { ACE_install_tel_hooks(); } @catch (NSException *e) { ACETrace(@"[tel] 安装异常: %@", e); }
             g_ace_busy = 0;
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
             dispatch_after(dispatch_time(0, 8000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(0); });
+            dispatch_after(dispatch_time(0, 10000000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("boot10s"); })
             @try { ACE_start_net_probe(); } @catch (NSException *e) { ACETrace(@"[probe] 启动异常: %@", e); }
         }
     });
