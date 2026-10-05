@@ -1826,6 +1826,20 @@ static void ACE_build_panel_direct(int attempt) {
             ACETrace(@"[panel] ★尝试%d: 面板构建完成! 盲点左上角出面板", attempt);
     } @catch (NSException *e) { ACETrace(@"[panel] 异常: %@", e); }
 }
+// ═══ v7.54: 可见球点击 = 原生面板显隐开关 ═══
+// 开关语义(F, drawInMTKView 0x8d360/0x8d838): [0x3ff7e4] byte0 非零=渲染 ImGui 内容
+// (bridge m1/container n0), 零=跳过内容渲染。iconOnClick(0x111fa4-b8) 就是 byte0^=1,
+// 但被 S链+第二链+45s+7min 四重门禁包裹; 我们直接翻字节 = 无门禁等价物。
+static void ACE_visBallTap(void) {
+    @try {
+        if (!g_tgt_base) return;
+        volatile uint8_t *sw = (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
+        uint8_t old = *sw;
+        *sw = old ? 0 : 1;
+        ACETrace(@"[visball] 点击: 面板开关byte0 %d→%d (%@)", (int)old, (int)*sw,
+                 *sw ? @"显示内容" : @"隐藏内容");
+    } @catch (NSException *e) { ACETrace(@"[visball] 异常: %@", e); }
+}
 
 // ═══ v7.53: 自绘面板兜底(blue 路线) ═══
 // 三轮探针实锤: sub_11ffb0 链的代码字节原样([code]行与文件全等)、block结构完好
@@ -1870,6 +1884,7 @@ static void ACE_fb_refresh(void) {
     ACETrace(@"[fbpanel] 点击热区 → 面板%@", g_fbPanel.hidden ? @"隐藏" : @"显示");
 }
 - (void)fbHide:(id)sender { g_fbPanel.hidden = YES; }
+- (void)fbNativeToggle:(id)sender { ACE_visBallTap(); }   // v7.54: 可见球→原生面板显隐
 @end
 static void ACE_install_fallback_panel(void) {
     static ACEFbHelper *helper = nil;
@@ -1927,12 +1942,141 @@ static void ACE_install_fallback_panel(void) {
         ACETrace(@"[fbpanel] ★自绘面板已装: 点左上角(12,54 44×44透明热区)出3项面板");
     } @catch (NSException *e) { ACETrace(@"[fbpanel] 异常: %@", e); }
 }
+// ═══ v7.54: 自建可见悬浮球(用户方案) — 点击切换原生面板显隐 ═══
+// 原生球在(0,0,45,45)但透明背景+base64图标可能不可见(老师实锤"左上角看不到按钮")。
+// 自建可见球叠放在同位置(后addSubview=最上层, 优先接点击), 点击=ACE_visBallTap。
+static UIButton *g_visBall = nil;
+static void ACE_install_visible_ball(void) {
+    static ACEFbHelper *helper2 = nil;
+    if (helper2) return;                                   // 幂等
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        UIWindow *kw = app.keyWindow;
+        if (!kw) for (UIWindow *w in app.windows) if (!w.hidden && w.alpha > 0.01) { kw = w; break; }
+        if (!kw) {
+            dispatch_after(dispatch_time(0, 2000000000LL), dispatch_get_main_queue(), ^{ ACE_install_visible_ball(); });
+            return;
+        }
+        helper2 = [[ACEFbHelper alloc] init];
+        g_visBall = [[UIButton alloc] initWithFrame:CGRectMake(2, 26, 45, 45)];
+        g_visBall.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.65];
+        g_visBall.layer.cornerRadius = 22;
+        [g_visBall setTitle:@"菜单" forState:UIControlStateNormal];
+        [g_visBall setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        g_visBall.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        [g_visBall addTarget:helper2 action:@selector(fbNativeToggle:) forControlEvents:UIControlEventTouchUpInside];
+        [kw addSubview:g_visBall];
+        [kw bringSubviewToFront:g_visBall];
+        ACETrace(@"[visball] ★可见球已装左上角(2,26 45×45), 点击=切换原生面板显隐");
+    } @catch (NSException *e) { ACETrace(@"[visball] 异常: %@", e); }
+}
+// ═══ v7.54: 原生面板复刻构建(主攻路线) ═══
+// 全局机制(全部F级, 反汇编逐条解码):
+// ① sub_11fa5c(启动即跑,[disp]+0x11fa5c实证): 注册通知观察者(block#1@0x3e9358→sub_11ffb0)
+//    + 建250ms周期dispatch timer(block#2@0x3e9378→sub_120e28巡检员, 0x11fec0-11ff30)
+//    + bl sub_11ffb0立即构建一次(0x11ff34)
+// ② sub_120e28巡检员(0x120e28-0x121174): S链+canary全链检查——一致→b sub_11ffb0(幂等);
+//    不一致且flag=1→拆面板(清[0x3ff7e4]byte0/两视图removeFromSuperview/release/清三全局槽)
+//    → web_tick喂值恒自洽(gates 16/16实证)时, 巡检员=免费维护者, 永不拆台
+// ③ MTKView init(0x8c0fc, 3284B): 无门禁(唯一失败点=0x8c1a0 super init nil即Metal不可用),
+//    自建UIWindow(initWithWindowScene 0x8c32c)+setHidden:NO([0x3f2850]槽,0x8c7ac-bc)
+//    +Metal设备/commandQueue/ImGui(setLoader: 0x8c9c0)+120fps(0x8c800)+后台通知观察者
+// ④ 容器init(0x1271b4, 124B全量): [super init]+set_0xE4C8719B:(cfg), 无门禁
+// ⑤ 桥接init(0x28814): set_0xE4C8719B:+Documents路径+NSFileManager, 无门禁
+// ⑥ 球init(0x111880, 856B全量): super initWithFrame:用(0,0,w,h)(d0/d1传入值被丢弃,
+//    0x1118b4 GOT CGPointZero实锤)→球恒在左上角; 透明背景+base64图标+Tap手势→iconOnClick
+// ⑦ 创建序列(sub_11ffb0创建段0x120744-0x120d3c逐指令): 容器(cfg)→桥接(cfg)→
+//    MTKView(cfg,容器,桥接,CGRect)→球(cfg,CGRect{489,58,45,45})→[window addSubview:球]→
+//    [0x3fc328]=retain(mtk)→[0x3fc330]=球(+1移交)→[0x3fc348]byte0=1
+// ⑧ drawInMTKView:(0x8cdd4)每帧查S链eq②(^Shi版0x8ce70)-eq⑬: 过→setHidden:NO(0x8d12c);
+//    挂→byte0清零+setHidden:YES(0x8d0b4) → 面板可见性=canary心跳, 喂值在则面板在
+// 复刻=绕过sub_11ffb0的31道门禁与其"早退之谜"(v7.52毒值实锤序言执行但tb恒0——
+// 原生250ms定时器同样调不起来, 非我方调用方式问题), 直接按⑦构造原生面板。
+static BOOL g_nativeBuilt = NO;
+static void ACE_native_panel_build(int tag) {
+    @try {
+        if (!g_tgt_base) return;
+        volatile uint8_t *flag = (volatile uint8_t *)(g_tgt_base + 0x3fc348ULL);
+        if (*flag & 1) {
+            if (!g_nativeBuilt) { g_nativeBuilt = YES; ACETrace(@"[native] tag%d: flag已置位=面板已在, 补装可见球", tag); }
+            ACE_install_visible_ball();
+            return;
+        }
+        if (g_nativeBuilt) return;                          // 已建过又被拆=canary断, 不重复
+        Class clsC = NSClassFromString(@"_0xC8E2A541");
+        Class clsB = NSClassFromString(@"_0xB1D7F3A9");
+        Class clsM = NSClassFromString(@"_0x1E6B7A93");
+        Class clsBall = NSClassFromString(@"_0xD4E9A3C7");
+        if (!clsC || !clsB || !clsM || !clsBall) {
+            ACETrace(@"[native] tag%d: 类缺失 C=%d B=%d M=%d 球=%d", tag, !!clsC, !!clsB, !!clsM, !!clsBall);
+            return;
+        }
+        UIApplication *app = [UIApplication sharedApplication];
+        UIWindow *kw = app.keyWindow;
+        if (!kw) for (UIWindow *w in app.windows) if (!w.hidden && w.alpha > 0.01) { kw = w; break; }
+        if (!kw) { ACETrace(@"[native] tag%d: 无可用窗口", tag); return; }
+        void *cfg = (void *)(g_tgt_base + 0x3ff7e4ULL);
+        CGRect full = kw.frame;
+        SEL sF  = NSSelectorFromString(@"initWithFrame:");
+        SEL sF4 = NSSelectorFromString(@"initWithFrame::::");
+        SEL sF2 = NSSelectorFromString(@"initWithFrame::");
+        // 构建期冻结喂值(防跨tick撕裂), 先喂后冻(v7.50顺序)
+        ACE_web_tick();
+        g_freeze_web = 1;
+        usleep(3000);
+        id container = ((id (*)(id, SEL, void *))objc_msgSend)([clsC alloc], sF, cfg);
+        id bridge    = ((id (*)(id, SEL, void *))objc_msgSend)([clsB alloc], sF, cfg);
+        id mtk = ((id (*)(id, SEL, void *, id, id, CGRect))objc_msgSend)([clsM alloc], sF4,
+                                                                         cfg, container, bridge, full);
+        ACETrace(@"[native] tag%d: 容器=%p 桥接=%p mtk=%p", tag,
+                 (__bridge void *)container, (__bridge void *)bridge, (__bridge void *)mtk);
+        if (!mtk) {
+            g_freeze_web = 0;
+            ACETrace(@"[native] tag%d: MTKView init返nil(Metal失败?), 本次中止", tag);
+            return;
+        }
+        id ball = ((id (*)(id, SEL, void *, CGRect))objc_msgSend)([clsBall alloc], sF2,
+                                                                  cfg, CGRectMake(489, 58, 45, 45));
+        ((void (*)(id, SEL, id))objc_msgSend)(kw, @selector(addSubview:), ball);
+        // 全局槽(仿0x120d04-0x120d3c): 328=retain(mtk), 330=ball(+1移交), 348byte0=1
+        volatile uintptr_t *p328 = (volatile uintptr_t *)(g_tgt_base + 0x3fc328ULL);
+        volatile uintptr_t *p330 = (volatile uintptr_t *)(g_tgt_base + 0x3fc330ULL);
+        uintptr_t old328 = *p328, old330 = *p330;
+        *p328 = (uintptr_t)CFBridgingRetain(mtk);
+        *p330 = (uintptr_t)CFBridgingRetain(ball);
+        if (old328) CFBridgingRelease((void *)old328);
+        if (old330) CFBridgingRelease((void *)old330);
+        *flag = 1;
+        // 渲染开关: byte0非零=drawInMTKView画ImGui内容(文件初值'p'=0x70非零)
+        volatile uint8_t *sw = (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
+        uint8_t sw0 = *sw;
+        if (sw0 == 0) *sw = 1;
+        g_nativeBuilt = YES;
+        uintptr_t pwin = *(volatile uintptr_t *)(g_tgt_base + 0x3f2850ULL);
+        g_freeze_web = 0;
+        ACETrace(@"[native] ★tag%d: 原生面板复刻构建完成! flag=1 开关%d→%d 面板窗=%p 球=%p",
+                 tag, (int)sw0, (int)*sw, (void *)pwin, (__bridge void *)ball);
+        ACE_install_visible_ball();
+        // 1s复查: 巡检员(250ms)是否拆台 / drawInMTKView是否隐藏
+        dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{
+            @try {
+                volatile uint8_t *f2 = (volatile uint8_t *)(g_tgt_base + 0x3fc348ULL);
+                uintptr_t w2 = *(volatile uintptr_t *)(g_tgt_base + 0x3f2850ULL);
+                uint8_t s2 = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
+                uintptr_t m2 = *(volatile uintptr_t *)(g_tgt_base + 0x3fc328ULL);
+                ACETrace(@"[native] 1s复查: flag=%d 开关=%d 面板窗=%p 槽328=%p (flag=0或槽空=被巡检拆台→canary断供)",
+                         (int)(*f2 & 1), (int)s2, (void *)w2, (void *)m2);
+            } @catch (NSException *e) {}
+        });
+    } @catch (NSException *e) { g_freeze_web = 0; ACETrace(@"[native] tag%d 异常: %@", tag, e); }
+}
 static void ACE_schedule_sec_posts(void) {
     dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(1); ACE_build_panel_direct(1); });
+    // v7.54 主攻: 授权成功2.5s后复刻构建原生面板(直调诊断保留, 无害)
+    dispatch_after(dispatch_time(0, 2500000000LL), dispatch_get_main_queue(), ^{ ACE_native_panel_build(1); });
     dispatch_after(dispatch_time(0, 3000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(2); ACE_build_panel_direct(2); });
     dispatch_after(dispatch_time(0, 6000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(3); ACE_build_panel_direct(3); });
-    // v7.53: 7.5s 兜底——原生面板仍没建出来就装自绘面板(保作业标准"点左上角出面板")
-    dispatch_after(dispatch_time(0, 7500000000LL), dispatch_get_main_queue(), ^{ ACE_install_fallback_panel(); });
+    dispatch_after(dispatch_time(0, 8000000000LL), dispatch_get_main_queue(), ^{ ACE_native_panel_build(2); });  // 重试(幂等)
 }
 static void ACE_install_notif_probe(void) {
     @try {
@@ -2427,7 +2571,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.52 启动（+毒值窗扩大/sp漂移核验/代码字节核验/直调对照）===");
+            ACETrace(@"=== ACETrace(@"=== v7.54 启动（+原生面板复刻构建+自建可见球: 全局机制已完全解码）===");===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -2463,8 +2607,8 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             dispatch_after(dispatch_time(0, 9000000000LL), dispatch_get_main_queue(), ^{ ACE_build_panel_direct(0); });
             
             dispatch_after(dispatch_time(0, 10000000000LL), dispatch_get_main_queue(), ^{ ACE_ui_scan("boot10s"); });
-            // v7.53: boot 兜底——即使一直没输卡密, 14s 后也装自绘面板(未激活态显示"未激活")
-            dispatch_after(dispatch_time(0, 14000000000LL), dispatch_get_main_queue(), ^{ ACE_install_fallback_panel(); });
+            // v7.54: boot 兜底——没输卡密也复刻构建原生面板(未激活态, canary喂值照常)
+            dispatch_after(dispatch_time(0, 14000000000LL), dispatch_get_main_queue(), ^{ ACE_native_panel_build(0); });
             @try { ACE_start_net_probe(); } @catch (NSException *e) { ACETrace(@"[probe] 启动异常: %@", e); }
         }
     });
