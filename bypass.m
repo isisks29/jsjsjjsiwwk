@@ -243,6 +243,10 @@ static uintptr_t g_tgt_base = 0, g_tgt_end = 0;
 static void *g_saved_slot_val = NULL;
 static int g_rw_dialog = 0, g_rw_boot = 0;
 static volatile int g_freeze_web = 0;   // v7.47: 直调建面板期间冻结喂值(防跨tick不自洽)
+// v7.56: 面板存续状态(前移声明, web_keeper 的 byte0 keeper 要用)
+static BOOL g_nativeBuilt = NO;          // 复刻面板已建成
+static volatile int g_panelWant = 1;     // 可见球设定的显隐意愿(keeper 维持 byte0=此值)
+static int g_rebuildCnt = 0;             // 被拆后重建计数(上限3, 防死循环)
 static void ACE_web_tick(void);   // v7.24 前置声明(定义在守护线程段)
 // ═══ v7.4: EndTime 补喂 ═══
 static void ACE_prime_endtime(void) {
@@ -950,7 +954,33 @@ static void *ACE_web_keeper(void *arg) {
                     }
                 }
             }
-            if (++n20 >= 20) { n20 = 0; ACE_web_tick(); }
+            if (++n20 >= 20) {
+                n20 = 0;
+                ACE_web_tick();
+                // v7.56①: byte0 keeper — drawInMTKView 失败分支会清 [0x3ff7e4]byte0
+                // (0x8d0c4 strb wzr), 渲染侧偶发撕裂会误清开关; 面板建成期间维持
+                // byte0 = g_panelWant(可见球设定), 保证"显示"意愿不被误清。
+                if (g_nativeBuilt && g_tgt_base) {
+                    volatile uint8_t *sw = (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
+                    if ((int)*sw != g_panelWant) *sw = (uint8_t)g_panelWant;
+                }
+                // v7.56②: S链撕裂侦测 — 回读族是否自洽(eq② 真式)。不自洽 = 有第二
+                // 写者(渲染链滚动S链?)在与 web_tick 抢写; 限流日志, 每500ms最多1条。
+                if (g_nativeBuilt && g_tgt_base) {
+                    static int swCnt = 0, swLog = 0;
+                    if (++swCnt >= 25) {
+                        swCnt = 0;
+                        uint64_t Sr = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
+                        uint32_t a8r = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL);
+                        uint32_t e2r = ACE_mix32((((uint32_t)Sr) ^ ((uint32_t)(Sr >> 32))) ^ 0xd18ddb25u);
+                        if (a8r != e2r && swLog < 10) {
+                            swLog++;
+                            ACETrace(@"[Schain] ★撕裂/外部写者! S=%llu a8=%x 期望=%x (渲染链在滚动S链?)",
+                                     (unsigned long long)Sr, a8r, e2r);
+                        }
+                    }
+                }
+            }
         } @catch (NSException *e) {}
     }
     return NULL;
@@ -1833,14 +1863,13 @@ static void ACE_build_panel_direct(int attempt) {
 static void ACE_visBallTap(void) {
     @try {
         if (!g_tgt_base) return;
+        // v7.56: 翻转"意愿", byte0 由 web_keeper 持续维持(防 drawInMTKView 撕裂误清)
+        g_panelWant = g_panelWant ? 0 : 1;
         volatile uint8_t *sw = (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
-        uint8_t old = *sw;
-        *sw = old ? 0 : 1;
-        ACETrace(@"[visball] 点击: 面板开关byte0 %d→%d (%@)", (int)old, (int)*sw,
-                 *sw ? @"显示内容" : @"隐藏内容");
+        *sw = (uint8_t)g_panelWant;
+        ACETrace(@"[visball] 点击: 面板%@ (开关byte0=%d)", g_panelWant ? @"显示" : @"隐藏", g_panelWant);
     } @catch (NSException *e) { ACETrace(@"[visball] 异常: %@", e); }
 }
-
 // ═══ v7.53: 自绘面板兜底(blue 路线) ═══
 // 三轮探针实锤: sub_11ffb0 链的代码字节原样([code]行与文件全等)、block结构完好
 // (isa=libSystem全局块/flags=0x50000000/invoke=base+0x11ffac)、16道门冻结态全过、
@@ -1977,7 +2006,6 @@ static void ACE_install_visible_ball(void) {
 //    + bl sub_11ffb0立即构建一次(0x11ff34)
 // ② sub_120e28巡检员(0x120e28-0x121174): S链+canary全链检查——一致→b sub_11ffb0(幂等);
 //    不一致且flag=1→拆面板(清[0x3ff7e4]byte0/两视图removeFromSuperview/release/清三全局槽)
-//    → web_tick喂值恒自洽(gates 16/16实证)时, 巡检员=免费维护者, 永不拆台
 // ③ MTKView init(0x8c0fc, 3284B): 无门禁(唯一失败点=0x8c1a0 super init nil即Metal不可用),
 //    自建UIWindow(initWithWindowScene 0x8c32c)+setHidden:NO([0x3f2850]槽,0x8c7ac-bc)
 //    +Metal设备/commandQueue/ImGui(setLoader: 0x8c9c0)+120fps(0x8c800)+后台通知观察者
@@ -1990,9 +2018,6 @@ static void ACE_install_visible_ball(void) {
 //    [0x3fc328]=retain(mtk)→[0x3fc330]=球(+1移交)→[0x3fc348]byte0=1
 // ⑧ drawInMTKView:(0x8cdd4)每帧查S链eq②(^Shi版0x8ce70)-eq⑬: 过→setHidden:NO(0x8d12c);
 //    挂→byte0清零+setHidden:YES(0x8d0b4) → 面板可见性=canary心跳, 喂值在则面板在
-// 复刻=绕过sub_11ffb0的31道门禁与其"早退之谜"(v7.52毒值实锤序言执行但tb恒0——
-// 原生250ms定时器同样调不起来, 非我方调用方式问题), 直接按⑦构造原生面板。
-static BOOL g_nativeBuilt = NO;
 static void ACE_native_panel_build(int tag) {
     @try {
         if (!g_tgt_base) return;
@@ -2052,20 +2077,48 @@ static void ACE_native_panel_build(int tag) {
         uint8_t sw0 = *sw;
         if (sw0 == 0) *sw = 1;
         g_nativeBuilt = YES;
+        g_panelWant = 1;
         uintptr_t pwin = *(volatile uintptr_t *)(g_tgt_base + 0x3f2850ULL);
+        // v7.56 核心: 缴械巡检员 — 挂起 250ms 巡检 dispatch_source([0x3fc340]槽)。
+        // F级证据链: ①v7.55日志: 构建成功后1s内 flag/槽328/面板窗/开关全部被清 =
+        //   与 sub_120e28 拆除段(0x1210d4-0x12114c)行为签名逐条吻合;
+        //   ②gates 显示 [0x3fc354] tb-init 恒0 → 巡检从未过其时间门(0x120f28会置1)
+        //     → 它必在 S链 eq②③④ 段(0x120e48/0x120eac/0x120ee8/0x120f24)退出→拆;
+        //   ③同期我方 gates 评估同一组方程全过 → 构建后渲染链启动([disp]+0x8edc0),
+        //     与 web_tick 双写 S链产生撕裂(或渲染链自滚S链) → 巡检读到混合族判失败。
+        // 挂起后 canary 唯一读者 = drawInMTKView(每帧, 失败仅单帧隐藏、下帧自愈)。
+        uintptr_t tsrc = *(volatile uintptr_t *)(g_tgt_base + 0x3fc340ULL);
+        if (tsrc) {
+            dispatch_suspend((dispatch_source_t)(void *)tsrc);
+            ACETrace(@"[native] 巡检timer已挂起(source=%p) — 拆除路径缴械", (void *)tsrc);
+        } else {
+            ACETrace(@"[native] 警告: [0x3fc340]巡检source为空, 无法挂起!");
+        }
         g_freeze_web = 0;
         ACETrace(@"[native] ★tag%d: 原生面板复刻构建完成! flag=1 开关%d→%d 面板窗=%p 球=%p",
                  tag, (int)sw0, (int)*sw, (void *)pwin, (__bridge void *)ball);
         ACE_install_visible_ball();
-        // 1s复查: 巡检员(250ms)是否拆台 / drawInMTKView是否隐藏
+        // 1s+5s 双复查: 被拆则自动重建(上限3次, 防死循环)
         dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{
             @try {
                 volatile uint8_t *f2 = (volatile uint8_t *)(g_tgt_base + 0x3fc348ULL);
                 uintptr_t w2 = *(volatile uintptr_t *)(g_tgt_base + 0x3f2850ULL);
                 uint8_t s2 = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
                 uintptr_t m2 = *(volatile uintptr_t *)(g_tgt_base + 0x3fc328ULL);
-                ACETrace(@"[native] 1s复查: flag=%d 开关=%d 面板窗=%p 槽328=%p (flag=0或槽空=被巡检拆台→canary断供)",
-                         (int)(*f2 & 1), (int)s2, (void *)w2, (void *)m2);
+                ACETrace(@"[native] 1s复查: flag=%d 开关=%d 面板窗=%p 槽328=%p", (int)(*f2 & 1), (int)s2, (void *)w2, (void *)m2);
+                if (!(*f2 & 1) && g_rebuildCnt < 3) {
+                    g_rebuildCnt++; g_nativeBuilt = NO;
+                    ACETrace(@"[native] 被拆! 0.5s后重建(第%d/3次)", g_rebuildCnt);
+                    dispatch_after(dispatch_time(0, 500000000LL), dispatch_get_main_queue(), ^{ ACE_native_panel_build(8 + g_rebuildCnt); });
+                }
+            } @catch (NSException *e) {}
+        });
+        dispatch_after(dispatch_time(0, 5000000000LL), dispatch_get_main_queue(), ^{
+            @try {
+                volatile uint8_t *f3 = (volatile uint8_t *)(g_tgt_base + 0x3fc348ULL);
+                uintptr_t w3 = *(volatile uintptr_t *)(g_tgt_base + 0x3f2850ULL);
+                uint8_t s3 = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
+                ACETrace(@"[native] 5s复查: flag=%d 开关=%d 面板窗=%p (稳了=点左上角菜单球验证显隐)", (int)(*f3 & 1), (int)s3, (void *)w3);
             } @catch (NSException *e) {}
         });
     } @catch (NSException *e) { g_freeze_web = 0; ACETrace(@"[native] tag%d 异常: %@", tag, e); }
@@ -2575,7 +2628,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.55 启动（+initM钩子签名修复: .ips实锤objc_retain(0x1)崩溃点）===");
+            ACETrace(@"=== v7.56 启动（+挂起巡检timer+byte0守护+撕裂侦测: 面板保卫战胜负手）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
