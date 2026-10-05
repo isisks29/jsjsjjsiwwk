@@ -966,6 +966,9 @@ static void *ACE_web_keeper(void *arg) {
                 if (g_nativeBuilt && g_tgt_base) {
                     volatile uint8_t *sw = (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
                     if ((int)*sw != g_panelWant) *sw = (uint8_t)g_panelWant;
+                    // v7.60: draw 时基槽防复毒(被写坏立即修回 125/3/flag1)
+                    volatile uint32_t *tb = (volatile uint32_t *)(g_tgt_base + 0x3f2900ULL);
+                    if (tb[1] != 3u || tb[2] != 1u) { tb[0] = 125u; tb[1] = 3u; tb[2] = 1u; }
                 }
                 // v7.56②: S链撕裂侦测 — 回读族是否自洽(eq② 真式)。不自洽 = 有第二
                 // 写者(渲染链滚动S链?)在与 web_tick 抢写; 限流日志, 每500ms最多1条。
@@ -2129,6 +2132,21 @@ static void ACE_native_panel_build(int tag) {
         if (!kw) { ACETrace(@"[native] tag%d: 无可用窗口", tag); return; }
         void *cfg = (void *)(g_tgt_base + 0x3ff7e4ULL);
         CGRect full = kw.frame;
+        // v7.60: 时基槽矫治 — drawInMTKView 专槽[0x3f2900/904/908](0x8cf08-24)、
+        // sub_11ffb0 槽[0x3fc34c/350/354](0x120254-6c)、iconOnClick 槽[0x3fb980/984/988]
+        // (0x111cec-d0)。若 flag 非零垃圾而 numer/denom 垃圾(字符串VM残留/未初始化),
+        // ms=abst*垃圾/垃圾 必荒谬 → 时间门每帧必挂 → 失败分支 setHidden:YES+清byte0
+        // (v7.59 hidden=1/开关=0 的唯一自洽解释; 我方评估用系统时基故显示全过)。
+        // 强写 125/3 + flag=1; 修前值落日志实证。
+        {
+            uintptr_t slots[3] = { 0x3f2900ULL, 0x3fc34cULL, 0x3fb980ULL };
+            for (int i = 0; i < 3; i++) {
+                volatile uint32_t *tb = (volatile uint32_t *)(g_tgt_base + slots[i]);
+                ACETrace(@"[tb] 槽%llx 修前: num=%u den=%u flag=%u",
+                         (unsigned long long)slots[i], tb[0], tb[1], tb[2]);
+                tb[0] = 125u; tb[1] = 3u; tb[2] = 1u;
+            }
+        }
         SEL sF  = NSSelectorFromString(@"initWithFrame:");
         SEL sF4 = NSSelectorFromString(@"initWithFrame::::");
         SEL sF2 = NSSelectorFromString(@"initWithFrame::");
@@ -2742,7 +2760,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.59 启动（+eq③常数K版修复: drawInMTKView真式, 面板出帧胜负手）===");
+            ACETrace(@"=== v7.60 启动（+时基槽矫治: draw时间门毒槽修复, 面板出帧最后一公里）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
