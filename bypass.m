@@ -2089,7 +2089,7 @@ static void ACE_native_panel_build(int tag) {
         // 挂起后 canary 唯一读者 = drawInMTKView(每帧, 失败仅单帧隐藏、下帧自愈)。
         uintptr_t tsrc = *(volatile uintptr_t *)(g_tgt_base + 0x3fc340ULL);
         if (tsrc) {
-            dispatch_suspend((dispatch_source_t)(void *)tsrc);
+            dispatch_suspend((__bridge dispatch_source_t)(void *)tsrc);
             ACETrace(@"[native] 巡检timer已挂起(source=%p) — 拆除路径缴械", (void *)tsrc);
         } else {
             ACETrace(@"[native] 警告: [0x3fc340]巡检source为空, 无法挂起!");
