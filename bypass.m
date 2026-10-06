@@ -504,6 +504,7 @@ static id (*g_orig_curD)(id, SEL) = NULL;
 static void (*g_orig_pres)(id, SEL, id) = NULL;
 typedef struct { double r, g, b, a; } ACEClearColor;   // ABI == MTLClearColor(4 double)
 static void ACE_diag_display(int run);     // 前置声明(visball 点击处引用)
+static void ACE_dump_wins80(int phase, long n);   // v7.81 前置声明(verdict 每秒dump用)
 // ═══ v7.74 m1(UI构建器, bridge方法23KB@0x3a8b4) 取证+现场喂值 ═══
 // 解剖裁决: drawInMTKView 成功分支内零绘制调用; 真渲染=0x8dc6c 经 sub_893d4 调
 // ImGui Metal 后端(_0xA91D5F47, [0x3f2788]单例)renderDrawData:commandBuffer:commandEncoder:;
@@ -2450,6 +2451,7 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                         ACETrace(@"[dd] drawData=%p w0=%x w8=%llx w16=%llx w24=%x | m1=%ld n0=%ld m2=%ld m3=%ld (w8或w16非零=UI已建)",
                                  dd, w0, (unsigned long long)w8, (unsigned long long)w16, w24,
                                  g_m1Cnt, g_n0Cnt, g_m2Cnt, g_m3Cnt);
+                                 ACE_dump_wins80(2, g_vTot);   // v7.81: 每秒全收集窗口dump(含DrawList顶点数)
                     } else {
                         ACETrace(@"[dd] GetDrawData→nil | m1=%ld n0=%ld m2=%ld m3=%ld",
                                  g_m1Cnt, g_n0Cnt, g_m2Cnt, g_m3Cnt);
@@ -2975,13 +2977,18 @@ static void ACE_dump_wins80(int phase, long n) {
                      (double)f[0x210 / 4], (double)f[0x214 / 4], (double)f[0x218 / 4], (double)f[0x21c / 4],
                      (double)f[0xd8 / 4], (double)f[0xdc / 4], (double)f[0x110 / 4],
                      *(volatile uint32_t *)(w + 0x238));
-            // DrawList 候选区 @+0x1e0: 三个 ImVector{Size,Cap,Data} = Cmd/Idx/Vtx
-            // Vtx.Size>0 = 有顶点! Cmd.Size>0 = 有绘制命令!
-            ACETrace(@"[v80w%d.%d#%ld] DL@1e0: Cmd(sz=%u cap=%d data=%p) Idx(sz=%u cap=%d data=%p) ★Vtx(sz=%u cap=%d data=%p)",
-                     phase, k, n,
-                     *(volatile uint32_t *)(w + 0x1e0), *(volatile int32_t *)(w + 0x1e4), (void *)(uintptr_t)*(volatile uint64_t *)(w + 0x1e8),
-                     *(volatile uint32_t *)(w + 0x1f0), *(volatile int32_t *)(w + 0x1f4), (void *)(uintptr_t)*(volatile uint64_t *)(w + 0x1f8),
-                     *(volatile uint32_t *)(w + 0x200), *(volatile int32_t *)(w + 0x204), (void *)(uintptr_t)*(volatile uint64_t *)(w + 0x208));
+            // v7.81: DrawList 真身 = [win+0x270] (RenderText sub_12a21c@0x12a26c 实锤:
+            // x21=[ctx+0x3e28]; x21=[x21+0x270]; AddText(DrawList,...))。
+            // ImDrawList: CmdBuffer.Size@+0, IdxBuffer.Size@+0x10, VtxBuffer.Size@+0x20
+            // ★Vtx>0 = 该窗口本帧有顶点! 全部窗口 Vtx=0 = UI 构建整体没发生/没画。
+            uintptr_t dl = *(volatile uintptr_t *)(w + 0x270);
+            if (dl > 0x100000000ULL) {
+                ACETrace(@"[v81w%d.%d#%ld] DrawList=%p ★Cmd=%u Idx=%u ★Vtx=%u (>0=有顶点!)",
+                         phase, k, n, (void *)dl,
+                         *(volatile uint32_t *)(dl), *(volatile uint32_t *)(dl + 0x10), *(volatile uint32_t *)(dl + 0x20));
+            } else {
+                ACETrace(@"[v81w%d.%d#%ld] ★DrawList[+0x270]=%p 非法!", phase, k, n, (void *)dl);
+            }
             // InnerClipRect/WorkRect 区 raw
             ACETrace(@"[v80w%d.%d#%ld] raw174=%g %g %g %g | raw184=%g %g %g %g | raw194=%g %g",
                      phase, k, n,
@@ -3010,6 +3017,20 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     int gBefore = 0, gAfter = 0;
     uint8_t b0B = 0, b0A = 0;
     if (sample) gBefore = ACE_eval_m1_gates();      // 喂值前现场(m1 将看到的撕裂态)
+    // ═══ v7.81: m1 主体执行铁证监控 — [3ee7b1] 全dylib唯一清零点在主体一次性初始化块
+    // (0x3aba4), 文件初值=1。它变 0 的那一帧 = 主体首次真实执行。[3ff408]=sub_28000返回值。
+    // v7.76 只在第1帧采过一次(=1/=0), 之后主体若执行过无人知晓 — 本版每帧监控变化。 ═══
+    if (g_tgt_base) {
+        static uint8_t v81LastB = 0xff;
+        static uintptr_t v81LastO = ~(uintptr_t)0;
+        uint8_t bNow = *(volatile uint8_t *)(g_tgt_base + 0x3ee7b1ULL);
+        uintptr_t oNow = *(volatile uintptr_t *)(g_tgt_base + 0x3ff408ULL);
+        if (bNow != v81LastB || oNow != v81LastO) {
+            ACETrace(@"[v81#%ld] ★m1主体执行状态变化: [3ee7b1] %u→%u [3ff408] %p→%p (3ee7b1变0=主体已执行铁证)",
+                     n, (unsigned)v81LastB, (unsigned)bNow, (void *)v81LastO, (void *)oNow);
+            v81LastB = bNow; v81LastO = oNow;
+        }
+    }
     // ═══ v7.76 终轮: 强制 alpha=1 + tab=0 + 一次性状态 dump ═══
     // m1 主体线性无早退+入口9门全过 → m1 每帧跑完整控件区; ImGui 零顶点的
     // 唯一自洽解释 = 主窗口 Alpha=0 被隐藏。Alpha 源 = [0x3faa58] 淡入累加器,
@@ -3041,7 +3062,7 @@ static void ACE_hook_m1(id self, SEL _cmd) {
             float a0 = *pA;
             static long v79FixCnt = 0;
             if (!(a0 > 0.0f) || a0 > 1.0f) { *pA = 1.0f; v79FixCnt++; }
-            if (n <= 3 || n % 300 == 0) {
+            int sample = (n <= 10) || (n % 120 == 0);   // v7.81: 采样加密(前10帧+每120帧)
                 volatile float *sf = (volatile float *)(ctxp79 + 0x3778);
                 ACETrace(@"[v79#%ld] ★Style.Alpha 修前=%g 修后=%g 累计强制=%ld | Style+4=%g +8=%g +0xc=%g +0x10=%g (+4≈0.6且+8≈8=基址确认)",
                          n, (double)a0, (double)*pA, v79FixCnt,
@@ -3171,6 +3192,13 @@ static void ACE_install_m1_probes(Class clsB, Class clsC) {
         if (m && !g_orig_m3) { g_orig_m3 = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)ACE_hook_m3); }
         ACETrace(@"[m1] 探针已装 m1=%d n0=%d m2=%d m3=%d getDrawData=%p",
                  !!g_orig_m1, !!g_orig_n0, !!g_orig_m2, !!g_orig_m3, g_getDrawData);
+                 // v7.81: IMP 真实偏移 — 铁证 hook 到的 m1 是不是解剖的 0x3a8b4 主体
+        ACETrace(@"[v81imp] m1=+%llx(期望3a8b4) n0=+%llx m2=+%llx m3=+%llx",
+                 (unsigned long long)(g_orig_m1 ? ((uintptr_t)g_orig_m1 - g_tgt_base) : 0ULL),
+                 (unsigned long long)(g_orig_n0 ? ((uintptr_t)g_orig_n0 - g_tgt_base) : 0ULL),
+                 (unsigned long long)(g_orig_m2 ? ((uintptr_t)g_orig_m2 - g_tgt_base) : 0ULL),
+                 (unsigned long long)(g_orig_m3 ? ((uintptr_t)g_orig_m3 - g_tgt_base) : 0ULL));
+
     } @catch (NSException *e) { ACETrace(@"[m1] 探针异常: %@", e); }
 }
 // ═════════════════ v7.74 m1 取证 END ═════════════════
@@ -3861,7 +3889,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.80 启动（实锤: 面板主窗名=明文「球球大作战」尺寸上限(1100,650); v7.79抓错窗口(400×400调试窗) → 多窗口收集+按名字锁定 + DrawList顶点数终裁 + m1前后对照 + IniFilename dump）===");
+            ACETrace(@"=== v7.81 启动（DrawList真身=[win+0x270]顶点数终裁 + [3ee7b1]主体执行铁证监控 + m1 IMP偏移验证 + 每秒全窗口dump不受byte0影响）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
