@@ -686,6 +686,7 @@ static void ACE_install_exc_server(void) {
 static char g_ring[8][240];
 static volatile int g_ring_i = 0, g_ring_n = 0;
 static volatile long long g_burst_until = 0;   // v7.17: 高精度突发采样截止时间(秒)
+static volatile int g_imgMapSaved87 = 0;       // v7.87: image映射已落日志
 
 static void *ACE_heartbeat(void *arg) {
     (void)arg;
@@ -748,6 +749,17 @@ static int ace_freeze_zone(unsigned long long off) {
     if (off >= 0xf26ccULL && off < 0xf2900ULL) return 2;
     if (off >= 0xf4650ULL && off < 0xf4a00ULL) return 3;
     if (off >= 0xf82a0ULL && off < 0xf8400ULL) return 4;
+    // ═══ v7.87 扩容: 其余全部自毁簇所在函数体(后台线程踩进即冻结) ═══
+    // z5: 安保巨函数主体(0xef0c8起40996B, 含0xefe18/0xf1738/0xf2668自毁簇)。
+    //     头部0xef0c8-0xef200(验卡结果判定+计数清零)不冻——它在主线程跑且已被hook喂成功。
+    if (off >= 0xef200ULL && off < 0xf9100ULL) return 5;
+    if (off >= 0xa6200ULL && off < 0xa6b00ULL) return 6;   // z6: a6自毁簇(5个svc)
+    if (off >= 0xe6100ULL && off < 0xe6300ULL) return 7;   // z7: e6自毁簇(2个动态svc)
+    if (off >= 0x9f600ULL && off < 0x9f700ULL) return 8;   // z8: 9f668自毁点(q4遥测内)
+    if (off >= 0xf9500ULL && off < 0xf95a0ULL) return 10;  // z10: f9580/f958c自毁簇
+    if (off >= 0xae800ULL && off < 0xae830ULL) return 11;  // z11: ae820纯die桩
+    if (off >= 0xd1800ULL && off < 0xd1850ULL) return 12;  // z12: d1818/d183c
+    if (off >= 0x31c00ULL && off < 0x31c30ULL) return 13;  // z13: 31c14动态svc
     return -1;
 }
 static void *ACE_flight_recorder(void *arg) {
@@ -772,7 +784,23 @@ static void *ACE_flight_recorder(void *arg) {
             ACETrace(@"[burst] 采样窗口结束");
         }
         was_burst = burst;
-        usleep(burst ? 300 : 50000);   // v7.25: burst 提到 300µs
+        // ═══ v7.87 高警戒采样: 面板flag([0x3fc348]bit0)置位 = 靶场已自建面板 =
+        // 死亡窗口开启(1-2s内SIGKILL)。2ms采样让 zone-freeze 对短命安检路径的
+        // 命中率×25; 同时一次性把 image 映射打进写直通日志(burst t行绝对地址换算钥匙)。 ═══
+        int alert87 = 0;
+        if (!burst && g_tgt_base) {
+            alert87 = (*(volatile uint8_t *)(g_tgt_base + 0x3fc348ULL) & 1);
+            if (alert87 && !g_imgMapSaved87) {
+                g_imgMapSaved87 = 1;
+                NSMutableString *mp87 = [NSMutableString string];
+                uint32_t ic87 = _dyld_image_count();
+                for (uint32_t i87 = 0; i87 < ic87; i87++)
+                    [mp87 appendFormat:@"IMG %s %p\n", _dyld_get_image_name(i87),
+                     (void *)_dyld_get_image_header(i87)];
+                ACETrace(@"===== v87 image映射(burst t行绝对地址换算用) =====\n%@", mp87);
+            }
+        }
+        usleep(burst ? 300 : (alert87 ? 2000 : 50000));   // v7.87: 高警戒2ms
         if (!g_tgt_base) continue;
         thread_act_array_t list = NULL;
         mach_msg_type_number_t n = 0;
@@ -979,6 +1007,10 @@ static void ACE_web_tick(void) {
         // blr [0x3f65a8](导出树解析缓存, 绕过GOT); 清零后 cbz 必落 GOT 桩路径,
         // 与镜像名隐藏(libsystem_pthread)+GOT门神构成三层封锁。
         *(volatile uint64_t *)(g_tgt_base + 0x3f65a8ULL) = 0;
+                // ═══ v7.87: 验卡失败计数[0x3f68e4]钉零 — F级拆弹 ═══
+        // 0xef254-268: 失败路径计数+1, 旧值>=2(第3次失败) → b.ge 0xefe18 →
+        // pthread_kill(self,SIGKILL)裸svc(内核级不可捕捉=本次死相)。钉零后 b.ge 永不成立。
+        *(volatile uint32_t *)(g_tgt_base + 0x3f68e4ULL) = 0;
         // ── ① 全局时钟哈希链(时间相关, 持续刷新保证新鲜度窗) ──
         volatile uint32_t *tb = (volatile uint32_t *)(g_tgt_base + 0x3f6b40);
         uint32_t num = tb[0], den = tb[1];
@@ -1174,7 +1206,28 @@ static void *ACE_freezer(void *arg) {
     return NULL;
 }
 static void *ACE_ctx_monitor(void *arg);   // v7.13 前置声明(定义在下方)
-
+// ═══ v7.87 轻量槽监控 — 本次run m1/draw探针没装(tag1幂等分支)导致观测面全盲。
+// 独立线程300ms轮询4个关键槽, 变化即打写直通日志。死也带得走。 ═══
+static void *ACE_slot_watch87(void *arg) {
+    (void)arg;
+    uint8_t lastB1 = 0xff; uintptr_t last408 = ~(uintptr_t)0;
+    uint32_t lastE4 = 0xffffffff; int lastPf = -1;
+    for (;;) {
+        usleep(300000);
+        if (!g_tgt_base) continue;
+        uint8_t b1 = *(volatile uint8_t *)(g_tgt_base + 0x3ee7b1ULL);
+        uintptr_t o8 = *(volatile uintptr_t *)(g_tgt_base + 0x3ff408ULL);
+        uint32_t e4 = *(volatile uint32_t *)(g_tgt_base + 0x3f68e4ULL);
+        int pf = (int)(*(volatile uint8_t *)(g_tgt_base + 0x3fc348ULL) & 1);
+        if (b1 != lastB1 || o8 != last408 || e4 != lastE4 || pf != lastPf) {
+            ACETrace(@"[v87] 槽变化: [3ee7b1主体] %u→%u [3ff408检测] %p→%p [3f68e4失败计数] %u→%u 面板flag %d→%d",
+                     (unsigned)lastB1, (unsigned)b1, (void *)last408, (void *)o8,
+                     lastE4, e4, lastPf, pf);
+            lastB1 = b1; last408 = o8; lastE4 = e4; lastPf = pf;
+        }
+    }
+    return NULL;
+}
 static void ACE_install_v79_threads(void) {
     pthread_t th;
     pthread_attr_t at;
@@ -1186,6 +1239,7 @@ static void ACE_install_v79_threads(void) {
     pthread_create(&th, &at, ACE_clock_keeper, NULL);   // v7.23: 时钟一致性守护
     pthread_create(&th, &at, ACE_freezer, NULL);         // v7.31: 复核线程冷冻器
     pthread_create(&th, &at, ACE_ctx_monitor, NULL);
+    pthread_create(&th, &at, ACE_slot_watch87, NULL);   // v7.87: 轻量槽监控
     
     pthread_attr_destroy(&at);
     ACETrace(@"v7.9 飞行记录器+EndTime守护已启动");
@@ -1610,6 +1664,28 @@ static void **ACE_find_ptr_slot(const struct mach_header *hdr, const char *want)
         seg = (const ACESegCmd64 *)((uintptr_t)c + c->cmdsize);
     }
     return NULL;
+}
+// ═══ v7.87: dispatch_after 钩子 — 凶手没走任何已监控通道(无[gate]/[zone]/[tel]日志),
+// GCD 是门神(GOT pthread_create)拦不住的唯一孵化通道。dispatch_async 早已hook,
+// dispatch_after 是独立符号独立GOT槽——安保系统若用它派发延迟检查(1-2s延迟吻合!),
+// 这里记录+对安保危险区block直接吞掉(不派发)。验卡结果block(0xef0c8)不在吞范围。 ═══
+static void ACE_dispatch_after_hook(unsigned long when, dispatch_queue_t q, void (^blk)(void)) {
+    @try {
+        if (blk && g_tgt_base) {
+            void **hdrp = (void **)(__bridge void *)blk;
+            uintptr_t inv = (uintptr_t)hdrp[2];
+            if (inv >= g_tgt_base && inv < g_tgt_end) {
+                uintptr_t off = inv - g_tgt_base;
+                ACETrace(@"[dispA] +0x%lx", (unsigned long)off);
+                if ((off >= 0xef200ULL && off < 0xf9100ULL) ||
+                    (off >= 0xaeda8ULL && off < 0xc7900ULL)) {
+                    ACETrace(@"[dispA] ★吞掉安保block +0x%lx (不派发)", (unsigned long)off);
+                    return;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    dispatch_after(when, q, blk);
 }
 static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
     @try {
@@ -3711,6 +3787,14 @@ static void ACE_install_result_hook(void) {
     g_saved_slot_val = *slot;
 
     *slot = (void *)ACE_dispatch_async_hook;
+    // v7.87: dispatch_after GOT槽同款改写(找不到只记日志, 不影响主链)
+    void **slotA = ACE_find_ptr_slot(hdr, "_dispatch_after");
+    if (slotA) {
+        *slotA = (void *)ACE_dispatch_after_hook;
+        ACETrace(@"[hook] dispatch_after槽已改写 → %p", (void *)ACE_dispatch_after_hook);
+    } else {
+        ACETrace(@"[hook] 未找到 _dispatch_after 槽(靶场不用它或偏移漂移)");
+    }
     ACETrace(@"结果hook 已安装: 靶场基址=%p __TEXT=0x%llx 槽=%p 原值=%p → %p",
              (void *)base, (unsigned long long)textsize, slot, g_saved_slot_val,
              (void *)ACE_dispatch_async_hook);
@@ -4009,7 +4093,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.86 启动（★病根实锤: S槽密钥两字节抄反! 反汇编movk@0x3a91c真钥=0xb75e8052babd72a6(babd), 我们全链10处一直是badb → m1真钥解出垃圾S → 门2 mix32雪崩必挂 → 每帧早退; eval同错钥自验自喂=1ff假象骗了我们全部轮次。本版全局修正, 判据: [3ee7b1] 1→0 + Windows出现「球球大作战」）===");
+            ACETrace(@"=== v7.87 启动（面板已出✓ → 治1-2s闪退: 死因=裸svc pthread_kill(SIGKILL)内核级不可捕捉; F级实锤三振出局机制[0x3f68e4]>=3→0xefe18自毁; 凶手=隐形后台线程(没走任何已监控通道)。五路压制: 失败计数钉零+冻结区扩8区+高警戒2ms采样+dispatch_after吞安保block+槽监控取证）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
