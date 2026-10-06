@@ -1186,6 +1186,33 @@ static void *ACE_web_keeper(void *arg) {
                     *p402 = 0; *p403 = 0; *p404 = 0; *p405 = 0; *p439 = 0; *p408 = 0;
                 }
             }
+            // ═══ v7.91: 命脉令牌伪造 — 三处死刑判决一次拆完 ═══
+            // [0x3ff6b8] 全库唯一发牌点 = sub_effe4 尾部CAS(0xf168c), 调用链
+            // sub_eefd0→sub_d27ac 状态机 0xd9840 — 服务器真实许可证响应才可达。
+            // TEST123 无真卡 → 令牌恒0 → 三处判决 cbz→SIGKILL:
+            //   sub_dcf88 0xdd810→0xe6164 / 0xe0ed8→0xe61c8 / sub_2fed8 0x2ff24→0x31bcc
+            //   (sub_2fed8 被 S链门0x2ca20+面板链0x39184系调用 = 面板后反复判 = 死相)
+            // 坏分支全审计安全: 计数[+0x700]/[+0x1d04] <1或>31 都是跳过解析路径(无svc),
+            // 计数由解析器自己写(0xe061c/0xe3e8c) → 全零 calloc(0x1d28) 与真发牌人
+            // sub_effe4 的分配完全同构 → 判决只查非空, 通过。
+            // 补装: sub_d27ac 复核清令牌(0xdb848 CAS零+free旧值)后 1ms 内新块补上
+            // (每次新 calloc, 不复用已 free 的块 → 无双 free); 判决在 dispatch_async
+            // 之后 ≥1 runloop, keeper 必先到。
+            if (g_tgt_base) {
+                volatile uintptr_t *ptok = (volatile uintptr_t *)(g_tgt_base + 0x3ff6b8ULL);
+                if (*ptok == 0) {
+                    static long v91Arms = 0;
+                    void *blk91 = calloc(1, 0x1d28);
+                    if (blk91) {
+                        *ptok = (uintptr_t)blk91;
+                        if (v91Arms < 40) {
+                            v91Arms++;
+                            ACETrace(@"[v91] ★命脉令牌伪造武装 [3ff6b8]=%p (第%ld次, calloc 0x1d28 全零=真发牌人同构)",
+                                     blk91, v91Arms);
+                        }
+                    }
+                }
+            }
             if (g_tgt_base) {
                 uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
                 if (ctx >= 0x100000000ULL) {
@@ -4186,7 +4213,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.90 启动（死因终审: 命脉令牌[3ff6b8]缺失! 发牌人=安保init, 被我们v7.43劫持成空操作 → sub_dcf88解析器判决 ldar+cbz→pthread_kill(self,SIGKILL)主线程自杀(0xe61c0/e6224, 混淆x16=0x148现场解出)=全部防线盲区。本版放行安保init发牌(canary与m1同网, 13/13全过实证) + keeper byte0改回强制维持+iconOnClick同步意愿(v7.89面板没出的病根) + burst延到30s覆盖死亡时刻）===");
+            ACETrace(@"=== v7.91 启动（v7.90日志实锤: 发牌链=服务器真实许可证→sub_d27ac状态机0xd9840→sub_effe4 CAS, TEST123无真卡永远走不到=令牌恒0; 三处判决cbz→SIGKILL(0xe6164/0xe61c8/0x31bcc, sub_2fed8被S链门+面板链反复调=面板后死)。本版keeper直接伪造令牌: calloc(0x1d28)全零块与真发牌人同构, 判决只查非空+坏分支全审计安全 → 死刑物理拆除）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
