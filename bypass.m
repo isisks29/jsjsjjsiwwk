@@ -2522,11 +2522,90 @@ static void ACE_install_gpu_probes(id mtk, Class clsM) {
                  !!g_orig_curD, !!g_orig_pres, cbName, g_mtlLayer, !!dev, fboSet);
     } @catch (NSException *e) { ACETrace(@"[gpu] 探针异常: %@", e); }
 }
+// v7.73b: CG 符号解析 — 构建管线没链 CoreGraphics(ld: Undefined symbols), 且本进程
+// dlsym 曾被实证受 interpose 污染(v7.15) → 直接扫 CoreGraphics 镜像符号表拿裸指针,
+// 与 ACE_real_task_threads 同机制(共享缓存 LINKEDIT fileoff→va 换算), 一次收齐 7 个。
+typedef struct {
+    size_t (*igw)(CGImageRef);
+    size_t (*igh)(CGImageRef);
+    CGColorSpaceRef (*csc)(void);
+    void (*csr)(CGColorSpaceRef);
+    CGContextRef (*bcc)(void *, size_t, size_t, size_t, size_t, CGColorSpaceRef, uint32_t);
+    void (*cdi)(CGContextRef, CGRect, CGImageRef);
+    void (*cre)(CGContextRef);
+} ACECgSyms;
+static int ACE_load_cg_syms(ACECgSyms *out) {
+    static ACECgSyms s;
+    static int done = 0, ok = 0;
+    if (done) { *out = s; return ok; }
+    done = 1;
+    memset(&s, 0, sizeof(s));
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm || !strstr(nm, "CoreGraphics")) continue;
+        const struct mach_header_64 *mh =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if (!mh) continue;
+        const struct symtab_command *st = NULL;
+        uintptr_t p = (uintptr_t)mh + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const ACESegCmd64 *lc = (const ACESegCmd64 *)p;
+            if (lc->cmd == 0x2 /*LC_SYMTAB*/) { st = (const struct symtab_command *)p; break; }
+            p += lc->cmdsize;
+        }
+        if (!st) continue;
+        uintptr_t le_va = 0; uint64_t le_off = 0;
+        p = (uintptr_t)mh + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const ACESegCmd64 *sg = (const ACESegCmd64 *)p;
+            if (sg->cmd == 0x19 /*LC_SEGMENT_64*/ && !strcmp(sg->segname, "__LINKEDIT")) {
+                le_va = (uintptr_t)(sg->vmaddr + slide);
+                le_off = sg->fileoff;
+                break;
+            }
+            p += sg->cmdsize;
+        }
+        if (!le_va) continue;
+        const uint8_t *le = (const uint8_t *)le_va;
+        const ACENlist64 *syms = (const ACENlist64 *)(le + (st->symoff - le_off));
+        const char *strs = (const char *)(le + (st->stroff - le_off));
+        int found = 0;
+        for (uint32_t k = 0; k < st->nsyms; k++) {
+            uint32_t so = syms[k].n_strx;
+            if (so == 0 || so >= st->strsize || !syms[k].n_value) continue;
+            const char *sn = strs + so;
+            if (sn[0] == '_') sn++;
+            void *fp = (void *)(uintptr_t)(syms[k].n_value + slide);
+            if      (!strcmp(sn, "CGImageGetWidth"))             { s.igw = (size_t (*)(CGImageRef))fp; found++; }
+            else if (!strcmp(sn, "CGImageGetHeight"))            { s.igh = (size_t (*)(CGImageRef))fp; found++; }
+            else if (!strcmp(sn, "CGColorSpaceCreateDeviceRGB")) { s.csc = (CGColorSpaceRef (*)(void))fp; found++; }
+            else if (!strcmp(sn, "CGColorSpaceRelease"))         { s.csr = (void (*)(CGColorSpaceRef))fp; found++; }
+            else if (!strcmp(sn, "CGBitmapContextCreate"))       { s.bcc = (CGContextRef (*)(void *, size_t, size_t, size_t, size_t, CGColorSpaceRef, uint32_t))fp; found++; }
+            else if (!strcmp(sn, "CGContextDrawImage"))          { s.cdi = (void (*)(CGContextRef, CGRect, CGImageRef))fp; found++; }
+            else if (!strcmp(sn, "CGContextRelease"))            { s.cre = (void (*)(CGContextRef))fp; found++; }
+            if (found >= 7) break;
+        }
+        ok = (s.igw && s.igh && s.csc && s.bcc && s.cdi) ? 1 : 0;
+        if (ok) {
+            ACETrace(@"[snap] CG符号镜像解析OK: found=%d igw=%p cdi=%p", found, (void *)s.igw, (void *)s.cdi);
+            break;
+        }
+    }
+    *out = s;
+    return ok;
+}
 static void ACE_snap_window(UIWindow *pw, int run) {
     @try {
         CGRect b = pw.bounds;
         if (b.size.width < 1 || b.size.height < 1) {
             ACETrace(@"[snap#%d] 面板窗bounds=%@非法 — 快照无意义(几何即病根)", run, NSStringFromCGRect(b));
+            return;
+        }
+        ACECgSyms cg;
+        if (!ACE_load_cg_syms(&cg)) {
+            ACETrace(@"[snap#%d] CG符号解析失败 — 快照放弃(diag/gpu/win-fix不受影响)", run);
             return;
         }
         UIGraphicsBeginImageContextWithOptions(b.size, NO, 0.5);
@@ -2535,17 +2614,16 @@ static void ACE_snap_window(UIWindow *pw, int run) {
         UIGraphicsEndImageContext();
         CGImageRef cgi = img.CGImage;
         if (!cgi) { ACETrace(@"[snap#%d] 快照失败(无CGImage)", run); return; }
-        size_t W = CGImageGetWidth(cgi), H = CGImageGetHeight(cgi);
+        size_t W = cg.igw(cgi), H = cg.igh(cgi);
         size_t bpr = W * 4;
         uint8_t *buf = (uint8_t *)calloc(bpr * H + 16, 1);
         if (!buf) return;
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        CGContextRef bc = CGBitmapContextCreate(buf, W, H, 8, bpr, cs,
-                                                (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-        CGColorSpaceRelease(cs);
+        CGColorSpaceRef cs = cg.csc();
+        CGContextRef bc = cg.bcc(buf, W, H, 8, bpr, cs, (uint32_t)kCGImageAlphaPremultipliedLast);
+        if (cg.csr) cg.csr(cs);
         if (!bc) { free(buf); ACETrace(@"[snap#%d] bitmap ctx创建失败", run); return; }
-        CGContextDrawImage(bc, CGRectMake(0, 0, (CGFloat)W, (CGFloat)H), cgi);
-        CGContextRelease(bc);
+        cg.cdi(bc, CGRectMake(0, 0, (CGFloat)W, (CGFloat)H), cgi);
+        if (cg.cre) cg.cre(bc);
         long nonT = 0, colored = 0, zoneNonT = 0;
         unsigned maxA = 0;
         for (size_t y = 0; y < H; y++) {
