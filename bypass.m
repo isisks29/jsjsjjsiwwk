@@ -991,7 +991,7 @@ static void ACE_web_tick(void) {
         if (den) ns = ns * num / den;
         uint64_t S = ns / 1000000ULL;             // v7.26: 单调毫秒(靶场时间门魔数=除1e6, 实证)
         uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
-        *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) = S ^ 0xb75e8052badb72a6ULL;
+        *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) = S ^ 0xb75e8052babd72a6ULL;
         // v7.50 真凶修复: eq② 真式 = mix32((Slo^Shi)^0xd18ddb25), 输入含 ^Shi!
         // 铁证A(iconOnClick 未混淆版): 0x111c3c lsr x8,x26,#0x20(=Shi) →
         //   0x111c44 eor w11,w26,w22(Slo^key) → 0x111c48 eor w11,w11,w8(再^Shi) → mix32。
@@ -1020,7 +1020,7 @@ static void ACE_web_tick(void) {
         // +镜像方程+7分钟窗)→全过才翻转面板可见字节(_0xE4C8719B byte[0]^=1)。
         // 第二链原由复核线程(已被拦)在真验卡成功后写 → 恒0 → 面板永不出。
         // 全靶场读它的只有 iconOnClick(失败=静默return,无kill) → 喂它零风险。
-        *(volatile uint64_t *)(g_tgt_base + 0x3ff680) = S ^ 0xb75e8052badb72a6ULL;
+        *(volatile uint64_t *)(g_tgt_base + 0x3ff680) = S ^ 0xb75e8052babd72a6ULL;
         uint32_t a88 = ACE_mix32(((uint32_t)S ^ 0xd18ddb25u) ^ Shi);
         *(volatile uint32_t *)(g_tgt_base + 0x3ff688) = a88;
         uint32_t g2 = a88 ^ 0x1767cedcu;
@@ -1112,7 +1112,7 @@ static void *ACE_web_keeper(void *arg) {
                     static int swCnt = 0, swLog = 0;
                     if (++swCnt >= 25) {
                         swCnt = 0;
-                        uint64_t Sr = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
+                        uint64_t Sr = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052babd72a6ULL;
                         uint32_t a8r = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL);
                         uint32_t e2r = ACE_mix32((((uint32_t)Sr) ^ ((uint32_t)(Sr >> 32))) ^ 0xd18ddb25u);
                         if (a8r != e2r && swLog < 10) {
@@ -1348,7 +1348,7 @@ static void ACE_eq_snapshot(const char *tag) {
         if (!g_tgt_base) return;
         uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
         if (ctx < 0x100000000ULL) { ACETrace(@"[eq@%s] ctx未就绪", tag); return; }
-        uint64_t S = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) ^ 0xb75e8052badb72a6ULL;
+        uint64_t S = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) ^ 0xb75e8052babd72a6ULL;
         uint32_t a8 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8);
         uint32_t ac = *(volatile uint32_t *)(g_tgt_base + 0x3ff6ac);
         uint32_t b0 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0);
@@ -1867,7 +1867,7 @@ static void ACE_gates_dump(const char *tag) {
         if (!g_tgt_base) return;
         uintptr_t B = g_tgt_base;
         int g1 = ((*(volatile uint8_t *)(B + 0x3fc348ULL)) & 1) == 0;          // 门1 幂等旗须0
-        uint64_t S   = *(volatile uint64_t *)(B + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
+        uint64_t S   = *(volatile uint64_t *)(B + 0x3ff6a0ULL) ^ 0xb75e8052babd72a6ULL;
         uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
         uint32_t a8  = *(volatile uint32_t *)(B + 0x3ff6a8ULL);
         uint32_t ac  = *(volatile uint32_t *)(B + 0x3ff6acULL);
@@ -2227,7 +2227,7 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
             if (cnt < 30 && nowNs - lastNs > 1000000000ULL) {
                 lastNs = nowNs;
                 uintptr_t B = g_tgt_base;
-                uint64_t S = *(volatile uint64_t *)(B + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
+                uint64_t S = *(volatile uint64_t *)(B + 0x3ff6a0ULL) ^ 0xb75e8052babd72a6ULL;
                 uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
                 uint32_t a8 = *(volatile uint32_t *)(B + 0x3ff6a8ULL);
                 uint32_t ac = *(volatile uint32_t *)(B + 0x3ff6acULL);
@@ -2295,7 +2295,7 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
             *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL) = a8s;
             *(volatile uint32_t *)(g_tgt_base + 0x3ff6acULL) = acs;
             *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0ULL) = b0s;
-            *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) = Ss ^ 0xb75e8052badb72a6ULL;
+            *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) = Ss ^ 0xb75e8052babd72a6ULL;
             snapS = Ss; snapA8 = a8s; snapAc = acs; snapB0 = b0s;   // v7.65: 留档
             
             // ═══ v7.67 执行水印: 时间门自初始化陷阱 ═══
@@ -2421,7 +2421,7 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         // v7.67: 水印判定 — 125/3/1=原实现亲自自初始化过=执行流到过时间门
         if (wm0 == 125u && wm1 == 3u && wm2 == 1u) g_wmHit++; else g_wmMiss++;
         if (snapS && g_tgt_base) {
-            uint64_t xS = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052badb72a6ULL;
+            uint64_t xS = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0ULL) ^ 0xb75e8052babd72a6ULL;
             uint32_t x8 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8ULL);
             uint32_t xc = *(volatile uint32_t *)(g_tgt_base + 0x3ff6acULL);
             uint32_t xb = *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0ULL);
@@ -2821,7 +2821,7 @@ static uint64_t ACE_feed_chain_now(void) {
     uint64_t ns = (uint64_t)mach_absolute_time() * num / den;
     uint64_t S = ns / 1000000ULL;
     uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
-    *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) = S ^ 0xb75e8052badb72a6ULL;
+    *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) = S ^ 0xb75e8052babd72a6ULL;
     uint32_t a8 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);
     *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8) = a8;
     uint32_t t2 = a8 ^ 0x1767cedcu;
@@ -2836,7 +2836,7 @@ static uint64_t ACE_feed_chain_now(void) {
 // 逐门评估 m1 入口 9 道门 (bit0..8, 1=过): a8≠0/eq②/eq③/eq④/45s窗/ctx指针非零/gate6/gate7abc/gate8
 static int ACE_eval_m1_gates(void) {
     int m = 0;
-    uint64_t S = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) ^ 0xb75e8052badb72a6ULL;
+    uint64_t S = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) ^ 0xb75e8052babd72a6ULL;
     uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
     uint32_t a8 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8);
     uint32_t ac = *(volatile uint32_t *)(g_tgt_base + 0x3ff6ac);
@@ -4009,7 +4009,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.85 启动（v7.84证明代码未改 → eval与实际唯一差异实锤: m1的45s窗用[0x3f0dc0/dc4]时基而eval用[0x3fadc0]! den=0→ms恒0→45s窗恒挂→每帧必早退→主体永不执行 → 纯数据修复num/den=125/3, 判据: [3ee7b1]变0+Windows列表出现「球球大作战」）===");
+            ACETrace(@"=== v7.86 启动（★病根实锤: S槽密钥两字节抄反! 反汇编movk@0x3a91c真钥=0xb75e8052babd72a6(babd), 我们全链10处一直是badb → m1真钥解出垃圾S → 门2 mix32雪崩必挂 → 每帧早退; eval同错钥自验自喂=1ff假象骗了我们全部轮次。本版全局修正, 判据: [3ee7b1] 1→0 + Windows出现「球球大作战」）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
