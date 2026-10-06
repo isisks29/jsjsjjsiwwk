@@ -1157,6 +1157,35 @@ static void *ACE_web_keeper(void *arg) {
         usleep(1000);
         while (g_addrTrapArmed) usleep(200);   // v7.70: 武装期不碰陷阱页(防自伤SIGBUS→Umeng→abort)
         @try {
+            // ═══ v7.89: 面板功能开关钉零(1ms高频, 抢在 sub_28dc8 下一帧读取之前) ═══
+            // F级链(键名从dylib明文提取): [3ff402]=配置/广角开启 [3ff404]=配置/全局加速
+            // [3ff439]=追踪/锁球调用全局加速 [3ff403]/[3ff405]=同族开关。
+            // sub_28dc8(draw每帧)在开关≠0时以 FUN_00028000 镜像扫描结果为共享缓存
+            // 巨库基址调 基址+0x46ce9e4/0x4647198(靶场反hook的手动函数解析, 设计
+            // 前提是干净环境)。我们环境扫描恒被污染: v7.87=trampolines→纯野秒死;
+            // v7.88=0x18524000(不在任何IMG)→半野随机活十几秒死。配置持久化 →
+            // 覆盖安装读旧开关=菜单出现瞬间崩; 删app=干净活十几秒 —— 双死相全解释。
+            // 钉零后: 402空分支/404==[3f09f3]恒等/439短路/405跳过 → 野调用物理不可达;
+            // 面板与复选框UI照常显示(点了不生效 — 验收三条不要求功能可用)。
+            // [3ff408](扫描结果)一并钉零: 12773消费点有范围检查, 读0直接跳过, 安全。
+            if (g_tgt_base) {
+                volatile uint8_t *p402 = (volatile uint8_t *)(g_tgt_base + 0x3ff402ULL);
+                volatile uint8_t *p403 = (volatile uint8_t *)(g_tgt_base + 0x3ff403ULL);
+                volatile uint8_t *p404 = (volatile uint8_t *)(g_tgt_base + 0x3ff404ULL);
+                volatile uint8_t *p405 = (volatile uint8_t *)(g_tgt_base + 0x3ff405ULL);
+                volatile uint8_t *p439 = (volatile uint8_t *)(g_tgt_base + 0x3ff439ULL);
+                volatile uintptr_t *p408 = (volatile uintptr_t *)(g_tgt_base + 0x3ff408ULL);
+                if (*p402 || *p403 || *p404 || *p405 || *p439 || *p408) {
+                    static long v89Log = 0;
+                    if (v89Log < 30) {
+                        v89Log++;
+                        ACETrace(@"[v89] ★功能开关非零→钉0: 广角(402)=%u 加速(404)=%u 403=%u 405=%u 锁球(439)=%u [3ff408]=%p (开关开=野调用=必死, 已拆)",
+                                 (unsigned)*p402, (unsigned)*p404, (unsigned)*p403,
+                                 (unsigned)*p405, (unsigned)*p439, (void *)*p408);
+                    }
+                    *p402 = 0; *p403 = 0; *p404 = 0; *p405 = 0; *p439 = 0; *p408 = 0;
+                }
+            }
             if (g_tgt_base) {
                 uintptr_t ctx = *(uintptr_t *)(g_tgt_base + 0x3ff698);
                 if (ctx >= 0x100000000ULL) {
@@ -4141,7 +4170,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.88 启动（死因终审: [v87]槽监控抓到 [3ff408]=0x104690000=libobjc-trampolines(我们swizzle的脚印库) → sub_28dc8每帧把它当共享缓存基址调 基址+0x46ce9e4 野地址 → 野跳死(不可捕捉+主线程=全部防线盲区)。修复: 镜像列表隐身trampolines(FUN_00028000返0=跳过野调) + byte0 keeper改跟随(原生球可开关面板)）===");
+            ACETrace(@"=== v7.89 启动（双死相全解释: 面板功能开关[3ff402广角/3ff404全局加速/3ff439锁球加速]≠0时 sub_28dc8 以FUN_00028000扫描结果为基址调+0x46ce9e4野地址 — v7.88命中0x18524000(不在任何IMG=半野)→每0.5s随机野跳活十几秒死; 配置持久化→覆盖安装读旧开关=菜单瞬间崩, 删app=干净。本版1ms钉零全部开关+3ff408, 野调用物理不可达）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
