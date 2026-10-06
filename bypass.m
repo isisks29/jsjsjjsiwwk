@@ -2916,41 +2916,93 @@ static void ACE_probe_imgui_core(void) {
 //    → SkipItems(win+0x93)=1 → 全部控件包装层(入口读 [ui+0x93]) 静默 return
 //    → 零顶点/零断言/drawData Valid=1 CmdLists=0 — 与全部现有观测吻合。
 // C. m1 的淡入累加器/标志/tab 真槽 = 0x3f0a58/0x3f0a0a/0x3f0a5c (v7.76 抄错位)。
-static void *g_winPtr79 = NULL;          // 捕获的面板主窗口对象
+// v7.80: 多窗口收集 — v7.79 只抓首个 CurrentWindow, 实锤抓错了(400×400调试窗);
+// 面板主窗真名=明文UTF8「球球大作战」@0x3e18ef(F级), 尺寸上限常数(1100,650)@0x1515b0。
+// 收集帧内出现过的所有窗口对象(cap 8), 按 Name 指认面板主窗。
+#define ACE_MAXWINS 8
+static void *g_wins80[ACE_MAXWINS];
+static volatile int g_winCnt80 = 0;
+static void *g_winPtr79 = NULL;          // 兼容: 首个捕获窗口
 static volatile int g_winSpin79 = 0;     // 自旋线程已启动
 static void *ACE_win_spin79(void *arg) {
     (void)arg;
-    for (int i = 0; i < 1000000 && g_winPtr79 == NULL; i++) {
+    for (int i = 0; i < 400000; i++) {
         if (g_tgt_base) {
             uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
             if (ctxp) {
                 uintptr_t w = *(volatile uintptr_t *)(ctxp + 0x3e28);
-                if (w) { g_winPtr79 = (void *)w; break; }
+                if (w) {
+                    int dup = 0;
+                    for (int k = 0; k < g_winCnt80; k++) if (g_wins80[k] == (void *)w) { dup = 1; break; }
+                    if (!dup && g_winCnt80 < ACE_MAXWINS) {
+                        g_wins80[g_winCnt80++] = (void *)w;
+                        if (!g_winPtr79) g_winPtr79 = (void *)w;
+                    }
+                }
             }
         }
+        if (g_winCnt80 >= 6 && i > 40000) break;   // 收齐提前退出
         usleep(1);
     }
-    ACETrace(@"[v79spin] 窗口指针捕获%s: %p", g_winPtr79 ? "成功" : "超时失败", g_winPtr79);
+    ACETrace(@"[v80spin] 窗口收集完成: %d 个", g_winCnt80);
     return NULL;
 }
-static void ACE_dump_win79(long n) {
-    if (!g_winPtr79) return;
-    uintptr_t w = (uintptr_t)g_winPtr79;
-    @try {
-        int8_t *bb = (int8_t *)w;
-        volatile float *f = (volatile float *)w;
-        ACETrace(@"[v79win#%ld] win=%p ★SkipItems(+0x93)=%d b0=%d b1=%d b2=%d b3=%d aFitX=%d aFitY=%d | 8e=%d 91=%d 94=%d 95=%d 96=%d 98=%d",
-                 n, (void *)w, (int)bb[0x93], (int)bb[0xb0], (int)bb[0xb1], (int)bb[0xb2], (int)bb[0xb3],
-                 (int)bb[0xa8], (int)bb[0xa9], (int)(uint8_t)bb[0x8e], (int)(uint8_t)bb[0x91],
-                 (int)(uint8_t)bb[0x94], (int)(uint8_t)bb[0x95], (int)(uint8_t)bb[0x96], (int)(uint8_t)bb[0x98]);
-        ACETrace(@"[v79win#%ld] Pos=(%g,%g) Size@0x10=(%g,%g,%g,%g) ClipRect@0x210=(%g,%g,%g,%g) Flags(+0xc)=%x LFA(+0x238)=%u",
-                 n, (double)f[0xe8 / 4], (double)f[0xec / 4],
-                 (double)f[0x10 / 4], (double)f[0x14 / 4], (double)f[0x18 / 4], (double)f[0x1c / 4],
-                 (double)f[0x210 / 4], (double)f[0x214 / 4], (double)f[0x218 / 4], (double)f[0x21c / 4],
-                 *(volatile uint32_t *)(w + 0xc), *(volatile uint32_t *)(w + 0x238));
-    } @catch (NSException *e) { ACETrace(@"[v79win#%ld] dump异常: %@", n, e); }
+static void ACE_dump_wins80(int phase, long n) {
+    // phase 0=m1前(上帧末状态) 1=m1后(本帧绘制产物)
+    int cnt = g_winCnt80;
+    if (cnt == 0) return;
+    for (int k = 0; k < cnt; k++) {
+        uintptr_t w = (uintptr_t)g_wins80[k];
+        if (!w) continue;
+        @try {
+            int8_t *bb = (int8_t *)w;
+            volatile float *f = (volatile float *)w;
+            // Name: [w+0] 是 char* — 面板主窗应为「球球大作战」(e7 90 83 e7 90 83 ...)
+            uintptr_t nmp = *(volatile uintptr_t *)w;
+            unsigned char nb[13] = {0};
+            if (nmp > 0x100000000ULL) memcpy(nb, (void *)nmp, 12);
+            int isPanel = (nb[0] == 0xe7 && nb[1] == 0x90 && nb[2] == 0x83);  // 「球」UTF8 首3字节
+            ACETrace(@"[v80w%d.%d#%ld]%s ptr=%p name=%02x%02x%02x%02x%02x%02x(%.12s) Skip=%d b0=%d b1=%d b2=%d b3=%d 8e=%d 91=%d 94=%d 95=%d",
+                     phase, k, n, isPanel ? "★面板主窗" : "", (void *)w,
+                     nb[0], nb[1], nb[2], nb[3], nb[4], nb[5],
+                     (nmp > 0x100000000ULL) ? (const char *)nb : "-",
+                     (int)bb[0x93], (int)bb[0xb0], (int)bb[0xb1], (int)bb[0xb2], (int)bb[0xb3],
+                     (int)(uint8_t)bb[0x8e], (int)(uint8_t)bb[0x91], (int)(uint8_t)bb[0x94], (int)(uint8_t)bb[0x95]);
+            ACETrace(@"[v80w%d.%d#%ld] Pos@e8=(%g,%g) f10=(%g,%g) f18=(%g,%g) f20=(%g,%g) Clip@210=(%g,%g,%g,%g) cursor@d8=(%g,%g) +110=%g LFA=%u",
+                     phase, k, n,
+                     (double)f[0xe8 / 4], (double)f[0xec / 4], (double)f[0x10 / 4], (double)f[0x14 / 4],
+                     (double)f[0x18 / 4], (double)f[0x1c / 4], (double)f[0x20 / 4], (double)f[0x24 / 4],
+                     (double)f[0x210 / 4], (double)f[0x214 / 4], (double)f[0x218 / 4], (double)f[0x21c / 4],
+                     (double)f[0xd8 / 4], (double)f[0xdc / 4], (double)f[0x110 / 4],
+                     *(volatile uint32_t *)(w + 0x238));
+            // DrawList 候选区 @+0x1e0: 三个 ImVector{Size,Cap,Data} = Cmd/Idx/Vtx
+            // Vtx.Size>0 = 有顶点! Cmd.Size>0 = 有绘制命令!
+            ACETrace(@"[v80w%d.%d#%ld] DL@1e0: Cmd(sz=%u cap=%d data=%p) Idx(sz=%u cap=%d data=%p) ★Vtx(sz=%u cap=%d data=%p)",
+                     phase, k, n,
+                     *(volatile uint32_t *)(w + 0x1e0), *(volatile int32_t *)(w + 0x1e4), (void *)(uintptr_t)*(volatile uint64_t *)(w + 0x1e8),
+                     *(volatile uint32_t *)(w + 0x1f0), *(volatile int32_t *)(w + 0x1f4), (void *)(uintptr_t)*(volatile uint64_t *)(w + 0x1f8),
+                     *(volatile uint32_t *)(w + 0x200), *(volatile int32_t *)(w + 0x204), (void *)(uintptr_t)*(volatile uint64_t *)(w + 0x208));
+            // InnerClipRect/WorkRect 区 raw
+            ACETrace(@"[v80w%d.%d#%ld] raw174=%g %g %g %g | raw184=%g %g %g %g | raw194=%g %g",
+                     phase, k, n,
+                     (double)f[0x174 / 4], (double)f[0x178 / 4], (double)f[0x17c / 4], (double)f[0x180 / 4],
+                     (double)f[0x184 / 4], (double)f[0x188 / 4], (double)f[0x18c / 4], (double)f[0x190 / 4],
+                     (double)f[0x194 / 4], (double)f[0x198 / 4]);
+        } @catch (NSException *e) { ACETrace(@"[v80w%d.%d#%ld] dump异常: %@", phase, k, n, e); }
+    }
+    if (phase == 1) {
+        @try {  // IniFilename 字符串 (IO+0x18 → 路径; 若指向靶场内 0x3ff7c8 则 ini 不可读写=无干扰)
+            uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
+            uintptr_t ini = ctxp ? *(volatile uintptr_t *)(ctxp + 8 + 0x18) : 0;
+            if (ini) {
+                char ib[65] = {0};
+                memcpy(ib, (void *)ini, 64);
+                long off = (g_tgt_base && ini >= g_tgt_base && ini < g_tgt_base + 0x400000ULL) ? (long)(ini - g_tgt_base) : -1;
+                ACETrace(@"[v80ini#%ld] IniFilename=%p(base+%ld) = \"%s\"", n, (void *)ini, off, ib);
+            }
+        } @catch (NSException *e) {}
+    }
 }
-// ═════════════════ v7.79 END ═════════════════
 
 static void ACE_hook_m1(id self, SEL _cmd) {
     long n = ++g_m1Cnt;
@@ -3002,6 +3054,7 @@ static void ACE_hook_m1(id self, SEL _cmd) {
             }
         }
     }
+    if (sample) ACE_dump_wins80(0, n);   // v7.80: m1前=上帧末状态(对照 Clear 时机)
     int fw = g_freeze_web;
     g_freeze_web = 1;                                // m1 期间冻结 keeper(防跨tick撕裂)
     ACE_feed_chain_now();                            // 现场喂新鲜一致链
@@ -3072,7 +3125,7 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     if (g_tgt_base) b0B = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
     if (g_orig_m1) g_orig_m1(self, _cmd);
     ACE_probe_imgui_core();   // v7.79: 内部直调已删(崩溃元凶), 只剩字体守卫数据检查
-    if (sample) ACE_dump_win79(n);   // v7.79: 本帧 Begin 后的 SkipItems/b1/ClipRect 真值
+    if (sample) ACE_dump_wins80(1, n);   // v7.80: m1后=本帧绘制产物(Vtx.Size>0=有顶点)
     if (g_tgt_base) b0A = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
     g_freeze_web = fw;
     if (sample) {
@@ -3808,7 +3861,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.79 启动（删v7.78崩溃探针 + 反汇编实锤Style.Alpha@ctx+0x3778: <=0→Begin置SkipItems→全控件静默→零顶点零断言, 每帧强制1.0 + 窗口对象捕获全字段dump + v7.76槽地址纠错0x3f0a58）===");
+            ACETrace(@"=== v7.80 启动（实锤: 面板主窗名=明文「球球大作战」尺寸上限(1100,650); v7.79抓错窗口(400×400调试窗) → 多窗口收集+按名字锁定 + DrawList顶点数终裁 + m1前后对照 + IniFilename dump）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
