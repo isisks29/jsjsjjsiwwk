@@ -505,6 +505,7 @@ static void (*g_orig_pres)(id, SEL, id) = NULL;
 typedef struct { double r, g, b, a; } ACEClearColor;   // ABI == MTLClearColor(4 double)
 static void ACE_diag_display(int run);     // 前置声明(visball 点击处引用)
 static void ACE_dump_wins80(int phase, long n);   // v7.81 前置声明(verdict 每秒dump用)
+static void ACE_scan_windows82(long tag);         // v7.82 前置声明(Windows列表枚举)
 // ═══ v7.74 m1(UI构建器, bridge方法23KB@0x3a8b4) 取证+现场喂值 ═══
 // 解剖裁决: drawInMTKView 成功分支内零绘制调用; 真渲染=0x8dc6c 经 sub_893d4 调
 // ImGui Metal 后端(_0xA91D5F47, [0x3f2788]单例)renderDrawData:commandBuffer:commandEncoder:;
@@ -2452,6 +2453,7 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                                  dd, w0, (unsigned long long)w8, (unsigned long long)w16, w24,
                                  g_m1Cnt, g_n0Cnt, g_m2Cnt, g_m3Cnt);
                                  ACE_dump_wins80(2, g_vTot);   // v7.81: 每秒全收集窗口dump(含DrawList顶点数)
+                                 ACE_scan_windows82(g_vTot);   // v7.82: Windows/Viewports 列表枚举(Render收集终裁)
                     } else {
                         ACETrace(@"[dd] GetDrawData→nil | m1=%ld n0=%ld m2=%ld m3=%ld",
                                  g_m1Cnt, g_n0Cnt, g_m2Cnt, g_m3Cnt);
@@ -2878,6 +2880,74 @@ static int ACE_eval_m1_gates(void) {
     }
     return m;
 }
+// ═════════════════ v7.82 Windows/Viewports 列表枚举 ═════════════════
+// Render(FUN_001380d4)伪代码实锤: 收集循环遍历 Windows列表(ctx+0x3dc8=Size, ctx+0x3dd0=Data),
+// 条件: [win+0x8e](Active)!=0 && [win+0x95]==0 && !(flags&0x1000000) && win!=NavWindow → FUN_001412e8 收集。
+// 观测悖论: Debug##Default Vtx=132 Active=1 但 CmdListsCount=0 → 怀疑 Windows 列表不含这些窗口
+// 或 ViewportIdx(+0x188) 无效被丢弃。本扫描一次列全: 谁在列表、谁有顶点、谁被丢。
+static void ACE_scan_windows82(long tag) {
+    if (!g_tgt_base) return;
+    @try {
+        uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
+        if (!ctxp) return;
+        uint32_t rvN = *(volatile uint32_t *)(ctxp + 0x4028);
+        uintptr_t rvD = *(volatile uintptr_t *)(ctxp + 0x4030);
+        uint32_t vpN = *(volatile uint32_t *)(ctxp + 0x42a8);
+        uintptr_t vpD = *(volatile uintptr_t *)(ctxp + 0x42b0);
+        uint32_t wN  = *(volatile uint32_t *)(ctxp + 0x3dc8);
+        uintptr_t wD = *(volatile uintptr_t *)(ctxp + 0x3dd0);
+        uintptr_t navW = *(volatile uintptr_t *)(ctxp + 0x41a0);
+        uintptr_t x41b0 = *(volatile uintptr_t *)(ctxp + 0x41b0);
+        ACETrace(@"[v82#%ld] ctx列表: Render迭代(n=%u,%p) Viewports(n=%u,%p) ★Windows(n=%u,%p) Nav=%p x41b0=%p FrameCount=%u/%u",
+                 tag, rvN, (void *)rvD, vpN, (void *)vpD, wN, (void *)wD, (void *)navW, (void *)x41b0,
+                 *(volatile uint32_t *)(ctxp + 0x3da8), *(volatile uint32_t *)(ctxp + 0x3dac));
+        if (vpD && vpN && vpN <= 16) {
+            for (uint32_t i = 0; i < vpN; i++) {
+                uintptr_t vp = vpD + (uintptr_t)i * 0x208ULL;
+                ACETrace(@"[v82#%ld] VP[%u]=%p ID=%x flags=%x DrawData区: Valid=%u CmdListsCount=%u TotIdx=%u TotVtx=%u CmdLists=%p",
+                         tag, i, (void *)vp, *(volatile uint32_t *)vp, *(volatile uint32_t *)(vp + 4),
+                         *(volatile uint32_t *)(vp + 0x48), *(volatile uint32_t *)(vp + 0x4c),
+                         *(volatile uint32_t *)(vp + 0x50), *(volatile uint32_t *)(vp + 0x54),
+                         (void *)(uintptr_t)*(volatile uint64_t *)(vp + 0x58));
+            }
+        }
+        if (rvD && rvN && rvN <= 16) {
+            for (uint32_t i = 0; i < rvN; i++) {
+                uintptr_t e = *(volatile uintptr_t *)(rvD + (uintptr_t)i * 8);
+                if (!e) continue;
+                ACETrace(@"[v82#%ld] RenderIt[%u]=%p +0x48=%x +0x4c(DL数)=%u +0x50=%p +0x78(n)=%d",
+                         tag, i, (void *)e, *(volatile uint32_t *)(e + 0x48),
+                         *(volatile uint32_t *)(e + 0x4c), (void *)(uintptr_t)*(volatile uint64_t *)(e + 0x50),
+                         *(volatile int32_t *)(e + 0x78));
+            }
+        }
+        if (wD && wN && wN <= 64) {
+            for (uint32_t i = 0; i < wN; i++) {
+                uintptr_t w = *(volatile uintptr_t *)(wD + (uintptr_t)i * 8);
+                if (w < 0x100000000ULL) { ACETrace(@"[v82#%ld] WIN[%u]=%p 非法!", tag, i, (void *)w); continue; }
+                uintptr_t nmp = *(volatile uintptr_t *)w;
+                unsigned char nb[13] = {0};
+                if (nmp > 0x100000000ULL) memcpy(nb, (void *)nmp, 12);
+                uintptr_t dl = *(volatile uintptr_t *)(w + 0x270);
+                uint32_t cmd = 0xffffffff, vtx = 0xffffffff;
+                if (dl > 0x100000000ULL) { cmd = *(volatile uint32_t *)dl; vtx = *(volatile uint32_t *)(dl + 0x20); }
+                int8_t *bb = (int8_t *)w;
+                ACETrace(@"[v82#%ld] ★WIN[%u]=%p name=%02x%02x%02x%02x%02x%02x(%.12s) Act8e=%d +95=%d Skip93=%d flags=%x VpIdx188=%d Par340=%p Cmd=%u ★Vtx=%u LFA=%u",
+                         tag, i, (void *)w, nb[0], nb[1], nb[2], nb[3], nb[4], nb[5],
+                         (nmp > 0x100000000ULL) ? (const char *)nb : "-",
+                         (int)(uint8_t)bb[0x8e], (int)(uint8_t)bb[0x95], (int)bb[0x93],
+                         *(volatile uint32_t *)(w + 0xc), *(volatile int32_t *)(w + 0x188),
+                         (void *)(uintptr_t)*(volatile uint64_t *)(w + 0x340), cmd, vtx,
+                         *(volatile uint32_t *)(w + 0x238));
+            }
+        } else {
+            ACETrace(@"[v82#%ld] ★★Windows列表异常: n=%u data=%p — Render收集循环%s!", tag, wN, (void *)wD,
+                     (wN == 0) ? "一次都不会跑(=CmdLists恒0的直接原因)" : "数据指针非法");
+        }
+    } @catch (NSException *e) { ACETrace(@"[v82#%ld] 扫描异常: %@", tag, e); }
+}
+// ═════════════════ v7.82 END ═════════════════
+
 // ═══ v7.78 对照实验 + NewFrame 守卫强制放行 ═══
 // ① sub_12d87c(NewFrame) 静态实锤含守卫: DisplaySize>0(过) + 字体图集状态
 //    ([Fonts+0x48]==1 && [Fonts+0x19]==0 → 跳过整帧主体)。守卫命中 → 帧作用域
@@ -3122,6 +3192,7 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     if (g_orig_m1) g_orig_m1(self, _cmd);
     ACE_probe_imgui_core();   // v7.79: 内部直调已删(崩溃元凶), 只剩字体守卫数据检查
     if (sample) ACE_dump_wins80(1, n);   // v7.80: m1后=本帧绘制产物(Vtx.Size>0=有顶点)
+    if (sample && n <= 3) ACE_scan_windows82(-n);   // v7.82: m1后立即枚举(Render前时刻)
     if (g_tgt_base) b0A = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
     g_freeze_web = fw;
     if (sample) {
@@ -3863,7 +3934,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.81 启动（DrawList真身=[win+0x270]顶点数终裁 + [3ee7b1]主体执行铁证监控 + m1 IMP偏移验证 + 每秒全窗口dump不受byte0影响）===");
+            ACETrace(@"=== v7.82 启动（Render伪代码实锤: 收集遍历Windows列表ctx+0x3dc8/3dd0 + 条件Act8e&&!95&&!flags1M → 本版全枚举Windows/Viewports: 谁在列表/谁有顶点/谁被丢, Debug窗132顶点却不进CmdLists的最后黑洞）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
