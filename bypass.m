@@ -2857,6 +2857,52 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     g_freeze_web = 1;                                // m1 期间冻结 keeper(防跨tick撕裂)
     ACE_feed_chain_now();                            // 现场喂新鲜一致链
     if (sample) gAfter = ACE_eval_m1_gates();
+    // ═══ v7.75: ImGui ctx/IO 状态探针 + DisplaySize/DeltaTime 矫正 ═══
+    // 解剖: sub_12c734=IO getter([0x3ff880]=ctx, 返回ctx+8); sub_12d87c=NewFrame(15KB);
+    // m1 用 DisplaySize(@IOptr+8) 算主窗口位置/尺寸。DisplaySize=(0,0) → 裁剪矩形空
+    // → 全顶点被裁 → CmdLists=0 → 全透明帧 — 与 [dd] w8=0 w16=0 w24=0 完全自洽。
+    // 检测到非法值当场矫正(每帧静默), 采样帧全量 dump。
+    if (g_tgt_base) {
+        uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
+        uintptr_t io = ctxp ? (ctxp + 8) : 0;
+        if (io) {
+            volatile float *dsX = (volatile float *)(io + 8);
+            volatile float *dsY = (volatile float *)(io + 0xc);
+            volatile float *dt  = (volatile float *)(io + 0x10);
+            int fixed = 0;
+            if (!(*dsX > 1.0f) || !(*dsY > 1.0f)) { *dsX = 1080.0f; *dsY = 810.0f; fixed |= 1; }
+            if (!(*dt > 0.0f) || *dt > 1.0f) { *dt = 0.016f; fixed |= 2; }
+            if (sample) {
+                ACETrace(@"[io#%ld] ctx=%p DisplaySize=(%g,%g) DeltaTime=%g 矫正bits=%d(1=尺寸2=时步)",
+                         n, (void *)ctxp, *dsX, *dsY, *dt, fixed);
+                for (int q = 0; q < 4; q++)
+                    ACETrace(@"[io#%ld] IO+%02x: %llx %llx %llx %llx", n, q * 32,
+                             (unsigned long long)*(volatile uint64_t *)(io + q * 32),
+                             (unsigned long long)*(volatile uint64_t *)(io + q * 32 + 8),
+                             (unsigned long long)*(volatile uint64_t *)(io + q * 32 + 16),
+                             (unsigned long long)*(volatile uint64_t *)(io + q * 32 + 24));
+                uint32_t inc = *(volatile uint32_t *)(ctxp + 0x5340);
+                uintptr_t be = *(volatile uintptr_t *)(g_tgt_base + 0x3f2788ULL);
+                void *ftex = NULL;
+                @try {
+                    if (be) ftex = (__bridge void *)((id (*)(id, SEL))objc_msgSend)((__bridge id)(void *)be, NSSelectorFromString(@"fontTexture"));
+                } @catch (NSException *e) {}
+                ACETrace(@"[io#%ld] backend=%p fontTexture=%p NewFrame计数[ctx+0x5340]=%u", n, (void *)be, ftex, inc);
+                if (g_getDrawData) {
+                    @try {
+                        void *dd = ((void *(*)(void))g_getDrawData)();
+                        if (dd) {
+                            float dpx = *(volatile float *)((uintptr_t)dd + 44), dpy = *(volatile float *)((uintptr_t)dd + 48);
+                            float dsx = *(volatile float *)((uintptr_t)dd + 52), dsy = *(volatile float *)((uintptr_t)dd + 56);
+                            ACETrace(@"[io#%ld] 上帧drawData DisplayPos=(%g,%g) DisplaySize=(%g,%g)", n, dpx, dpy, dsx, dsy);
+                        }
+                    } @catch (NSException *e) {}
+                }
+            }
+        } else if (sample) {
+            ACETrace(@"[io#%ld] ★ctx[0x3ff880]=%p — ImGui上下文缺失!", n, (void *)ctxp);
+        }
+    }
     if (g_tgt_base) b0B = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
     if (g_orig_m1) g_orig_m1(self, _cmd);
     if (g_tgt_base) b0A = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
@@ -3594,7 +3640,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.74 启动（m1=UI构建器实锤: hook m1/n0/m2/m3 + 进门冻结keeper现场喂新鲜S链(5道S门由构造必过) + 真门字节直写 + 9门逐项评估 + drawData命令数裁决）===");
+            ACETrace(@"=== v7.75 启动（m1全程在跑实锤: 控件代码每帧执行但ImGui零输出 → IO.DisplaySize探针+当场矫正(1080×810) + DeltaTime矫正 + ctx/backend/字体纹理/上帧drawData尺寸全量dump）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
