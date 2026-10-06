@@ -49,12 +49,54 @@ static int ACE_find_our_index(void) {
         if (_dyld_get_image_header(i) == self) { g_our_index = (int)i; return g_our_index; }
     return -1;
 }
+// ═══ v7.88: 第二隐身目标 libobjc-trampolines.dylib — 本次死因实锤 ═══
+// [v87]槽监控+IMG映射: 面板出现瞬间 [3ee7b1]1→0(主体首执行) 且 [3ff408]0→0x104690000
+// = libobjc-trampolines 基址(objc runtime 因我们大量 swizzle 自动加载的副产物库)。
+// m1 主体首帧 FUN_00028000 扫镜像名 strstr 命中它 → sub_28dc8(draw主链每帧)把它
+// 当共享缓存巨库基址算 基址+0x46ce9e4=0x108D5E9E4 野地址直接调用 → 野跳死进程
+// (信号/Mach层全不可捕捉; 主线程所为 → zone-freeze 冻不到; 面板出现后1s内死全吻合)。
+// 修复: 从可见镜像列表摘除(它只是几页的小库, 摘除后 FUN_00028000 返回0=跳过调用,
+// 或命中其真正目标库 → 两种结局都安全)。
+static int g_tramp_index = -2;              // -2=未查过 -1=不存在 >=0 真实索引
+static uint32_t g_tramp_scan_cnt = 0xffffffffu;
+static int ACE_find_tramp_index(void) {
+    if (g_tramp_index >= 0) return g_tramp_index;
+    uint32_t n = _dyld_image_count();
+    if (g_tramp_index == -1 && n == g_tramp_scan_cnt) return -1;   // 数量未变不重扫
+    g_tramp_scan_cnt = n;
+    g_tramp_index = -1;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "libobjc-trampolines")) { g_tramp_index = (int)i; break; }
+    }
+    return g_tramp_index;
+}
+// 逻辑→真实索引映射缓存(image 数量/隐身目标变化才重建; 靶场每帧全量扫描 O(n) 可接受)
+static uint32_t g_mapCache[1536];
+static uint32_t g_mapN = 0;
+static uint32_t g_mapCnt = 0xffffffffu;
+static int g_mapO = -99, g_mapT = -99;
+static void ACE_ensure_map(void) {
+    uint32_t n = _dyld_image_count();
+    int o = ACE_find_our_index();
+    int t = ACE_find_tramp_index();
+    if (n == g_mapCnt && o == g_mapO && t == g_mapT && g_mapN) return;
+    g_mapCnt = n; g_mapO = o; g_mapT = t; g_mapN = 0;
+    for (uint32_t r = 0; r < n && g_mapN < 1536; r++) {
+        if ((int)r == o || (int)r == t) continue;
+        g_mapCache[g_mapN++] = r;
+    }
+}
+static uint32_t ACE_map_real(uint32_t i) {
+    ACE_ensure_map();
+    return (i < g_mapN) ? g_mapCache[i] : i;
+}
 static uint32_t ACE_image_count(void) {
-    return (uint32_t)((int)_dyld_image_count() - (ACE_find_our_index() >= 0 ? 1 : 0));
+    ACE_ensure_map();
+    return g_mapN;
 }
 static const char *ACE_image_name(uint32_t i) {
-    int o = ACE_find_our_index();
-    const char *nm = _dyld_get_image_name((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+    const char *nm = _dyld_get_image_name(ACE_map_real(i));
     // v7.37: 对靶场隐藏 libsystem_pthread —— 其导出树扫描(q4@0x9eaa4, 解密实证
     // 目标="libsystem_pthread"+"/_pthread_create")解析不到真 pthread_create
     // → 缓存[0x3f65a8]永远为空 → 复核线程(entry 0xaeda8)孵化只能走 GOT 桩
@@ -63,8 +105,7 @@ static const char *ACE_image_name(uint32_t i) {
     return nm;
 }
 static const struct mach_header *ACE_image_header(uint32_t i) {
-    int o = ACE_find_our_index();
-    return _dyld_get_image_header((o >= 0 && i >= (uint32_t)o) ? i + 1 : i);
+    return _dyld_get_image_header(ACE_map_real(i));
 }
 static ACEAddImageFn g_watch_cb = NULL;
 static void ACE_watch_wrapper(const struct mach_header *mh, intptr_t slide) {
@@ -72,6 +113,11 @@ static void ACE_watch_wrapper(const struct mach_header *mh, intptr_t slide) {
     // v7.10: 自己的镜像绝不转发。旧版换成 image0 的头配我们的 slide 转发,
     // 靶场解密引擎(pm_poolmin_prepare)拿到错配组合算出野指针 → 启动随机 SIGSEGV
     if (mh && mh == ACE_self_header()) return;
+    // v7.88: trampolines 的 add_image 也不转发(与镜像列表同一隐身目标)
+    {
+        int t88 = ACE_find_tramp_index();
+        if (mh && t88 >= 0 && mh == _dyld_get_image_header((uint32_t)t88)) return;
+    }
     g_watch_cb(mh, slide);
 }
 static void ACE_register_add_image(ACEAddImageFn f) {
@@ -1133,7 +1179,9 @@ static void *ACE_web_keeper(void *arg) {
                 // byte0 = g_panelWant(可见球设定), 保证"显示"意愿不被误清。
                 if (g_nativeBuilt && g_tgt_base) {
                     volatile uint8_t *sw = (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
-                    if ((int)*sw != g_panelWant) *sw = (uint8_t)g_panelWant;
+                                        // v7.88: 跟随式——尊重任何翻转者(靶场原生球 iconOnClick / 我们的
+                    // visball)。旧强制覆盖会把原生球的"关闭"在20ms内顶回 → 面板关不掉。
+                    g_panelWant = (int)*sw;
                     // v7.60: draw 时基槽防复毒(被写坏立即修回 125/3/flag1)
                     volatile uint32_t *tb = (volatile uint32_t *)(g_tgt_base + 0x3f2900ULL);
                     if (tb[1] != 3u || tb[2] != 1u) { tb[0] = 125u; tb[1] = 3u; tb[2] = 1u; }
@@ -4093,7 +4141,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.87 启动（面板已出✓ → 治1-2s闪退: 死因=裸svc pthread_kill(SIGKILL)内核级不可捕捉; F级实锤三振出局机制[0x3f68e4]>=3→0xefe18自毁; 凶手=隐形后台线程(没走任何已监控通道)。五路压制: 失败计数钉零+冻结区扩8区+高警戒2ms采样+dispatch_after吞安保block+槽监控取证）===");
+            ACETrace(@"=== v7.88 启动（死因终审: [v87]槽监控抓到 [3ff408]=0x104690000=libobjc-trampolines(我们swizzle的脚印库) → sub_28dc8每帧把它当共享缓存基址调 基址+0x46ce9e4 野地址 → 野跳死(不可捕捉+主线程=全部防线盲区)。修复: 镜像列表隐身trampolines(FUN_00028000返0=跳过野调) + byte0 keeper改跟随(原生球可开关面板)）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
