@@ -2853,6 +2853,27 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     int gBefore = 0, gAfter = 0;
     uint8_t b0B = 0, b0A = 0;
     if (sample) gBefore = ACE_eval_m1_gates();      // 喂值前现场(m1 将看到的撕裂态)
+    // ═══ v7.76 终轮: 强制 alpha=1 + tab=0 + 一次性状态 dump ═══
+    // m1 主体线性无早退+入口9门全过 → m1 每帧跑完整控件区; ImGui 零顶点的
+    // 唯一自洽解释 = 主窗口 Alpha=0 被隐藏。Alpha 源 = [0x3faa58] 淡入累加器,
+    // 累加块被 [0x3faa0a] bit0 门控跳过 → 累加器停在 BSS 初值 0。强制归 1。
+    if (g_tgt_base) {
+        volatile float *pAcc = (volatile float *)(g_tgt_base + 0x3faa58ULL);
+        volatile uint8_t *pFlag = (volatile uint8_t *)(g_tgt_base + 0x3faa0aULL);
+        volatile uint32_t *pTab = (volatile uint32_t *)(g_tgt_base + 0x3faa5cULL);
+        static int v776Once = 0;
+        if (!v776Once) {
+            v776Once = 1;
+            float a0 = *pAcc; uint8_t f0 = *pFlag; uint32_t t0 = *pTab;
+            uintptr_t o1 = *(volatile uintptr_t *)(g_tgt_base + 0x3ff408ULL);
+            uint8_t b1 = *(volatile uint8_t *)(g_tgt_base + 0x3ee7b1ULL);
+            ACETrace(@"[v76] 修前: alpha累加[3faa58]=%g flag[3faa0a]=%u tab[3faa5c]=%u 一次性([3ee7b1]=%u [3ff408]=%p)",
+                     (double)a0, (unsigned)f0, t0, (unsigned)b1, (void *)o1);
+            ACETrace(@"[v76] 强制: alpha=1.0 flag=1 tab=%u(越界才归0)", t0);
+        }
+        *pAcc = 1.0f; *pFlag = 1;
+        if (*pTab > 6u) *pTab = 0;
+    }
     int fw = g_freeze_web;
     g_freeze_web = 1;                                // m1 期间冻结 keeper(防跨tick撕裂)
     ACE_feed_chain_now();                            // 现场喂新鲜一致链
@@ -3640,7 +3661,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.75 启动（m1全程在跑实锤: 控件代码每帧执行但ImGui零输出 → IO.DisplaySize探针+当场矫正(1080×810) + DeltaTime矫正 + ctx/backend/字体纹理/上帧drawData尺寸全量dump）===");
+            ACETrace(@"=== v7.76 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
