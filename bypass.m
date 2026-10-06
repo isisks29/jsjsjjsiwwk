@@ -734,9 +734,23 @@ static volatile int g_ring_i = 0, g_ring_n = 0;
 static volatile long long g_burst_until = 0;   // v7.17: 高精度突发采样截止时间(秒)
 static volatile int g_imgMapSaved87 = 0;       // v7.87: image映射已落日志
 static volatile uintptr_t g_cacheBase92 = 0;   // v7.92: dyld共享缓存基址(一次性读取)
-// v7.92b: 真SDK里该声明在 <mach-o/dyld_priv.h>; 不引额外头, 直接extern
-// (符号由libdyld导出, iOS13+; 隐式声明在真Xcode是error)
-extern const void *dyld_get_shared_cache_range(size_t *length);
+// v7.92c: 该符号在头文件(mach-o/dyld_priv.h)有声明但 SDK tbd 链接桩没有 →
+// 直接extern会 Undefined symbols。改运行时 dlsym 解析; 解析不到再用
+// "共享缓存系统库最低基址按16MB向下取整"做显示基址(基址仅面板显示用,
+// 开关恒钉0, base不参与任何执行路径)。
+typedef const void *(*ACE_gscr_t)(size_t *);
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *)-2)   // 真SDK dlfcn.h 原值; 编译桩缺失时补
+#endif
+static ACE_gscr_t ACE_gscr92(void) {
+    static ACE_gscr_t f = 0;
+    static int done92 = 0;
+    if (!done92) {
+        done92 = 1;
+        f = (ACE_gscr_t)dlsym(RTLD_DEFAULT, "dyld_get_shared_cache_range");
+    }
+    return f;
+}
 
 static void *ACE_heartbeat(void *arg) {
     (void)arg;
@@ -1196,9 +1210,25 @@ static void *ACE_web_keeper(void *arg) {
                 // 开关已独立钉零, base钉 dyld_get_shared_cache_range 真基址 = 靶场设计
                 // 本意(base+0x46ce9e4=缓存内手动解析系统函数) → 显示与真机一致。
                 if (!g_cacheBase92) {
+                    ACE_gscr_t f92 = ACE_gscr92();
                     size_t clen92 = 0;
-                    const void *cr92 = dyld_get_shared_cache_range(&clen92);
-                    if (cr92 && clen92) g_cacheBase92 = (uintptr_t)cr92;
+                    const void *cr92 = f92 ? f92(&clen92) : 0;
+                    if (cr92 && clen92) {
+                        g_cacheBase92 = (uintptr_t)cr92;
+                    } else {
+                        // 兜底: 共享缓存系统库最低基址按16MB向下取整作显示基址
+                        uintptr_t lo92 = ~(uintptr_t)0;
+                        uint32_t n92 = _dyld_image_count();
+                        for (uint32_t i92 = 0; i92 < n92; i92++) {
+                            const char *nm92 = _dyld_get_image_name(i92);
+                            if (nm92 && strncmp(nm92, "/usr/lib/", 9) == 0) {
+                                uintptr_t h92 = (uintptr_t)_dyld_get_image_header(i92);
+                                if (h92 && h92 < lo92) lo92 = h92;
+                            }
+                        }
+                        if (lo92 != ~(uintptr_t)0) g_cacheBase92 = lo92 & ~(uintptr_t)0x0ffffffULL;
+                        ACETrace(@"[v92] dlsym共享缓存符号失败, 兜底显示基址 %p", (void *)g_cacheBase92);
+                    }
                 }
                 if (g_cacheBase92 && *p408 != g_cacheBase92) {
                     static long v92Log = 0;
