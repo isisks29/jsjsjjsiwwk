@@ -3140,9 +3140,14 @@ static void ACE_hook_m1(id self, SEL _cmd) {
         }
     }
     if (sample) ACE_dump_wins80(0, n);   // v7.80: m1前=上帧末状态(对照 Clear 时机)
-    int fw = g_freeze_web;
-    g_freeze_web = 1;                                // m1 期间冻结 keeper(防跨tick撕裂)
-    ACE_feed_chain_now();                            // 现场喂新鲜一致链
+    // ═══ v7.83 停手实验: 我们这边全部 S 链写入停掉 ═══
+    // v7.82 实锤: Windows列表864帧恒2个窗口,「球球大作战」面板窗从未被创建 = m1主体从未执行
+    // ([3ee7b1]恒1)。eval全过但主体不跑 → 真实执行时门读到撕裂数据: 我们的keeper+现场喂值
+    // 与靶场自己的写者([xw]每秒61次)三方抢写同4槽。rawdump证明靶场链恒自洽(槽值==期望值)。
+    // 停手: 冻结我们的keeper+不喂值, 靶场独占写者。主体若执行 → [3ee7b1]立即1→0, 面板窗诞生。
+    int fw = 1;                                      // v7.83: 永久冻结我们的keeper
+    g_freeze_web = 1;
+    // ACE_feed_chain_now();                         // v7.83: 停止现场喂值(撕裂源)
     if (sample) gAfter = ACE_eval_m1_gates();
     // ═══ v7.75: ImGui ctx/IO 状态探针 + DisplaySize/DeltaTime 矫正 ═══
     if (g_tgt_base) {
@@ -3934,7 +3939,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.82 启动（Render伪代码实锤: 收集遍历Windows列表ctx+0x3dc8/3dd0 + 条件Act8e&&!95&&!flags1M → 本版全枚举Windows/Viewports: 谁在列表/谁有顶点/谁被丢, Debug窗132顶点却不进CmdLists的最后黑洞）===");
+            ACETrace(@"=== v7.83 启动（停手实验: 面板窗864帧从未创建实锤=m1主体从未执行 → 停掉我们全部S链写入(keeper冻结+不喂值), 靶场链自洽独占 → 判据: [3ee7b1]变0=主体执行=面板窗诞生）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
