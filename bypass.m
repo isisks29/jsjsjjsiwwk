@@ -492,6 +492,19 @@ static unsigned long long g_trapRegs[3][34];
 static struct sigaction g_oldBus, g_oldSegv;
 static volatile int g_sigTrapReady = 0;
 static volatile long g_jumpCnt = 0;   // v7.72: 绕门手术执行次数
+// ═══ v7.73 显示链诊断全局 — 手术已电学成功(成功分支每帧跑、setHidden:NO 61/s、
+// 视图树 hidden=0 alpha=1、面板窗 level=2200)但屏幕无像素。悖论移到显示链:
+// 面板窗 frame 从未被证明非零 → GPU 是否真出 drawable → 内容是否空。 ═══
+static id g_mtkView = nil;                 // 复刻 MTKView(强引用)
+static void *g_mtlLayer = NULL;            // 其 CAMetalLayer(present 过滤键)
+static volatile long g_curDCnt = 0;        // currentDrawable 调用数(0x8dc94 必调)
+static volatile long g_curDNil = 0;        // 其中返 nil 次数(=无画面直接原因)
+static volatile long g_presCnt = 0;        // 目标层 presentDrawable: 次数
+static id (*g_orig_curD)(id, SEL) = NULL;
+static void (*g_orig_pres)(id, SEL, id) = NULL;
+typedef struct { double r, g, b, a; } ACEClearColor;   // ABI == MTLClearColor(4 double)
+static void ACE_diag_display(int run);     // 前置声明(visball 点击处引用)
+
 static void ACE_trap_signal_handler(int sig, siginfo_t *si, void *uc) {
     uintptr_t fa = (uintptr_t)(si ? si->si_addr : NULL);
     uintptr_t pgBase = g_tgt_base ? (g_tgt_base + 0x3fc000ULL) : 0;
@@ -1988,6 +2001,9 @@ static void ACE_visBallTap(void) {
         volatile uint8_t *sw = (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
         *sw = (uint8_t)g_panelWant;
         ACETrace(@"[visball] 点击: 面板%@ (开关byte0=%d)", g_panelWant ? @"显示" : @"隐藏", g_panelWant);
+        // v7.73: 切到"显示"态 0.4s 后补跑一次显示链诊断(按需取证, 不必等构建窗口)
+        if (g_panelWant)
+            dispatch_after(dispatch_time(0, 400000000LL), dispatch_get_main_queue(), ^{ ACE_diag_display(9); });
     } @catch (NSException *e) { ACETrace(@"[visball] 异常: %@", e); }
 }
 // ═══ v7.53: 自绘面板兜底(blue 路线) ═══
@@ -2398,9 +2414,10 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         uint64_t nowNs2 = mach_absolute_time() * (uint64_t)ti2.numer / (uint64_t)ti2.denom;
         if (nowNs2 - vLastNs > 1000000000ULL && vCnt < 60) {
             vLastNs = nowNs2; vCnt++;
-            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 手术跳=%ld 执行期改写=%ld 水印:自初始化=%ld 未到达=%ld(槽=%x/%x/%x) 陷阱=%ld | preH=%d→postH=%d b0:%d→%d",
+            ACETrace(@"[verdict] 1s: 帧=%ld 失败分支=%ld 手术跳=%ld 执行期改写=%ld 水印:自初始化=%ld 未到达=%ld(槽=%x/%x/%x) 陷阱=%ld | preH=%d→postH=%d b0:%d→%d gpu:curD=%ld nil=%ld pres=%ld",
                      g_vTot, g_vFail, g_jumpCnt, g_xw, g_wmHit, g_wmMiss, wm0, wm1, wm2, g_addrTrapCnt,
-                     preHid, postHid, (int)preB0, (int)postB0);
+                     preHid, postHid, (int)preB0, (int)postB0,
+                     g_curDCnt, g_curDNil, g_presCnt);
             // v7.68: 陷阱现场一次性输出(前3次) — x9=硬件亲手算的门1读地址
             static int trapLogged = 0;
             if (!trapLogged && g_addrTrapCnt > 0) {
@@ -2422,6 +2439,225 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
         }
     } @catch (NSException *e) {}
 }
+// ═════════════════ v7.73 显示链诊断 ═════════════════
+// 裁决树(全部 msgSend/反射, 零新框架依赖, 不碰靶场代码页):
+//   A. [diag] 全窗口几何 dump + 面板窗 frame 非法时自动矫正(最大嫌疑:
+//      frame 从未被证明非零; frame=0 → drawableSize=0 → currentDrawable=nil
+//      → 整链空转 → 全透明窗口, 与现有全部日志事实自洽);
+//   B. [gpu] currentDrawable(clsM override, 0x8dc94 调用点必中) +
+//      presentDrawable:(commandBuffer 具体类挂钩, 按 layer 过滤掉 Unity)
+//      → GPU 侧到底有没有出帧;
+//   C. [snap] 面板窗像素快照(drawViewHierarchyInRect, 主线程) →
+//      非透明/彩色像素计数 + 左上象限(老师截图面板区)统计。
+//      注: 该 API 对 Metal 内容可能假阴性, 须与 B 的计数联判。
+static id ACE_hook_curD(id self, SEL _cmd) {
+    id d = g_orig_curD ? g_orig_curD(self, _cmd) : nil;
+    g_curDCnt++;
+    if (!d) {
+        g_curDNil++;
+        if (g_curDNil <= 3 || (g_curDNil % 600) == 0) {
+            CGSize ds = {0, 0};
+            if (g_mtkView)
+                ds = ((CGSize (*)(id, SEL))objc_msgSend)(g_mtkView, NSSelectorFromString(@"drawableSize"));
+            ACETrace(@"[gpu] ★currentDrawable→nil#%ld — drawable不可用=无画面直接原因 (drawableSize=%g×%g)",
+                     g_curDNil, ds.width, ds.height);
+        }
+    } else if (g_curDCnt <= 2) {
+        @try {
+            id tex = ((id (*)(id, SEL))objc_msgSend)(d, NSSelectorFromString(@"texture"));
+            long tw = tex ? (long)((NSUInteger (*)(id, SEL))objc_msgSend)(tex, NSSelectorFromString(@"width")) : -1;
+            long th = tex ? (long)((NSUInteger (*)(id, SEL))objc_msgSend)(tex, NSSelectorFromString(@"height")) : -1;
+            ACETrace(@"[gpu] currentDrawable→%p texture=%p size=%ld×%ld (GPU drawable有效)",
+                     (__bridge void *)d, (__bridge void *)tex, tw, th);
+        } @catch (NSException *e) { ACETrace(@"[gpu] curD读取异常: %@", e); }
+    }
+    return d;
+}
+static void ACE_hook_present(id cb, SEL _cmd, id drawable) {
+    @try {
+        if (drawable && g_mtlLayer && [drawable respondsToSelector:@selector(layer)]
+                && (__bridge void *)((id (*)(id, SEL))objc_msgSend)(drawable, @selector(layer)) == g_mtlLayer) {
+            g_presCnt++;
+            if (g_presCnt <= 2 || (g_presCnt % 600) == 0)
+                ACETrace(@"[gpu] presentDrawable#%ld — 帧已提交上屏(GPU侧在出帧)", g_presCnt);
+        }
+    } @catch (NSException *e) {}
+    if (g_orig_pres) g_orig_pres(cb, _cmd, drawable);
+}
+static void ACE_install_gpu_probes(id mtk, Class clsM) {
+    @try {
+        g_mtkView = mtk;
+        g_mtlLayer = (__bridge void *)[(UIView *)mtk layer];
+        // ① currentDrawable override — 成功分支 0x8dc94 显式调 [view currentDrawable], clsM 必中
+        SEL selD = NSSelectorFromString(@"currentDrawable");
+        Method mD = class_getInstanceMethod(clsM, selD);
+        if (mD && !g_orig_curD) {
+            g_orig_curD = (id (*)(id, SEL))method_getImplementation(mD);
+            if (!class_addMethod(clsM, selD, (IMP)ACE_hook_curD, "@@:")) {
+                Method m2 = class_getInstanceMethod(clsM, selD);
+                if (m2) method_setImplementation(m2, (IMP)ACE_hook_curD);
+            }
+        }
+        // ② presentDrawable: 挂 commandBuffer 具体类(设备/队列全从 mtk 反射拿, 不 import Metal)
+        id dev = ((id (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"device"));
+        id q = dev ? ((id (*)(id, SEL))objc_msgSend)(dev, NSSelectorFromString(@"newCommandQueue")) : nil;
+        id cb = q ? ((id (*)(id, SEL))objc_msgSend)(q, NSSelectorFromString(@"commandBuffer")) : nil;
+        const char *cbName = "-";
+        if (cb) {
+            Class cbCls = object_getClass(cb);
+            cbName = class_getName(cbCls);
+            Method mP = class_getInstanceMethod(cbCls, NSSelectorFromString(@"presentDrawable:"));
+            if (mP && !g_orig_pres) {
+                g_orig_pres = (void (*)(id, SEL, id))method_getImplementation(mP);
+                method_setImplementation(mP, (IMP)ACE_hook_present);
+            }
+        }
+        // ③ framebufferOnly=NO(无害, 为后续 GPU 回读留路)
+        int fboSet = 0;
+        if ([mtk respondsToSelector:NSSelectorFromString(@"setFramebufferOnly:")]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(mtk, NSSelectorFromString(@"setFramebufferOnly:"), NO);
+            fboSet = 1;
+        }
+        ACETrace(@"[gpu] 探针已装: curD=%d pres=%d cbCls=%s layer=%p dev=%d fbo=%d",
+                 !!g_orig_curD, !!g_orig_pres, cbName, g_mtlLayer, !!dev, fboSet);
+    } @catch (NSException *e) { ACETrace(@"[gpu] 探针异常: %@", e); }
+}
+static void ACE_snap_window(UIWindow *pw, int run) {
+    @try {
+        CGRect b = pw.bounds;
+        if (b.size.width < 1 || b.size.height < 1) {
+            ACETrace(@"[snap#%d] 面板窗bounds=%@非法 — 快照无意义(几何即病根)", run, NSStringFromCGRect(b));
+            return;
+        }
+        UIGraphicsBeginImageContextWithOptions(b.size, NO, 0.5);
+        [pw drawViewHierarchyInRect:b afterScreenUpdates:NO];
+        UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        CGImageRef cgi = img.CGImage;
+        if (!cgi) { ACETrace(@"[snap#%d] 快照失败(无CGImage)", run); return; }
+        size_t W = CGImageGetWidth(cgi), H = CGImageGetHeight(cgi);
+        size_t bpr = W * 4;
+        uint8_t *buf = (uint8_t *)calloc(bpr * H + 16, 1);
+        if (!buf) return;
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef bc = CGBitmapContextCreate(buf, W, H, 8, bpr, cs,
+                                                (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+        CGColorSpaceRelease(cs);
+        if (!bc) { free(buf); ACETrace(@"[snap#%d] bitmap ctx创建失败", run); return; }
+        CGContextDrawImage(bc, CGRectMake(0, 0, (CGFloat)W, (CGFloat)H), cgi);
+        CGContextRelease(bc);
+        long nonT = 0, colored = 0, zoneNonT = 0;
+        unsigned maxA = 0;
+        for (size_t y = 0; y < H; y++) {
+            const uint8_t *row = buf + y * bpr;
+            for (size_t x = 0; x < W; x++) {
+                const uint8_t *p = row + x * 4;
+                unsigned a = p[3];
+                if (a > maxA) maxA = a;
+                if (a > 8) {
+                    nonT++;
+                    if ((unsigned)p[0] + p[1] + p[2] > 24) colored++;
+                    if (x < W / 2 && y < H / 2) zoneNonT++;
+                }
+            }
+        }
+        ACETrace(@"[snap#%d] %zu×%zu 非透明=%ld 彩色=%ld maxA=%u 左上象限非透明=%ld/%ld %s",
+                 run, W, H, nonT, colored, maxA, zoneNonT, (long)(W / 2) * (long)(H / 2),
+                 nonT == 0 ? "★整窗全透明—窗口在但没画出任何内容(与gpu计数联判)" : "(有像素!)");
+        size_t px[3] = { W / 8, W / 4, W / 2 }, py[3] = { H / 8, H / 4, H / 2 };
+        for (int i = 0; i < 3; i++) {
+            const uint8_t *p = buf + py[i] * bpr + px[i] * 4;
+            ACETrace(@"[snap#%d] 样点(%zu,%zu) RGBA=(%u,%u,%u,%u)", run, px[i], py[i], p[0], p[1], p[2], p[3]);
+        }
+        free(buf);
+    } @catch (NSException *e) { ACETrace(@"[snap#%d] 异常: %@", run, e); }
+}
+static void ACE_dump_mtk(int run) {
+    id mtk = g_mtkView;
+    if (!mtk) { ACETrace(@"[mtk#%d] g_mtkView未设", run); return; }
+    @try {
+        CGSize ds = ((CGSize (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"drawableSize"));
+        ACEClearColor cc = ((ACEClearColor (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"clearColor"));
+        BOOL paused = ((BOOL (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"isPaused"));
+        long fps = (long)((NSInteger (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"preferredFramesPerSecond"));
+        id dev = ((id (*)(id, SEL))objc_msgSend)(mtk, NSSelectorFromString(@"device"));
+        UIView *mv = (UIView *)mtk;
+        CALayer *ly = mv.layer;
+        ACETrace(@"[mtk#%d] ds=(%g,%g) frame=%@ paused=%d fps=%ld dev=%d clear=(%g,%g,%g,a=%g)",
+                 run, ds.width, ds.height, NSStringFromCGRect(mv.frame), (int)paused, fps, !!dev,
+                 cc.r, cc.g, cc.b, cc.a);
+        if ([ly respondsToSelector:NSSelectorFromString(@"drawableSize")]) {
+            CGSize lds = ((CGSize (*)(id, SEL))objc_msgSend)(ly, NSSelectorFromString(@"drawableSize"));
+            int fbo = [ly respondsToSelector:NSSelectorFromString(@"framebufferOnly")]
+                    ? (int)((BOOL (*)(id, SEL))objc_msgSend)(ly, NSSelectorFromString(@"framebufferOnly")) : -1;
+            ACETrace(@"[mtk#%d] layer=%s lyFrame=%@ lyDS=(%g,%g) lyHid=%d lyOp=%g fbo=%d",
+                     run, class_getName(object_getClass(ly)), NSStringFromCGRect(ly.frame),
+                     lds.width, lds.height, (int)ly.hidden, (double)ly.opacity, fbo);
+        }
+        int d = 0;
+        for (UIView *v = mv; v && d < 8; v = v.superview, d++) {
+            ACETrace(@"[mtk#%d] 链%d: %s(%p) frame=%@ hid=%d alpha=%g clips=%d",
+                     run, d, class_getName(object_getClass(v)), (__bridge void *)v,
+                     NSStringFromCGRect(v.frame), (int)v.hidden, (double)v.alpha, (int)v.clipsToBounds);
+        }
+    } @catch (NSException *e) { ACETrace(@"[mtk#%d] 异常: %@", run, e); }
+}
+static void ACE_dump_tree(UIView *v, int depth, int run) {
+    if (!v || depth > 3) return;
+    ACETrace(@"[tree#%d]%*s%s(%p) frame=%@ hid=%d alpha=%g layer=%s",
+             run, depth * 2, "", class_getName(object_getClass(v)), (__bridge void *)v,
+             NSStringFromCGRect(v.frame), (int)v.hidden, (double)v.alpha,
+             class_getName(object_getClass(v.layer)));
+    for (UIView *s in v.subviews) ACE_dump_tree(s, depth + 1, run);
+}
+static void ACE_diag_display(int run) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIApplication *app = [UIApplication sharedApplication];
+            ACETrace(@"[diag#%d] ═══ 显示链诊断 ═══ key=%p screen=%@ gpu:curD=%ld nil=%ld pres=%ld",
+                     run, (__bridge void *)app.keyWindow,
+                     NSStringFromCGRect([UIScreen mainScreen].bounds),
+                     g_curDCnt, g_curDNil, g_presCnt);
+            for (UIWindow *w in app.windows) {
+                ACETrace(@"[diag#%d] win=%p %s frame=%@ level=%g hid=%d alpha=%g scene=%d rootVC=%s rvFrame=%@",
+                         run, (__bridge void *)w, class_getName(object_getClass(w)),
+                         NSStringFromCGRect(w.frame), (double)w.windowLevel, (int)w.hidden, (double)w.alpha,
+                         w.windowScene ? 1 : 0,
+                         w.rootViewController ? class_getName(object_getClass(w.rootViewController)) : "-",
+                         w.rootViewController ? NSStringFromCGRect(w.rootViewController.view.frame) : @"-");
+            }
+            if (g_tgt_base) {
+                uintptr_t pwin = *(volatile uintptr_t *)(g_tgt_base + 0x3f2850ULL);
+                UIWindow *pw = (__bridge UIWindow *)(void *)pwin;
+                if (pw && [pw isKindOfClass:[UIWindow class]]) {
+                    CGRect sb = [UIScreen mainScreen].bounds;
+                    UIWindow *kw = app.keyWindow;
+                    CGRect kf = (kw && kw != pw && kw.frame.size.width > 1) ? kw.frame : sb;
+                    BOOL bad = (pw.frame.size.width < 1 || pw.frame.size.height < 1
+                                || pw.frame.origin.x < -1 || pw.frame.origin.y < -1
+                                || pw.frame.origin.x >= sb.size.width || pw.frame.origin.y >= sb.size.height);
+                    if (bad || !pw.windowScene) {
+                        ACETrace(@"[win-fix#%d] ★面板窗frame=%@ scene=%d → 矫正frame=%@ + hidden=NO alpha=1",
+                                 run, NSStringFromCGRect(pw.frame), pw.windowScene ? 1 : 0,
+                                 NSStringFromCGRect(kf));
+                        if (!pw.windowScene && kw.windowScene) pw.windowScene = kw.windowScene;
+                        if (bad) pw.frame = kf;
+                        pw.hidden = NO; pw.alpha = 1;
+                        [pw setNeedsLayout]; [pw layoutIfNeeded];
+                    } else {
+                        ACETrace(@"[win-fix#%d] 面板窗几何正常 frame=%@", run, NSStringFromCGRect(pw.frame));
+                    }
+                    ACE_dump_tree(pw.rootViewController ? pw.rootViewController.view : (UIView *)pw, 0, run);
+                    ACE_snap_window(pw, run);
+                } else {
+                    ACETrace(@"[diag#%d] 面板窗槽[0x3f2850]非法: %p", run, (void *)pwin);
+                }
+            }
+            ACE_dump_mtk(run);
+        } @catch (NSException *e) { ACETrace(@"[diag#%d] 异常: %@", run, e); }
+    });
+}
+// ═════════════════ v7.73 显示链诊断 END ═════════════════
 
 // ═══ v7.54: 原生面板复刻构建(主攻路线) ═══
 // 全局机制(全部F级, 反汇编逐条解码):
@@ -2514,6 +2750,8 @@ static void ACE_native_panel_build(int tag) {
             ACETrace(@"[native] draw仪表已挂 draw=%d 73=%d setHidden取证=%d origIMP偏移=%llx(应=8cdd4)",
                      !!g_orig_draw, !!g_orig_73, !!g_orig_setHidden,
                      (unsigned long long)(g_orig_draw ? ((uintptr_t)g_orig_draw - g_tgt_base) : 0));
+                     // ═══ v7.73: GPU 显示链探针(currentDrawable/presentDrawable 仪表) ═══
+            ACE_install_gpu_probes(mtk, clsM);
         } @catch (NSException *e) { ACETrace(@"[native] draw仪表挂载异常: %@", e); }
         id ball = ((id (*)(id, SEL, void *, CGRect))objc_msgSend)([clsBall alloc], sF2,
                                                                   cfg, CGRectMake(489, 58, 45, 45));
@@ -2595,6 +2833,9 @@ static void ACE_native_panel_build(int tag) {
                 ACETrace(@"[native] 5s复查: flag=%d 开关=%d 面板窗=%p (稳了=点左上角菜单球验证显隐)", (int)(*f3 & 1), (int)s3, (void *)w3);
             } @catch (NSException *e) {}
         });
+        // v7.73: 显示链诊断双跑 — 窗口几何dump+自动矫正 / 视图树 / GPU提交计数 / 像素快照
+        dispatch_after(dispatch_time(0, 1800000000LL), dispatch_get_main_queue(), ^{ ACE_diag_display(1); });
+        dispatch_after(dispatch_time(0, 5200000000LL), dispatch_get_main_queue(), ^{ ACE_diag_display(2); });
     } @catch (NSException *e) { g_freeze_web = 0; ACETrace(@"[native] tag%d 异常: %@", tag, e); }
 }
 static void ACE_schedule_sec_posts(void) {
@@ -3102,7 +3343,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.72 启动（绕门手术: 门1陷阱点PC改写→0x8d12c成功分支, 常驻武装每帧跳, 物理绕过eq②③④）===");
+            ACETrace(@"=== v7.73 启动（显示链诊断: 全窗几何dump+面板窗自动矫正 / currentDrawable+presentDrawable仪表 / 窗口像素快照 — 定位「成功分支每帧跑但无像素」断点）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
