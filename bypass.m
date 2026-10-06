@@ -2901,22 +2901,57 @@ static void ACE_probe_imgui_core(void) {
                 *f19 = 1;
             }
         }
-        int (*pBegin)(const char *) = (int (*)(const char *))(g_tgt_base + 0x78bc8ULL);
-        void (*pText)(const char *) = (void (*)(const char *))(g_tgt_base + 0x78c54ULL);
-        void (*pChk)(const char *, void *) = (void (*)(const char *, void *))(g_tgt_base + 0x7a440ULL);
-        void (*pEnd)(void) = (void (*)(void))(g_tgt_base + 0x7ae94ULL);
-        static uint8_t probeCb = 1;
-        int opened = pBegin("ACEPROBE");
-        pText("ACE_PROBE_TEXT");
-        pChk("ACE_PROBE_BOX", &probeCb);
-        pEnd();
-        static int openedLogged = 0;
-        if (!openedLogged && g_probeDraws >= 2) {
-            openedLogged = 1;
-            ACETrace(@"[v78] 探针窗口 Begin(ACEPROBE)返回=%d(1=开成功) Fonts=%p", opened, (void *)fonts);
-        }
+        // v7.79: 已删除 pBegin/pText/pChk/pEnd 直调 — v7.78 崩溃实锤元凶
+        // (IPS: Render→EndFrame 内 __assert_rtn→abort, 探针破坏窗口栈平衡)。
+        // 本函数只保留上面的字体图集守卫数据检查(纯数据, 从未命中, 无害)。
+        
     } @catch (NSException *e) {}
 }
+// ═════════════════ v7.79 Style.Alpha 强制 + 窗口取证 ═════════════════
+// 本轮反汇编深挖三大 F 级结论:
+// A. ctx+0x3778 = ImGuiStyle 基址, Alpha@+0 — PushStyleVar 包装 sub_1298a4 以
+//    x22=ctx+0x3778 为基址按 idx 表读写当前值(0x129910); 全 dylib 对该地址只有
+//    push备份(0x13baf0)/pop恢复(0x13bca4)两个写者, 无独立初始化写 1.0。
+// B. Begin(sub_132250,15KB) 尾部 0x134ebc: if([ctx+0x3778]<=0.0){win+0xb0=1;}
+//    → SkipItems(win+0x93)=1 → 全部控件包装层(入口读 [ui+0x93]) 静默 return
+//    → 零顶点/零断言/drawData Valid=1 CmdLists=0 — 与全部现有观测吻合。
+// C. m1 的淡入累加器/标志/tab 真槽 = 0x3f0a58/0x3f0a0a/0x3f0a5c (v7.76 抄错位)。
+static void *g_winPtr79 = NULL;          // 捕获的面板主窗口对象
+static volatile int g_winSpin79 = 0;     // 自旋线程已启动
+static void *ACE_win_spin79(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 1000000 && g_winPtr79 == NULL; i++) {
+        if (g_tgt_base) {
+            uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
+            if (ctxp) {
+                uintptr_t w = *(volatile uintptr_t *)(ctxp + 0x3e28);
+                if (w) { g_winPtr79 = (void *)w; break; }
+            }
+        }
+        usleep(1);
+    }
+    ACETrace(@"[v79spin] 窗口指针捕获%s: %p", g_winPtr79 ? "成功" : "超时失败", g_winPtr79);
+    return NULL;
+}
+static void ACE_dump_win79(long n) {
+    if (!g_winPtr79) return;
+    uintptr_t w = (uintptr_t)g_winPtr79;
+    @try {
+        int8_t *bb = (int8_t *)w;
+        volatile float *f = (volatile float *)w;
+        ACETrace(@"[v79win#%ld] win=%p ★SkipItems(+0x93)=%d b0=%d b1=%d b2=%d b3=%d aFitX=%d aFitY=%d | 8e=%d 91=%d 94=%d 95=%d 96=%d 98=%d",
+                 n, (void *)w, (int)bb[0x93], (int)bb[0xb0], (int)bb[0xb1], (int)bb[0xb2], (int)bb[0xb3],
+                 (int)bb[0xa8], (int)bb[0xa9], (int)(uint8_t)bb[0x8e], (int)(uint8_t)bb[0x91],
+                 (int)(uint8_t)bb[0x94], (int)(uint8_t)bb[0x95], (int)(uint8_t)bb[0x96], (int)(uint8_t)bb[0x98]);
+        ACETrace(@"[v79win#%ld] Pos=(%g,%g) Size@0x10=(%g,%g,%g,%g) ClipRect@0x210=(%g,%g,%g,%g) Flags(+0xc)=%x LFA(+0x238)=%u",
+                 n, (double)f[0xe8 / 4], (double)f[0xec / 4],
+                 (double)f[0x10 / 4], (double)f[0x14 / 4], (double)f[0x18 / 4], (double)f[0x1c / 4],
+                 (double)f[0x210 / 4], (double)f[0x214 / 4], (double)f[0x218 / 4], (double)f[0x21c / 4],
+                 *(volatile uint32_t *)(w + 0xc), *(volatile uint32_t *)(w + 0x238));
+    } @catch (NSException *e) { ACETrace(@"[v79win#%ld] dump异常: %@", n, e); }
+}
+// ═════════════════ v7.79 END ═════════════════
+
 static void ACE_hook_m1(id self, SEL _cmd) {
     long n = ++g_m1Cnt;
     int sample = (n <= 3) || (n % 300 == 0);
@@ -2928,9 +2963,11 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     // 唯一自洽解释 = 主窗口 Alpha=0 被隐藏。Alpha 源 = [0x3faa58] 淡入累加器,
     // 累加块被 [0x3faa0a] bit0 门控跳过 → 累加器停在 BSS 初值 0。强制归 1。
     if (g_tgt_base) {
-        volatile float *pAcc = (volatile float *)(g_tgt_base + 0x3faa58ULL);
-        volatile uint8_t *pFlag = (volatile uint8_t *)(g_tgt_base + 0x3faa0aULL);
-        volatile uint32_t *pTab = (volatile uint32_t *)(g_tgt_base + 0x3faa5cULL);
+        // v7.79 纠错: 反汇编实锤真槽 = adrp 0x3f0000 + 0xa58/0xa0a/0xa5c
+        // (v7.76 误抄成 0x3faa58/0x3faa0a/0x3faa5c — BSS 死槽, 写了无效但无害)
+        volatile float *pAcc = (volatile float *)(g_tgt_base + 0x3f0a58ULL);
+        volatile uint8_t *pFlag = (volatile uint8_t *)(g_tgt_base + 0x3f0a0aULL);
+        volatile uint32_t *pTab = (volatile uint32_t *)(g_tgt_base + 0x3f0a5cULL);
         static int v776Once = 0;
         if (!v776Once) {
             v776Once = 1;
@@ -2943,6 +2980,27 @@ static void ACE_hook_m1(id self, SEL _cmd) {
         }
         *pAcc = 1.0f; *pFlag = 1;
         if (*pTab > 6u) *pTab = 0;
+    }
+    // ═══ v7.79: Style.Alpha 检测+强制 (ctx+0x3778) ═══
+    if (g_tgt_base) {
+        uintptr_t ctxp79 = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
+        if (ctxp79) {
+            volatile float *pA = (volatile float *)(ctxp79 + 0x3778);
+            float a0 = *pA;
+            static long v79FixCnt = 0;
+            if (!(a0 > 0.0f) || a0 > 1.0f) { *pA = 1.0f; v79FixCnt++; }
+            if (n <= 3 || n % 300 == 0) {
+                volatile float *sf = (volatile float *)(ctxp79 + 0x3778);
+                ACETrace(@"[v79#%ld] ★Style.Alpha 修前=%g 修后=%g 累计强制=%ld | Style+4=%g +8=%g +0xc=%g +0x10=%g (+4≈0.6且+8≈8=基址确认)",
+                         n, (double)a0, (double)*pA, v79FixCnt,
+                         (double)sf[1], (double)sf[2], (double)sf[3], (double)sf[4]);
+            }
+            if (n == 2 && !g_winSpin79) {
+                g_winSpin79 = 1;
+                pthread_t th;
+                if (pthread_create(&th, NULL, ACE_win_spin79, NULL) == 0) pthread_detach(th);
+            }
+        }
     }
     int fw = g_freeze_web;
     g_freeze_web = 1;                                // m1 期间冻结 keeper(防跨tick撕裂)
@@ -3013,7 +3071,8 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     }
     if (g_tgt_base) b0B = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
     if (g_orig_m1) g_orig_m1(self, _cmd);
-    ACE_probe_imgui_core();   // v7.78: 对照实验(仍在 NewFrame..Render 窗口内, Begin/End成对)
+    ACE_probe_imgui_core();   // v7.79: 内部直调已删(崩溃元凶), 只剩字体守卫数据检查
+    if (sample) ACE_dump_win79(n);   // v7.79: 本帧 Begin 后的 SkipItems/b1/ClipRect 真值
     if (g_tgt_base) b0A = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
     g_freeze_web = fw;
     if (sample) {
@@ -3749,7 +3808,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.78 ===");
+            ACETrace(@"=== v7.79 启动（删v7.78崩溃探针 + 反汇编实锤Style.Alpha@ctx+0x3778: <=0→Begin置SkipItems→全控件静默→零顶点零断言, 每帧强制1.0 + 窗口对象捕获全字段dump + v7.76槽地址纠错0x3f0a58）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
