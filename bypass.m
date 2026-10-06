@@ -1291,6 +1291,7 @@ static void *ACE_slot_watch87(void *arg) {
     (void)arg;
     uint8_t lastB1 = 0xff; uintptr_t last408 = ~(uintptr_t)0;
     uint32_t lastE4 = 0xffffffff; int lastPf = -1;
+    uintptr_t lastTk = ~(uintptr_t)0;   // v7.90: 命脉令牌上次值
     for (;;) {
         usleep(300000);
         if (!g_tgt_base) continue;
@@ -1298,11 +1299,12 @@ static void *ACE_slot_watch87(void *arg) {
         uintptr_t o8 = *(volatile uintptr_t *)(g_tgt_base + 0x3ff408ULL);
         uint32_t e4 = *(volatile uint32_t *)(g_tgt_base + 0x3f68e4ULL);
         int pf = (int)(*(volatile uint8_t *)(g_tgt_base + 0x3fc348ULL) & 1);
-        if (b1 != lastB1 || o8 != last408 || e4 != lastE4 || pf != lastPf) {
-            ACETrace(@"[v87] 槽变化: [3ee7b1主体] %u→%u [3ff408检测] %p→%p [3f68e4失败计数] %u→%u 面板flag %d→%d",
+        uintptr_t tk = *(volatile uintptr_t *)(g_tgt_base + 0x3ff6b8ULL);   // v7.90: 命脉令牌
+        if (b1 != lastB1 || o8 != last408 || e4 != lastE4 || pf != lastPf || tk != lastTk) {
+            ACETrace(@"[v87] 槽变化: [3ee7b1主体] %u→%u [3ff408检测] %p→%p [3f68e4失败计数] %u→%u 面板flag %d→%d ★[3ff6b8命脉令牌] %p→%p",
                      (unsigned)lastB1, (unsigned)b1, (void *)last408, (void *)o8,
-                     lastE4, e4, lastPf, pf);
-            lastB1 = b1; last408 = o8; lastE4 = e4; lastPf = pf;
+                     lastE4, e4, lastPf, pf, (void *)lastTk, (void *)tk);
+            lastB1 = b1; last408 = o8; lastE4 = e4; lastPf = pf; lastTk = tk;
         }
     }
     return NULL;
@@ -4184,7 +4186,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.89 启动（双死相全解释: 面板功能开关[3ff402广角/3ff404全局加速/3ff439锁球加速]≠0时 sub_28dc8 以FUN_00028000扫描结果为基址调+0x46ce9e4野地址 — v7.88命中0x18524000(不在任何IMG=半野)→每0.5s随机野跳活十几秒死; 配置持久化→覆盖安装读旧开关=菜单瞬间崩, 删app=干净。本版1ms钉零全部开关+3ff408, 野调用物理不可达）===");
+            ACETrace(@"=== v7.90 启动（死因终审: 命脉令牌[3ff6b8]缺失! 发牌人=安保init, 被我们v7.43劫持成空操作 → sub_dcf88解析器判决 ldar+cbz→pthread_kill(self,SIGKILL)主线程自杀(0xe61c0/e6224, 混淆x16=0x148现场解出)=全部防线盲区。本版放行安保init发牌(canary与m1同网, 13/13全过实证) + keeper byte0改回强制维持+iconOnClick同步意愿(v7.89面板没出的病根) + burst延到30s覆盖死亡时刻）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
