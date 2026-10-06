@@ -922,7 +922,7 @@ static void *ACE_flight_recorder(void *arg) {
                 }
             }
         }
-        if (burstfd >= 0 && bq > 0 && burst_bytes < 6 * 1024 * 1024) {
+        if (burstfd >= 0 && bq > 0 && burst_bytes < 24 * 1024 * 1024) {
             char sm[12]; int sq = 0;
             sm[sq++] = 'S'; sm[sq++] = hd[(sweep >> 4) & 0xf]; sm[sq++] = hd[sweep & 0xf]; sm[sq++] = '\n';
             write(burstfd, sm, (size_t)sq);
@@ -1208,9 +1208,11 @@ static void *ACE_web_keeper(void *arg) {
                 // byte0 = g_panelWant(可见球设定), 保证"显示"意愿不被误清。
                 if (g_nativeBuilt && g_tgt_base) {
                     volatile uint8_t *sw = (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
-                                        // v7.88: 跟随式——尊重任何翻转者(靶场原生球 iconOnClick / 我们的
-                    // visball)。旧强制覆盖会把原生球的"关闭"在20ms内顶回 → 面板关不掉。
-                    g_panelWant = (int)*sw;
+                    // v7.90: 改回强制维持 g_panelWant —— v7.88跟随式的副作用实锤:
+                    // byte0被启动链清零后无人恢复 → m1永不被调 → v7.89主体没执行面板没出。
+                    // 原生球的翻转改由 iconOnClick hook 同步 g_panelWant(见修改3)尊重,
+                    // 误清则由这里顶回 — 两全。
+                    if ((int)*sw != g_panelWant) *sw = (uint8_t)g_panelWant;
                     // v7.60: draw 时基槽防复毒(被写坏立即修回 125/3/flag1)
                     volatile uint32_t *tb = (volatile uint32_t *)(g_tgt_base + 0x3f2900ULL);
                     if (tb[1] != 3u || tb[2] != 1u) { tb[0] = 125u; tb[1] = 3u; tb[2] = 1u; }
@@ -1782,7 +1784,7 @@ static void ACE_dispatch_async_hook(dispatch_queue_t q, dispatch_block_t blk) {
                         ACETrace(@"[hook] 弹窗验卡结果 %d → 0（强制成功路径）", *slot);
                         *slot = 0; g_rw_dialog++;
                     }
-                    g_burst_until = (long long)time(NULL) + 6;   // v7.17: 触发6秒高精度采样
+                    g_burst_until = (long long)time(NULL) + 30;  // v7.90: 30秒(覆盖死亡时刻, 旧6s根本没录到死)
                     ACE_prime_endtime();
                 } else if (off == 0xdcf68ULL) {            // 启动复核结果: capture+0x30 → 非0
                     volatile int32_t *slot = (volatile int32_t *)((uintptr_t)(__bridge void *)blk + 0x30);
@@ -3699,11 +3701,16 @@ static void ACE_icon_click(id self, SEL _cmd) {
     if (g_orig_iconClick) g_orig_iconClick(self, _cmd);
     @try {
         void *st = ((void *(*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"_0xE4C8719B"));
-        if (st && g_ace_ready && !g_ace_busy) {
-            g_ace_busy = 1;
-            ACETrace(@"[ball] 门禁结果: 面板标志byte[0]=%d (1=面板应已显示, 0=被静默拒绝)",
-                     *(volatile uint8_t *)st);
-            g_ace_busy = 0;
+        if (st) {
+            // v7.90: 原生球翻转后同步显隐意愿 — keeper 的强制维持从此跟随原生球
+            // (可开可关), 同时 draw 失败分支的误清仍会被顶回(v7.89 面板不出的病根)。
+            g_panelWant = (int)*(volatile uint8_t *)st;
+            if (g_ace_ready && !g_ace_busy) {
+                g_ace_busy = 1;
+                ACETrace(@"[ball] 门禁结果: 面板标志byte[0]=%d → 意愿已同步 g_panelWant=%d",
+                         *(volatile uint8_t *)st, g_panelWant);
+                g_ace_busy = 0;
+            }
         }
     } @catch (NSException *e) {}
 }
@@ -3895,10 +3902,17 @@ static void ACE_install_result_hook(void) {
         volatile uintptr_t *sinv = (volatile uintptr_t *)(base + 0x3e9240ULL);
         uintptr_t cur = *sinv;
         uintptr_t expect = base + 0xf177cULL;
+        // ═══ v7.90: 放行安保init — 死因反转 ═══
+        // 安保init(FUN_000effe4)是命脉令牌[0x3ff6b8]的唯一发牌人(0x1d28+大结构CAS写入)。
+        // v7.43劫持成空操作(错钥时代canary必挂→0xf1768 SIGKILL自毁, 劫持=保命)。
+        // 密钥修复后: sub_dcf88解析器判决 ldar[3ff6b8];cbz→pthread_kill(self,SIGKILL)
+        // (0xe61c0/0xe6224) — 令牌缺失=授权成功后必死(v7.86-89全部死相)。
+        // 放行依据: 安保init canary与m1/draw门同一张封印网, q4快照13/13全过+m1主体
+        // 已跑通同族门 → 校验应自然过 → 发牌。它孵化的看门狗/校验线程仍被门神拦。
+        (void)sinv;
         if (cur == expect || cur == 0xf177cULL) {
-            *sinv = (uintptr_t)(void *)ACE_secinit_noop;
-            ACETrace(@"[secinit] 安保init invoke槽已劫持: 0x%lx → %p (自毁触发链掐断)",
-                     (unsigned long)cur, (void *)ACE_secinit_noop);
+            ACETrace(@"[secinit] v7.90 安保init已放行(invoke=0x%lx 原样) — 等它发命脉令牌[3ff6b8]",
+                     (unsigned long)cur);
         } else {
             ACETrace(@"[secinit] 槽值0x%lx≠base+0xf177c(0x%lx), 未改(疑偏移漂移)",
                      (unsigned long)cur, (unsigned long)expect);
