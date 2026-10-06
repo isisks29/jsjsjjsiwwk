@@ -3013,13 +3013,12 @@ static void ACE_dump_wins80(int phase, long n) {
 
 static void ACE_hook_m1(id self, SEL _cmd) {
     long n = ++g_m1Cnt;
-    int sample = (n <= 3) || (n % 300 == 0);
+    int sample = (n <= 10) || (n % 120 == 0);   // v7.81: 采样加密(前10帧+每120帧)
     int gBefore = 0, gAfter = 0;
     uint8_t b0B = 0, b0A = 0;
     if (sample) gBefore = ACE_eval_m1_gates();      // 喂值前现场(m1 将看到的撕裂态)
     // ═══ v7.81: m1 主体执行铁证监控 — [3ee7b1] 全dylib唯一清零点在主体一次性初始化块
-    // (0x3aba4), 文件初值=1。它变 0 的那一帧 = 主体首次真实执行。[3ff408]=sub_28000返回值。
-    // v7.76 只在第1帧采过一次(=1/=0), 之后主体若执行过无人知晓 — 本版每帧监控变化。 ═══
+    // (0x3aba4), 文件初值=1。它变 0 的那一帧 = 主体首次真实执行。[3ff408]=sub_28000返回值。 ═══
     if (g_tgt_base) {
         static uint8_t v81LastB = 0xff;
         static uintptr_t v81LastO = ~(uintptr_t)0;
@@ -3031,13 +3030,8 @@ static void ACE_hook_m1(id self, SEL _cmd) {
             v81LastB = bNow; v81LastO = oNow;
         }
     }
-    // ═══ v7.76 终轮: 强制 alpha=1 + tab=0 + 一次性状态 dump ═══
-    // m1 主体线性无早退+入口9门全过 → m1 每帧跑完整控件区; ImGui 零顶点的
-    // 唯一自洽解释 = 主窗口 Alpha=0 被隐藏。Alpha 源 = [0x3faa58] 淡入累加器,
-    // 累加块被 [0x3faa0a] bit0 门控跳过 → 累加器停在 BSS 初值 0。强制归 1。
+    // ═══ v7.76: 强制 alpha=1 + tab=0 + 一次性状态 dump（v7.79 已纠错真槽 0x3f0a58/0x3f0a0a/0x3f0a5c）═══
     if (g_tgt_base) {
-        // v7.79 纠错: 反汇编实锤真槽 = adrp 0x3f0000 + 0xa58/0xa0a/0xa5c
-        // (v7.76 误抄成 0x3faa58/0x3faa0a/0x3faa5c — BSS 死槽, 写了无效但无害)
         volatile float *pAcc = (volatile float *)(g_tgt_base + 0x3f0a58ULL);
         volatile uint8_t *pFlag = (volatile uint8_t *)(g_tgt_base + 0x3f0a0aULL);
         volatile uint32_t *pTab = (volatile uint32_t *)(g_tgt_base + 0x3f0a5cULL);
@@ -3047,7 +3041,7 @@ static void ACE_hook_m1(id self, SEL _cmd) {
             float a0 = *pAcc; uint8_t f0 = *pFlag; uint32_t t0 = *pTab;
             uintptr_t o1 = *(volatile uintptr_t *)(g_tgt_base + 0x3ff408ULL);
             uint8_t b1 = *(volatile uint8_t *)(g_tgt_base + 0x3ee7b1ULL);
-            ACETrace(@"[v76] 修前: alpha累加[3faa58]=%g flag[3faa0a]=%u tab[3faa5c]=%u 一次性([3ee7b1]=%u [3ff408]=%p)",
+            ACETrace(@"[v76] 修前: alpha累加[3f0a58]=%g flag[3f0a0a]=%u tab[3f0a5c]=%u 一次性([3ee7b1]=%u [3ff408]=%p)",
                      (double)a0, (unsigned)f0, t0, (unsigned)b1, (void *)o1);
             ACETrace(@"[v76] 强制: alpha=1.0 flag=1 tab=%u(越界才归0)", t0);
         }
@@ -3062,7 +3056,7 @@ static void ACE_hook_m1(id self, SEL _cmd) {
             float a0 = *pA;
             static long v79FixCnt = 0;
             if (!(a0 > 0.0f) || a0 > 1.0f) { *pA = 1.0f; v79FixCnt++; }
-            int sample = (n <= 10) || (n % 120 == 0);   // v7.81: 采样加密(前10帧+每120帧)
+            if (n <= 3 || n % 300 == 0) {
                 volatile float *sf = (volatile float *)(ctxp79 + 0x3778);
                 ACETrace(@"[v79#%ld] ★Style.Alpha 修前=%g 修后=%g 累计强制=%ld | Style+4=%g +8=%g +0xc=%g +0x10=%g (+4≈0.6且+8≈8=基址确认)",
                          n, (double)a0, (double)*pA, v79FixCnt,
@@ -3081,31 +3075,10 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     ACE_feed_chain_now();                            // 现场喂新鲜一致链
     if (sample) gAfter = ACE_eval_m1_gates();
     // ═══ v7.75: ImGui ctx/IO 状态探针 + DisplaySize/DeltaTime 矫正 ═══
-    // 解剖: sub_12c734=IO getter([0x3ff880]=ctx, 返回ctx+8); sub_12d87c=NewFrame(15KB);
-    // m1 用 DisplaySize(@IOptr+8) 算主窗口位置/尺寸。DisplaySize=(0,0) → 裁剪矩形空
-    // → 全顶点被裁 → CmdLists=0 → 全透明帧 — 与 [dd] w8=0 w16=0 w24=0 完全自洽。
-    // 检测到非法值当场矫正(每帧静默), 采样帧全量 dump。
     if (g_tgt_base) {
         uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
         uintptr_t io = ctxp ? (ctxp + 8) : 0;
         if (io) {
-                    // ═══ v7.77: 包装层总开关强制打开 — [ctx+0x3e28]+0x93 ═══
-            // 静态实锤: sub_7aadc/sub_7ae94/sub_7aa90 (Begin/End/Text包装) 入口均为
-            // ldrb w9,[ui+0x93]; cbz→正常执行; ret→静默空操作。+0x93非零时 m1 内
-            // 所有 ImGui 控件调用全部空转 → 零顶点 → 全透明帧(与[dd]计数完全吻合)。
-            uintptr_t ui = *(volatile uintptr_t *)(ctxp + 0x3e28);
-            if (ui) {
-                volatile uint8_t *sw93 = (volatile uint8_t *)(ui + 0x93);
-                static int v777Once = 0;
-                if (!v777Once) {
-                    v777Once = 1;
-                    ACETrace(@"[v77] UI状态对象[ctx+0x3e28]=%p 字节+0x90..0x97: %02x %02x %02x [+0x93=%02x] %02x %02x %02x %02x → 每帧强制0",
-                             (void *)ui, sw93[-3], sw93[-2], sw93[-1], sw93[0], sw93[1], sw93[2], sw93[3], sw93[4]);
-                }
-                *sw93 = 0;
-            } else if (sample) {
-                ACETrace(@"[v77] ★[ctx+0x3e28]=0 — UI状态对象缺失");
-            }
             volatile float *dsX = (volatile float *)(io + 8);
             volatile float *dsY = (volatile float *)(io + 0xc);
             volatile float *dt  = (volatile float *)(io + 0x10);
@@ -3132,9 +3105,11 @@ static void ACE_hook_m1(id self, SEL _cmd) {
                     @try {
                         void *dd = ((void *(*)(void))g_getDrawData)();
                         if (dd) {
-                            float dpx = *(volatile float *)((uintptr_t)dd + 44), dpy = *(volatile float *)((uintptr_t)dd + 48);
-                            float dsx = *(volatile float *)((uintptr_t)dd + 52), dsy = *(volatile float *)((uintptr_t)dd + 56);
-                            ACETrace(@"[io#%ld] 上帧drawData DisplayPos=(%g,%g) DisplaySize=(%g,%g)", n, dpx, dpy, dsx, dsy);
+                            float f24 = *(volatile float *)((uintptr_t)dd + 24), f28 = *(volatile float *)((uintptr_t)dd + 28);
+                            float f32 = *(volatile float *)((uintptr_t)dd + 32), f36 = *(volatile float *)((uintptr_t)dd + 36);
+                            float f40 = *(volatile float *)((uintptr_t)dd + 40), f44 = *(volatile float *)((uintptr_t)dd + 44);
+                            ACETrace(@"[io#%ld] 上帧drawData浮点@24..44: %g %g %g %g %g %g (任一对=(0,0)即尺寸未喂)",
+                                     n, (double)f24, (double)f28, (double)f32, (double)f36, (double)f40, (double)f44);
                         }
                     } @catch (NSException *e) {}
                 }
@@ -3157,7 +3132,6 @@ static void ACE_hook_m1(id self, SEL _cmd) {
                  (unsigned long long)(g_cfgPtr && g_tgt_base ? ((uintptr_t)g_cfgPtr - g_tgt_base) : 0ULL),
                  (int)b0B, (int)b0A,
                  (b0B && !b0A) ? "★m1走到尾=UI已构建!" : "(byte0未消费=m1早退)");
-        // drawData 即时裁决(此刻 Render 尚未跑, 看的是上一帧产物)
         if (g_getDrawData) {
             @try {
                 void *dd = ((void *(*)(void))g_getDrawData)();
