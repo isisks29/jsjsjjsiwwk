@@ -506,6 +506,7 @@ typedef struct { double r, g, b, a; } ACEClearColor;   // ABI == MTLClearColor(4
 static void ACE_diag_display(int run);     // 前置声明(visball 点击处引用)
 static void ACE_dump_wins80(int phase, long n);   // v7.81 前置声明(verdict 每秒dump用)
 static void ACE_scan_windows82(long tag);         // v7.82 前置声明(Windows列表枚举)
+static void ACE_code_check84(long n);             // v7.84 前置声明(代码完整性对照)
 // ═══ v7.74 m1(UI构建器, bridge方法23KB@0x3a8b4) 取证+现场喂值 ═══
 // 解剖裁决: drawInMTKView 成功分支内零绘制调用; 真渲染=0x8dc6c 经 sub_893d4 调
 // ImGui Metal 后端(_0xA91D5F47, [0x3f2788]单例)renderDrawData:commandBuffer:commandEncoder:;
@@ -2947,6 +2948,49 @@ static void ACE_scan_windows82(long tag) {
     } @catch (NSException *e) { ACETrace(@"[v82#%ld] 扫描异常: %@", tag, e); }
 }
 // ═════════════════ v7.82 END ═════════════════
+// ═════════════════ v7.84 运行时代码完整性对照 ═════════════════
+// 悖论链(F级): ①Debug窗8e在m1执行期间1→0(只有End清它) ②文件版m1早退出口0x4012c=纯ret无End
+// ③文件版m1主体必调Begin("球球大作战")→窗口必被创建或改名→但Windows列表恒2且Debug名未变。
+// ②③与①矛盾 → 唯一自洽解释: 运行时执行的代码≠文件代码(sub_28dc8每帧vm_write/vm_protect)。
+// 任何一点 MISMATCH = 运行时自改码实锤, 静态分析对象作废, 转运行时dump重建。
+static const uintptr_t g_v84Off[8] = {
+    0x3a8b4,   // m1 入口
+    0x3ab8c,   // m1 主体首块(一次性初始化)
+    0x3ad8c,   // m1 Begin("球球大作战")调用点
+    0x4012c,   // m1 早退出口
+    0x132250,  // ImGui Begin 入口
+    0x127230,  // n0 入口(alpha窗)
+    0x8d864,   // draw 成功分支 m1 调用点
+    0x28dc8    // sub_28dc8 入口(每帧vm_write者)
+};
+static const uint8_t g_v84Exp[8][16] = {
+    {0xff,0x43,0x05,0xd1,0xeb,0x2b,0x0d,0x6d,0xe9,0x23,0x0e,0x6d,0xfc,0x6f,0x0f,0xa9},
+    {0xb4,0x1d,0x00,0x90,0x88,0xc6,0x5e,0x39,0x35,0x1e,0x00,0xb0,0x88,0x00,0x00,0x34},
+    {0x31,0xdd,0x03,0x94,0x0d,0x04,0x04,0x94,0x08,0x40,0x20,0x1e,0x29,0x40,0x20,0x1e},
+    {0xa8,0x03,0x58,0xf8,0x49,0x1d,0x00,0x90,0x29,0x81,0x40,0xf9,0x29,0x01,0x40,0xf9},
+    {0xef,0x3b,0xb6,0x6d,0xed,0x33,0x01,0x6d,0xeb,0x2b,0x02,0x6d,0xe9,0x23,0x03,0x6d},
+    {0xff,0xc3,0x00,0xd1,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91,0x3e,0x15,0x00,0x94},
+    {0x37,0x09,0x03,0x94,0xe0,0x03,0x16,0xaa,0x3b,0x09,0x03,0x94,0x08,0x1b,0x00,0x90},
+    {0xff,0xc3,0x01,0xd1,0xe9,0x23,0x01,0x6d,0xfa,0x67,0x02,0xa9,0xf8,0x5f,0x03,0xa9}
+};
+static void ACE_code_check84(long n) {
+    if (!g_tgt_base) return;
+    int bad = 0;
+    for (int i = 0; i < 8; i++) {
+        const volatile uint8_t *rt = (const volatile uint8_t *)(g_tgt_base + g_v84Off[i]);
+        int same = 1;
+        for (int k = 0; k < 16; k++) if (rt[k] != g_v84Exp[i][k]) { same = 0; break; }
+        if (!same) bad++;
+        ACETrace(@"[v84#%ld] 点%d @+%llx %s 运行时=%02x%02x%02x%02x %02x%02x%02x%02x 文件=%02x%02x%02x%02x %02x%02x%02x%02x",
+                 n, i, (unsigned long long)g_v84Off[i], same ? "OK" : "★★MISMATCH=运行时被改写★",
+                 rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6], rt[7],
+                 g_v84Exp[i][0], g_v84Exp[i][1], g_v84Exp[i][2], g_v84Exp[i][3],
+                 g_v84Exp[i][4], g_v84Exp[i][5], g_v84Exp[i][6], g_v84Exp[i][7]);
+    }
+    ACETrace(@"[v84#%ld] 总结: %d/8 点被改写 %s", n, bad,
+             bad ? "★静态分析作废, 需dump运行时代码重建" : "(代码与文件一致, 悖论另有解释)");
+}
+// ═════════════════ v7.84 END ═════════════════
 
 // ═══ v7.78 对照实验 + NewFrame 守卫强制放行 ═══
 // ① sub_12d87c(NewFrame) 静态实锤含守卫: DisplaySize>0(过) + 字体图集状态
@@ -3139,6 +3183,7 @@ static void ACE_hook_m1(id self, SEL _cmd) {
             }
         }
     }
+    if (n <= 2) ACE_code_check84(n);     // v7.84: 代码完整性对照(前2帧)
     if (sample) ACE_dump_wins80(0, n);   // v7.80: m1前=上帧末状态(对照 Clear 时机)
     // ═══ v7.83 停手实验: 我们这边全部 S 链写入停掉 ═══
     // v7.82 实锤: Windows列表864帧恒2个窗口,「球球大作战」面板窗从未被创建 = m1主体从未执行
@@ -3939,7 +3984,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.83 启动（停手实验: 面板窗864帧从未创建实锤=m1主体从未执行 → 停掉我们全部S链写入(keeper冻结+不喂值), 靶场链自洽独占 → 判据: [3ee7b1]变0=主体执行=面板窗诞生）===");
+            ACETrace(@"=== v7.84 启动（悖论: Debug窗End痕迹出现在m1期间但文件版m1两条路径都解释不了 → 运行时代码≠文件代码嫌疑(sub_28dc8每帧vm_write) → 8关键点16字节运行时vs文件对照, MISMATCH=静态分析作废实锤）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
