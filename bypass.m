@@ -2887,6 +2887,23 @@ static void ACE_hook_m1(id self, SEL _cmd) {
         uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
         uintptr_t io = ctxp ? (ctxp + 8) : 0;
         if (io) {
+                    // ═══ v7.77: 包装层总开关强制打开 — [ctx+0x3e28]+0x93 ═══
+            // 静态实锤: sub_7aadc/sub_7ae94/sub_7aa90 (Begin/End/Text包装) 入口均为
+            // ldrb w9,[ui+0x93]; cbz→正常执行; ret→静默空操作。+0x93非零时 m1 内
+            // 所有 ImGui 控件调用全部空转 → 零顶点 → 全透明帧(与[dd]计数完全吻合)。
+            uintptr_t ui = *(volatile uintptr_t *)(ctxp + 0x3e28);
+            if (ui) {
+                volatile uint8_t *sw93 = (volatile uint8_t *)(ui + 0x93);
+                static int v777Once = 0;
+                if (!v777Once) {
+                    v777Once = 1;
+                    ACETrace(@"[v77] UI状态对象[ctx+0x3e28]=%p 字节+0x90..0x97: %02x %02x %02x [+0x93=%02x] %02x %02x %02x %02x → 每帧强制0",
+                             (void *)ui, sw93[-3], sw93[-2], sw93[-1], sw93[0], sw93[1], sw93[2], sw93[3], sw93[4]);
+                }
+                *sw93 = 0;
+            } else if (sample) {
+                ACETrace(@"[v77] ★[ctx+0x3e28]=0 — UI状态对象缺失");
+            }
             volatile float *dsX = (volatile float *)(io + 8);
             volatile float *dsY = (volatile float *)(io + 0xc);
             volatile float *dt  = (volatile float *)(io + 0x10);
@@ -3661,7 +3678,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.76 ===");
+            ACETrace(@"=== v7.77 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
