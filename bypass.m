@@ -518,6 +518,7 @@ static void (*g_orig_m3)(id, SEL) = NULL;
 static volatile long g_m1Cnt = 0, g_n0Cnt = 0, g_m2Cnt = 0, g_m3Cnt = 0;
 static void *g_getDrawData = NULL;      // sub_12c7b4 = ImGui::GetDrawData
 static void *g_cfgPtr = NULL;           // [mtk _0xE4C8719B] 返回的门字节真身地址
+static volatile long g_probeDraws = 0;  // v7.78: ImGui 探针对照帧计数
 static void ACE_trap_signal_handler(int sig, siginfo_t *si, void *uc) {
     uintptr_t fa = (uintptr_t)(si ? si->si_addr : NULL);
     uintptr_t pgBase = g_tgt_base ? (g_tgt_base + 0x3fc000ULL) : 0;
@@ -2455,6 +2456,34 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                     }
                 } @catch (NSException *e) {}
             }
+            // ═══ v7.78: ctx FrameCount 猎取(+≈60/s 的增长字段=NewFrame在跑) + Fonts 状态 ═══
+            @try {
+                uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
+                if (ctxp) {
+                    static uint32_t prevScan[1536];
+                    static int haveScan = 0;
+                    int hitA = -1, hitB = -1; uint32_t growA = 0, growB = 0;
+                    for (int i = 0; i < 1536; i++) {
+                        uint32_t v = *(volatile uint32_t *)(ctxp + (size_t)i * 4);
+                        if (haveScan) {
+                            uint32_t d = v - prevScan[i];
+                            if (d >= 20 && d <= 240 && v > 100) {
+                                if (hitA < 0) { hitA = i; growA = d; }
+                                else if (hitB < 0) { hitB = i; growB = d; }
+                            }
+                        }
+                        prevScan[i] = v;
+                    }
+                    haveScan = 1;
+                    uintptr_t fonts = *(volatile uintptr_t *)(ctxp + 0x50);
+                    uint32_t f48 = fonts ? *(volatile uint32_t *)(fonts + 0x48) : 0;
+                    uint32_t f19 = fonts ? (uint32_t)*(volatile uint8_t *)(fonts + 0x19) : 0;
+                    void *f40 = fonts ? (void *)(uintptr_t)*(volatile uintptr_t *)(fonts + 0x40) : NULL;
+                    ACETrace(@"[ctxd] 增长字段A:ctx+0x%x(+%u/s) B:ctx+0x%x(+%u/s) (任一≈帧率=NewFrame在跑) 探针帧=%ld | Fonts=%p +0x19=%u +0x40=%p +0x48=%u",
+                             hitA * 4, growA, hitB * 4, growB, g_probeDraws,
+                             (void *)fonts, f19, f40, f48);
+                }
+            } @catch (NSException *e) {}
             // v7.68: 陷阱现场一次性输出(前3次) — x9=硬件亲手算的门1读地址
             static int trapLogged = 0;
             if (!trapLogged && g_addrTrapCnt > 0) {
@@ -2847,6 +2876,47 @@ static int ACE_eval_m1_gates(void) {
     }
     return m;
 }
+// ═══ v7.78 对照实验 + NewFrame 守卫强制放行 ═══
+// ① sub_12d87c(NewFrame) 静态实锤含守卫: DisplaySize>0(过) + 字体图集状态
+//    ([Fonts+0x48]==1 && [Fonts+0x19]==0 → 跳过整帧主体)。守卫命中 → 帧作用域
+//    不建立 → m1 全部控件空放 → 零顶点 → 全透明帧, 与三轮观测完全吻合。
+//    仅在守卫条件精确成立时翻 +0x19=1 破guard(不碰其他状态), 首次大声打日志。
+// ② 每帧用 m1 同款包装函数(签名已被 m1 每帧验证安全)直调 ImGui 画探针窗口:
+//    [dd] w16 转非零 = ImGui 核心管线完好, 问题在 m1 内部; 仍为零 = NewFrame 层。
+static void ACE_probe_imgui_core(void) {
+    if (!g_tgt_base) return;
+    g_probeDraws++;
+    @try {
+        uintptr_t ctxp = *(volatile uintptr_t *)(g_tgt_base + 0x3ff880ULL);
+        uintptr_t fonts = ctxp ? *(volatile uintptr_t *)(ctxp + 0x50) : 0;
+        static int guardLogged = 0;
+        if (fonts) {
+            volatile uint32_t *f48 = (volatile uint32_t *)(fonts + 0x48);
+            volatile uint8_t *f19 = (volatile uint8_t *)(fonts + 0x19);
+            if (*f48 == 1u && *f19 == 0) {
+                if (!guardLogged) {
+                    guardLogged = 1;
+                    ACETrace(@"[v78] ★NewFrame字体图集守卫命中: Fonts=%p +0x48=1 +0x19=0 → 强制+0x19=1破guard(下一帧生效)", (void *)fonts);
+                }
+                *f19 = 1;
+            }
+        }
+        int (*pBegin)(const char *) = (int (*)(const char *))(g_tgt_base + 0x78bc8ULL);
+        void (*pText)(const char *) = (void (*)(const char *))(g_tgt_base + 0x78c54ULL);
+        void (*pChk)(const char *, void *) = (void (*)(const char *, void *))(g_tgt_base + 0x7a440ULL);
+        void (*pEnd)(void) = (void (*)(void))(g_tgt_base + 0x7ae94ULL);
+        static uint8_t probeCb = 1;
+        int opened = pBegin("ACEPROBE");
+        pText("ACE_PROBE_TEXT");
+        pChk("ACE_PROBE_BOX", &probeCb);
+        pEnd();
+        static int openedLogged = 0;
+        if (!openedLogged && g_probeDraws >= 2) {
+            openedLogged = 1;
+            ACETrace(@"[v78] 探针窗口 Begin(ACEPROBE)返回=%d(1=开成功) Fonts=%p", opened, (void *)fonts);
+        }
+    } @catch (NSException *e) {}
+}
 static void ACE_hook_m1(id self, SEL _cmd) {
     long n = ++g_m1Cnt;
     int sample = (n <= 3) || (n % 300 == 0);
@@ -2943,6 +3013,7 @@ static void ACE_hook_m1(id self, SEL _cmd) {
     }
     if (g_tgt_base) b0B = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
     if (g_orig_m1) g_orig_m1(self, _cmd);
+    ACE_probe_imgui_core();   // v7.78: 对照实验(仍在 NewFrame..Render 窗口内, Begin/End成对)
     if (g_tgt_base) b0A = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
     g_freeze_web = fw;
     if (sample) {
@@ -3678,7 +3749,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.77 ===");
+            ACETrace(@"=== v7.78 ===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
