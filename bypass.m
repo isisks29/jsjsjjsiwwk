@@ -733,6 +733,7 @@ static char g_ring[8][240];
 static volatile int g_ring_i = 0, g_ring_n = 0;
 static volatile long long g_burst_until = 0;   // v7.17: 高精度突发采样截止时间(秒)
 static volatile int g_imgMapSaved87 = 0;       // v7.87: image映射已落日志
+static volatile uintptr_t g_cacheBase92 = 0;   // v7.92: dyld共享缓存基址(一次性读取)
 
 static void *ACE_heartbeat(void *arg) {
     (void)arg;
@@ -1175,15 +1176,35 @@ static void *ACE_web_keeper(void *arg) {
                 volatile uint8_t *p405 = (volatile uint8_t *)(g_tgt_base + 0x3ff405ULL);
                 volatile uint8_t *p439 = (volatile uint8_t *)(g_tgt_base + 0x3ff439ULL);
                 volatile uintptr_t *p408 = (volatile uintptr_t *)(g_tgt_base + 0x3ff408ULL);
-                if (*p402 || *p403 || *p404 || *p405 || *p439 || *p408) {
+                if (*p402 || *p403 || *p404 || *p405 || *p439) {
                     static long v89Log = 0;
                     if (v89Log < 30) {
                         v89Log++;
-                        ACETrace(@"[v89] ★功能开关非零→钉0: 广角(402)=%u 加速(404)=%u 403=%u 405=%u 锁球(439)=%u [3ff408]=%p (开关开=野调用=必死, 已拆)",
+                        ACETrace(@"[v89] ★功能开关非零→钉0: 广角(402)=%u 加速(404)=%u 403=%u 405=%u 锁球(439)=%u (开关开=野调用, 已拆)",
                                  (unsigned)*p402, (unsigned)*p404, (unsigned)*p403,
-                                 (unsigned)*p405, (unsigned)*p439, (void *)*p408);
+                                 (unsigned)*p405, (unsigned)*p439);
                     }
-                    *p402 = 0; *p403 = 0; *p404 = 0; *p405 = 0; *p439 = 0; *p408 = 0;
+                    *p402 = 0; *p403 = 0; *p404 = 0; *p405 = 0; *p439 = 0;
+                }
+                // ═══ v7.92: 基地址复原 — [3ff408] 钉真共享缓存基址 ═══
+                // F级: m1面板"基地址: 0x%llX"读源=[0x3ff408](dis 0x3adf8 ldr x8,[x21,#0x408]
+                // →snprintf第3参; 格式串0x3e18ff XREF→m1)。v7.89钉0防野调 → 面板0x0,
+                // 与老师真机(有基址)不符=验收破绽。野调风险=开关≠0且base错 两条件;
+                // 开关已独立钉零, base钉 dyld_get_shared_cache_range 真基址 = 靶场设计
+                // 本意(base+0x46ce9e4=缓存内手动解析系统函数) → 显示与真机一致。
+                if (!g_cacheBase92) {
+                    size_t clen92 = 0;
+                    const void *cr92 = dyld_get_shared_cache_range(&clen92);
+                    if (cr92 && clen92) g_cacheBase92 = (uintptr_t)cr92;
+                }
+                if (g_cacheBase92 && *p408 != g_cacheBase92) {
+                    static long v92Log = 0;
+                    if (v92Log < 5) {
+                        v92Log++;
+                        ACETrace(@"[v92] ★基地址复原: [3ff408] %p → %p (共享缓存真基址, 面板显示与真机一致)",
+                                 (void *)*p408, (void *)g_cacheBase92);
+                    }
+                    *p408 = g_cacheBase92;
                 }
             }
             // ═══ v7.91: 命脉令牌伪造 — 三处死刑判决一次拆完 ═══
@@ -1211,6 +1232,41 @@ static void *ACE_web_keeper(void *arg) {
                                      blk91, v91Arms);
                         }
                     }
+                }
+            }
+            // ═══ v7.92: 隐藏双保险 — 靶场MTKView(_0x1E6B7A93).hidden 与意愿强制同步 ═══
+            // byte0=0 是原生"跳过内容渲染"语义, 但已构建视图树仍在; 藏 MTKView =
+            // 面板视觉消失(游戏是Unity自己的视图, 不受影响)。500ms扫一次主线程同步,
+            // 任何脱同步状态自愈。
+            {
+                static int v92Tick = 0;
+                if (++v92Tick >= 500) {
+                    v92Tick = 0;
+                    int want92 = g_panelWant;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        @try {
+                            UIApplication *app92 = [UIApplication sharedApplication];
+                            UIWindow *kw92 = app92.keyWindow;
+                            if (!kw92) for (UIWindow *w92 in app92.windows)
+                                if (!w92.hidden && w92.alpha > 0.01) { kw92 = w92; break; }
+                            if (!kw92) return;
+                            UIView *stack92[512]; int top92 = 0;
+                            stack92[top92++] = kw92;
+                            while (top92 > 0) {
+                                UIView *v92 = stack92[--top92];
+                                NSString *cn92 = NSStringFromClass([v92 class]);
+                                if ([cn92 containsString:@"1E6B7A93"]) {
+                                    BOOL h92 = (want92 == 0);
+                                    if (v92.hidden != h92) {
+                                        v92.hidden = h92;
+                                        ACETrace(@"[v92] 面板视图hidden同步=%d (意愿=%d)", (int)h92, want92);
+                                    }
+                                }
+                                for (UIView *s92 in v92.subviews)
+                                    if (top92 < 512) stack92[top92++] = s92;
+                            }
+                        } @catch (NSException *e) {}
+                    });
                 }
             }
             if (g_tgt_base) {
@@ -2312,6 +2368,16 @@ static void ACE_install_fallback_panel(void) {
 // 原生球在(0,0,45,45)但透明背景+base64图标可能不可见(老师实锤"左上角看不到按钮")。
 // 自建可见球叠放在同位置(后addSubview=最上层, 优先接点击), 点击=ACE_visBallTap。
 static UIButton *g_visBall = nil;
+static UIWindow *g_visWin92 = nil;             // v7.92: 球所在独立顶层窗
+// ═══ v7.92: 透传顶层窗 — 空区 hitTest 返 nil, 触摸落回下层窗(不抢游戏操作) ═══
+@interface ACEPassWindow : UIWindow
+@end
+@implementation ACEPassWindow
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *v = [super hitTest:p withEvent:e];
+    return (v == self) ? nil : v;
+}
+@end
 static void ACE_install_visible_ball(void) {
     static ACEFbHelper *helper2 = nil;
     if (helper2) return;                                   // 幂等
@@ -2324,6 +2390,15 @@ static void ACE_install_visible_ball(void) {
             return;
         }
         helper2 = [[ACEFbHelper alloc] init];
+        // ═══ v7.92: 独立顶层窗 — v7.91点击不达实锤: 授权成功后靶场重建UI容器+换
+        // keyWindow(日志尾keyWindow→新窗), 加在旧window上的球被新容器盖住, 点击
+        // 从未送达(全程无[visball]点击/[ball]日志)=面板关不掉。独立窗 windowLevel=
+        // Alert+100 恒最前, 不受keyWindow切换/容器叠加影响。 ═══
+        (void)kw;
+        g_visWin92 = [[ACEPassWindow alloc] initWithFrame:CGRectMake(0, 0, 52, 76)];
+        g_visWin92.windowLevel = 2100;   // = UIWindowLevelAlert(2000)+100, 恒最前
+        g_visWin92.backgroundColor = [UIColor clearColor];
+        g_visWin92.hidden = NO;
         g_visBall = [[UIButton alloc] initWithFrame:CGRectMake(2, 26, 45, 45)];
         g_visBall.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.65];
         g_visBall.layer.cornerRadius = 22;
@@ -2331,9 +2406,8 @@ static void ACE_install_visible_ball(void) {
         [g_visBall setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         g_visBall.titleLabel.font = [UIFont boldSystemFontOfSize:13];
         [g_visBall addTarget:helper2 action:@selector(fbNativeToggle:) forControlEvents:UIControlEventTouchUpInside];
-        [kw addSubview:g_visBall];
-        [kw bringSubviewToFront:g_visBall];
-        ACETrace(@"[visball] ★可见球已装左上角(2,26 45×45), 点击=切换原生面板显隐");
+        [g_visWin92 addSubview:g_visBall];
+        ACETrace(@"[visball] ★可见球已装独立顶层窗(0,0,52,76 lvl=Alert+100, 空区透传), 点击=切换原生面板显隐");
     } @catch (NSException *e) { ACETrace(@"[visball] 异常: %@", e); }
 }
 // ═══ v7.57: 绘制层活体门仪表 ═══
@@ -4213,7 +4287,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.91 启动（v7.90日志实锤: 发牌链=服务器真实许可证→sub_d27ac状态机0xd9840→sub_effe4 CAS, TEST123无真卡永远走不到=令牌恒0; 三处判决cbz→SIGKILL(0xe6164/0xe61c8/0x31bcc, sub_2fed8被S链门+面板链反复调=面板后死)。本版keeper直接伪造令牌: calloc(0x1d28)全零块与真发牌人同构, 判决只查非空+坏分支全审计安全 → 死刑物理拆除）===");
+            ACETrace(@"=== v7.92 启动（v7.91已不崩✓ → 修验收两疑点: ①基地址0x0= v7.89把[3ff408]钉0防野调, 但m1面板基地址读源就是它(dis 0x3adf8铁证) → 改钉dyld共享缓存真基址=靶场设计本意+显示与真机一致; ②面板关不掉= visball加在旧keyWindow被授权后重建的UI容器盖住(点击从未送达) → 改独立顶层窗(Alert+100恒最前+空区透传) + keeper 500ms同步MTKView.hidden双保险）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
