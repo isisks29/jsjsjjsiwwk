@@ -504,7 +504,20 @@ static id (*g_orig_curD)(id, SEL) = NULL;
 static void (*g_orig_pres)(id, SEL, id) = NULL;
 typedef struct { double r, g, b, a; } ACEClearColor;   // ABI == MTLClearColor(4 double)
 static void ACE_diag_display(int run);     // 前置声明(visball 点击处引用)
-
+// ═══ v7.74 m1(UI构建器, bridge方法23KB@0x3a8b4) 取证+现场喂值 ═══
+// 解剖裁决: drawInMTKView 成功分支内零绘制调用; 真渲染=0x8dc6c 经 sub_893d4 调
+// ImGui Metal 后端(_0xA91D5F47, [0x3f2788]单例)renderDrawData:commandBuffer:commandEncoder:;
+// drawData 来自 GetDrawData@0x8d900(bl sub_12c7b4), Render@0x8d8fc(bl sub_1380d4)。
+// UI 搭建全在 m1 内(含控件标签字符串VM解密点)。m1 入口=与 drawInMTKView 同一套
+// S链门(a8≠0+eq②③④+45s窗)+ctx门6道, 任一挂→静默早退0x4012c→ImGui空帧→全透明。
+// 佐证(F): m1 尾部 0x40128 建完UI才清 byte0; 日志 byte0 恒1 = m1 从未走到尾 = 每帧早退。
+static void (*g_orig_m1)(id, SEL) = NULL;
+static void (*g_orig_n0)(id, SEL) = NULL;
+static void (*g_orig_m2)(id, SEL) = NULL;
+static void (*g_orig_m3)(id, SEL) = NULL;
+static volatile long g_m1Cnt = 0, g_n0Cnt = 0, g_m2Cnt = 0, g_m3Cnt = 0;
+static void *g_getDrawData = NULL;      // sub_12c7b4 = ImGui::GetDrawData
+static void *g_cfgPtr = NULL;           // [mtk _0xE4C8719B] 返回的门字节真身地址
 static void ACE_trap_signal_handler(int sig, siginfo_t *si, void *uc) {
     uintptr_t fa = (uintptr_t)(si ? si->si_addr : NULL);
     uintptr_t pgBase = g_tgt_base ? (g_tgt_base + 0x3fc000ULL) : 0;
@@ -2195,6 +2208,12 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
     volatile uint8_t *vsw = g_tgt_base ? (volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL) : NULL;
     int preHid = (int)((UIView *)self).hidden;
     if (vsw) *vsw = (uint8_t)g_panelWant;   // 置期望值, 失败分支若清0即可检出
+    // ═══ v7.74: 真门字节直写 — 0x8d838 的门读的是 *[self _0xE4C8719B](ivar指针),
+    // 不保证==0x3ff7e4! 若历史上一直写错字节, m1/n0/m2/m3 整段内容循环被静默跳过。
+    // 这里按 g_panelWant 直写 getter 返回的真身地址(首帧解析并缓存)。 ═══
+    if (!g_cfgPtr && g_mtkView)
+        g_cfgPtr = ((void *(*)(id, SEL))objc_msgSend)(g_mtkView, NSSelectorFromString(@"_0xE4C8719B"));
+    if (g_cfgPtr) *(volatile uint8_t *)g_cfgPtr = (uint8_t)g_panelWant;
     uint8_t preB0 = vsw ? *vsw : 0;
     @try {
         if (g_tgt_base) {
@@ -2418,6 +2437,24 @@ static void ACE_hook_draw(id self, SEL _cmd, id view) {
                      g_vTot, g_vFail, g_jumpCnt, g_xw, g_wmHit, g_wmMiss, wm0, wm1, wm2, g_addrTrapCnt,
                      preHid, postHid, (int)preB0, (int)postB0,
                      g_curDCnt, g_curDNil, g_presCnt);
+                     // ═══ v7.74: Render 后 drawData 裁决 — 命令列表数=0 即 UI 没建 ═══
+            if (g_getDrawData) {
+                @try {
+                    void *dd = ((void *(*)(void))g_getDrawData)();
+                    if (dd) {
+                        uint32_t w0 = *(volatile uint32_t *)((uintptr_t)dd);
+                        uint64_t w8 = *(volatile uint64_t *)((uintptr_t)dd + 8);
+                        uint64_t w16 = *(volatile uint64_t *)((uintptr_t)dd + 16);
+                        uint32_t w24 = *(volatile uint32_t *)((uintptr_t)dd + 24);
+                        ACETrace(@"[dd] drawData=%p w0=%x w8=%llx w16=%llx w24=%x | m1=%ld n0=%ld m2=%ld m3=%ld (w8或w16非零=UI已建)",
+                                 dd, w0, (unsigned long long)w8, (unsigned long long)w16, w24,
+                                 g_m1Cnt, g_n0Cnt, g_m2Cnt, g_m3Cnt);
+                    } else {
+                        ACETrace(@"[dd] GetDrawData→nil | m1=%ld n0=%ld m2=%ld m3=%ld",
+                                 g_m1Cnt, g_n0Cnt, g_m2Cnt, g_m3Cnt);
+                    }
+                } @catch (NSException *e) {}
+            }
             // v7.68: 陷阱现场一次性输出(前3次) — x9=硬件亲手算的门1读地址
             static int trapLogged = 0;
             if (!trapLogged && g_addrTrapCnt > 0) {
@@ -2736,6 +2773,140 @@ static void ACE_diag_display(int run) {
     });
 }
 // ═════════════════ v7.73 显示链诊断 END ═════════════════
+// ═════════════════ v7.74 m1 取证+现场喂值 ═════════════════
+// 修复逻辑: m1 早退的唯一可能 = 进门瞬间读到的 S 链/ctx 值不满足门。
+// keeper 在别的线程持续重写四槽, m1 在渲染线程读 → 跨 tick 撕裂窗口真实存在;
+// 且历史喂值只保证"帧边界一致"(rawdump), 不保证"m1 进门瞬间一致"。
+// v7.74: hook m1 → 冻结 keeper → 现场喂一条以当前时刻为 S 的新鲜一致链 →
+// 调原 m1(进门5道S门由构造保证必过; ctx门6道值从未挂过, rawdump3 实证) →
+// 出门检查 byte0 是否被消费(消费=建完UI铁证) + 采样打印9门逐项评估。
+static uint64_t ACE_feed_chain_now(void) {
+    volatile uint32_t *tb = (volatile uint32_t *)(g_tgt_base + 0x3f6b40);
+    uint32_t num = tb[0], den = tb[1];
+    if (!num || !den) { num = 125; den = 3; }
+    uint64_t ns = (uint64_t)mach_absolute_time() * num / den;
+    uint64_t S = ns / 1000000ULL;
+    uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
+    *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) = S ^ 0xb75e8052badb72a6ULL;
+    uint32_t a8 = ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u);
+    *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8) = a8;
+    uint32_t t2 = a8 ^ 0x1767cedcu;
+    t2 ^= t2 >> 15; t2 *= 0x1f3d6a71u; t2 ^= t2 >> 11; t2 *= 0x8e4b1395u;
+    uint32_t ac = Slo ^ (t2 >> 17) ^ t2;
+    *(volatile uint32_t *)(g_tgt_base + 0x3ff6ac) = ac;
+    uint32_t t3 = ac ^ 0x5d41c293u;
+    t3 ^= t3 >> 15; t3 *= 0x1f3d6a71u; t3 ^= t3 >> 11; t3 *= 0x8e4b1395u;
+    *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0) = Shi ^ (t3 >> 17) ^ t3;
+    return S;
+}
+// 逐门评估 m1 入口 9 道门 (bit0..8, 1=过): a8≠0/eq②/eq③/eq④/45s窗/ctx指针非零/gate6/gate7abc/gate8
+static int ACE_eval_m1_gates(void) {
+    int m = 0;
+    uint64_t S = *(volatile uint64_t *)(g_tgt_base + 0x3ff6a0) ^ 0xb75e8052badb72a6ULL;
+    uint32_t Slo = (uint32_t)S, Shi = (uint32_t)(S >> 32);
+    uint32_t a8 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6a8);
+    uint32_t ac = *(volatile uint32_t *)(g_tgt_base + 0x3ff6ac);
+    uint32_t b0 = *(volatile uint32_t *)(g_tgt_base + 0x3ff6b0);
+    if (a8) m |= 1;
+    if (a8 == ACE_mix32((Slo ^ Shi) ^ 0xd18ddb25u)) m |= 2;
+    uint32_t t2 = a8 ^ 0x1767cedcu;
+    t2 ^= t2 >> 15; t2 *= 0x1f3d6a71u; t2 ^= t2 >> 11; t2 *= 0x8e4b1395u;
+    if (ac == (Slo ^ (t2 >> 17) ^ t2)) m |= 4;
+    uint32_t t3 = ac ^ 0x5d41c293u;
+    t3 ^= t3 >> 15; t3 *= 0x1f3d6a71u; t3 ^= t3 >> 11; t3 *= 0x8e4b1395u;
+    if (b0 == (Shi ^ (t3 >> 17) ^ t3)) m |= 8;
+    // 45s 窗: m1 用自己的时基槽 [0x3fadc0/0x3fadc4](自初始化125/3)
+    {
+        volatile uint32_t *tb2 = (volatile uint32_t *)(g_tgt_base + 0x3fadc0);
+        uint32_t n2 = tb2[0], d2 = tb2[1];
+        if (!n2 || !d2) { n2 = 125; d2 = 3; }
+        uint64_t nowMs = (uint64_t)mach_absolute_time() * n2 / d2 / 1000000ULL;
+        if (nowMs >= S && (nowMs - S) <= 45000ULL) m |= 16;
+    }
+    uintptr_t ctx = *(volatile uintptr_t *)(g_tgt_base + 0x3ff698);
+    if (ctx) {
+        uint32_t p8e = *(volatile uint32_t *)(ctx + 0x8e);
+        uint32_t p92 = *(volatile uint32_t *)(ctx + 0x92);
+        uint64_t C = *(volatile uint64_t *)(ctx + 0x119a);
+        uint64_t A = *(volatile uint64_t *)(ctx + 0x11a2);
+        uint64_t E = *(volatile uint64_t *)(ctx + 0x78);
+        uint64_t s10 = *(volatile uint64_t *)(ctx + 0x11aa);
+        uint64_t s18 = *(volatile uint64_t *)(ctx + 0x11b2);
+        uint64_t s20 = *(volatile uint64_t *)(ctx + 0x11ba);
+        if (p8e && p92 && C) m |= 32;
+        if ((C ^ A ^ 0xa5c3e1f7b6d2489aULL) == E) m |= 64;
+        if ((((uint32_t)s10 ^ 0x4a9b5206u) ^ (uint32_t)(C >> 7)) == p8e
+                && (((uint32_t)s18 ^ 0x8c1a73e5u) ^ (uint32_t)(C >> 13)) == p92
+                && (((uint32_t)s20 ^ 0x5f8a16e3u) ^ (uint32_t)(C >> 19)) == *(volatile uint32_t *)ctx) m |= 128;
+        uint32_t w = (uint32_t)(A >> 32) ^ (uint32_t)A;
+        w *= 0x45d9f3b7u; w ^= (uint32_t)s10;
+        w *= 0x8e4b1395u; w ^= (uint32_t)s18;
+        w *= 0x1f3d6a71u; w ^= (uint32_t)s20;
+        w ^= w >> 16;
+        if (w == *(volatile uint32_t *)(ctx + 0x11c2)) m |= 256;
+    }
+    return m;
+}
+static void ACE_hook_m1(id self, SEL _cmd) {
+    long n = ++g_m1Cnt;
+    int sample = (n <= 3) || (n % 300 == 0);
+    int gBefore = 0, gAfter = 0;
+    uint8_t b0B = 0, b0A = 0;
+    if (sample) gBefore = ACE_eval_m1_gates();      // 喂值前现场(m1 将看到的撕裂态)
+    int fw = g_freeze_web;
+    g_freeze_web = 1;                                // m1 期间冻结 keeper(防跨tick撕裂)
+    ACE_feed_chain_now();                            // 现场喂新鲜一致链
+    if (sample) gAfter = ACE_eval_m1_gates();
+    if (g_tgt_base) b0B = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
+    if (g_orig_m1) g_orig_m1(self, _cmd);
+    if (g_tgt_base) b0A = *(volatile uint8_t *)(g_tgt_base + 0x3ff7e4ULL);
+    g_freeze_web = fw;
+    if (sample) {
+        if (!g_cfgPtr && g_mtkView)
+            g_cfgPtr = ((void *(*)(id, SEL))objc_msgSend)(g_mtkView, NSSelectorFromString(@"_0xE4C8719B"));
+        ACETrace(@"[m1#%ld] 门:喂前=%x 喂后=%x(1ff=全过) cfgPtr=%p(base+%llx) byte0:%d→%d %s",
+                 n, gBefore, gAfter, g_cfgPtr,
+                 (unsigned long long)(g_cfgPtr && g_tgt_base ? ((uintptr_t)g_cfgPtr - g_tgt_base) : 0ULL),
+                 (int)b0B, (int)b0A,
+                 (b0B && !b0A) ? "★m1走到尾=UI已构建!" : "(byte0未消费=m1早退)");
+        // drawData 即时裁决(此刻 Render 尚未跑, 看的是上一帧产物)
+        if (g_getDrawData) {
+            @try {
+                void *dd = ((void *(*)(void))g_getDrawData)();
+                if (dd) {
+                    uint32_t w0 = *(volatile uint32_t *)((uintptr_t)dd);
+                    uint64_t w8 = *(volatile uint64_t *)((uintptr_t)dd + 8);
+                    uint64_t w16 = *(volatile uint64_t *)((uintptr_t)dd + 16);
+                    uint32_t w24 = *(volatile uint32_t *)((uintptr_t)dd + 24);
+                    ACETrace(@"[dd] drawData=%p w0=%x w8=%llx w16=%llx w24=%x (旧布局:w8=列表指针,w16低32=命令列表数; 非零=UI已建)",
+                             dd, w0, (unsigned long long)w8, (unsigned long long)w16, w24);
+                } else {
+                    ACETrace(@"[dd] GetDrawData→nil");
+                }
+            } @catch (NSException *e) {}
+        }
+    }
+}
+static void ACE_hook_n0(id self, SEL _cmd) { g_n0Cnt++; if (g_orig_n0) g_orig_n0(self, _cmd); }
+static void ACE_hook_m2(id self, SEL _cmd) { g_m2Cnt++; if (g_orig_m2) g_orig_m2(self, _cmd); }
+static void ACE_hook_m3(id self, SEL _cmd) { g_m3Cnt++; if (g_orig_m3) g_orig_m3(self, _cmd); }
+static void ACE_install_m1_probes(Class clsB, Class clsC) {
+    @try {
+        g_getDrawData = (void *)(g_tgt_base + 0x12c7b4ULL);
+        Method m;
+        m = class_getInstanceMethod(clsB, NSSelectorFromString(@"m1"));
+        if (m && !g_orig_m1) { g_orig_m1 = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)ACE_hook_m1); }
+        m = class_getInstanceMethod(clsC, NSSelectorFromString(@"n0"));
+        if (m && !g_orig_n0) { g_orig_n0 = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)ACE_hook_n0); }
+        m = class_getInstanceMethod(clsB, NSSelectorFromString(@"m2"));
+        if (m && !g_orig_m2) { g_orig_m2 = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)ACE_hook_m2); }
+        m = class_getInstanceMethod(clsB, NSSelectorFromString(@"m3"));
+        if (m && !g_orig_m3) { g_orig_m3 = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)ACE_hook_m3); }
+        ACETrace(@"[m1] 探针已装 m1=%d n0=%d m2=%d m3=%d getDrawData=%p",
+                 !!g_orig_m1, !!g_orig_n0, !!g_orig_m2, !!g_orig_m3, g_getDrawData);
+    } @catch (NSException *e) { ACETrace(@"[m1] 探针异常: %@", e); }
+}
+// ═════════════════ v7.74 m1 取证 END ═════════════════
 
 // ═══ v7.54: 原生面板复刻构建(主攻路线) ═══
 // 全局机制(全部F级, 反汇编逐条解码):
@@ -2830,6 +3001,8 @@ static void ACE_native_panel_build(int tag) {
                      (unsigned long long)(g_orig_draw ? ((uintptr_t)g_orig_draw - g_tgt_base) : 0));
                      // ═══ v7.73: GPU 显示链探针(currentDrawable/presentDrawable 仪表) ═══
             ACE_install_gpu_probes(mtk, clsM);
+            // ═══ v7.74: m1/n0/m2/m3(UI构建链)探针 ═══
+            ACE_install_m1_probes(clsB, clsC);
         } @catch (NSException *e) { ACETrace(@"[native] draw仪表挂载异常: %@", e); }
         id ball = ((id (*)(id, SEL, void *, CGRect))objc_msgSend)([clsBall alloc], sF2,
                                                                   cfg, CGRectMake(489, 58, 45, 45));
@@ -3421,7 +3594,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.73 启动（显示链诊断: 全窗几何dump+面板窗自动矫正 / currentDrawable+presentDrawable仪表 / 窗口像素快照 — 定位「成功分支每帧跑但无像素」断点）===");
+            ACETrace(@"=== v7.74 启动（m1=UI构建器实锤: hook m1/n0/m2/m3 + 进门冻结keeper现场喂新鲜S链(5道S门由构造必过) + 真门字节直写 + 9门逐项评估 + drawData命令数裁决）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
