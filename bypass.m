@@ -3183,6 +3183,31 @@ static void ACE_hook_m1(id self, SEL _cmd) {
             }
         }
     }
+    // ═══ v7.85: m1 真实时基槽修复 — 最后一块拼图 ═══
+    // m1 门区 0x3a9dc-0x3aa14 (F级反汇编):
+    //   if ([0x3f0a70]==0) { mach_timebase_info(&[0x3f0dc0]); [0x3f0a70]=1; }
+    //   ms = mach_absolute_time() × [0x3f0dc0] / [0x3f0dc4] / 1000000;
+    //   if (ms < S || ms-S > 45000) goto 早退;    ← 45s窗门
+    // 而我们的 eval 一直用 [0x3fadc0](另一个被我们修过的时基槽) 算 45s 窗 → eval过/m1挂。
+    // 若 [0x3f0dc4]==0 (den=0, udiv 结果为0) → ms恒0 < S → 每帧必早退 → 主体永不执行
+    // → 面板窗永不创建 → 与 v7.82/83/84 全部观测吻合。修复: 纯数据写 num/den=125/3。
+    if (g_tgt_base) {
+        volatile uint32_t *tb85 = (volatile uint32_t *)(g_tgt_base + 0x3f0dc0ULL);
+        volatile uint32_t *fl85 = (volatile uint32_t *)(g_tgt_base + 0x3f0a70ULL);
+        volatile uint32_t *tbOld = (volatile uint32_t *)(g_tgt_base + 0x3fadc0ULL);
+        static int v85Once = 0;
+        if (!v85Once) {
+            v85Once = 1;
+            ACETrace(@"[v85#%ld] ★m1真时基: flag[3f0a70]=%u num[3f0dc0]=%u den[3f0dc4]=%u | 旧eval时基[3fadc0]=%u/%u (den=0即45s窗恒挂=主体永不执行)",
+                     n, *fl85, tb85[0], tb85[1], tbOld[0], tbOld[1]);
+        }
+        if (tb85[1] == 0 || tb85[0] == 0) {
+            tb85[0] = 125; tb85[1] = 3; *fl85 = 1;
+            if (n <= 3 || n % 300 == 0)
+                ACETrace(@"[v85#%ld] ★已修复时基→125/3 (下一帧m1的45s窗应通过)", n);
+        }
+    }
+    
     if (n <= 2) ACE_code_check84(n);     // v7.84: 代码完整性对照(前2帧)
     if (sample) ACE_dump_wins80(0, n);   // v7.80: m1前=上帧末状态(对照 Clear 时机)
     // ═══ v7.83 停手实验: 我们这边全部 S 链写入停掉 ═══
@@ -3984,7 +4009,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.84 启动（悖论: Debug窗End痕迹出现在m1期间但文件版m1两条路径都解释不了 → 运行时代码≠文件代码嫌疑(sub_28dc8每帧vm_write) → 8关键点16字节运行时vs文件对照, MISMATCH=静态分析作废实锤）===");
+            ACETrace(@"=== v7.85 启动（v7.84证明代码未改 → eval与实际唯一差异实锤: m1的45s窗用[0x3f0dc0/dc4]时基而eval用[0x3fadc0]! den=0→ms恒0→45s窗恒挂→每帧必早退→主体永不执行 → 纯数据修复num/den=125/3, 判据: [3ee7b1]变0+Windows列表出现「球球大作战」）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
