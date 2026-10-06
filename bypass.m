@@ -34,6 +34,7 @@
 #import <arpa/inet.h>
 #import <errno.h>
 #import <sys/mman.h>      // v7.68: 地址陷阱 mprotect
+extern void sys_icache_invalidate(void *start, size_t len);   // Xcode26 SDK 不再隐式声明, 显式补上
 
 // ══════════════ 第 0 层：隐身（对靶场的 dyld/调试探测不可见）══════════════
 typedef void (*ACEAddImageFn)(const struct mach_header *mh, intptr_t vmaddr_slide);
@@ -448,7 +449,7 @@ static void ACE_report_last_crash(void) {
             memset(runSw, 0, sizeof(runSw)); memset(runN, 0, sizeof(runN));
             char curSw[3] = "??";
             long entries = 0;
-            #define ACE_HX(c) (((c)>='0'&&(c)<='9')?((c)-'0'):((((c)|32)>='a')?((c)|32)-'a'+10):0))
+            #define ACE_HX(c) (((c)>='0'&&(c)<='9')?((c)-'0'):((((c)|32)>='a')?(((c)|32)-'a'+10):0))
             #define ACE_T_FLUSH(ix) do { if (runN[ix] > 0 && entries < 600) { \
                     [dg appendFormat:@"S%.2s t%02x P%s L%s x%d\n", runSw[ix], (ix), lastPc[ix], lastLr[ix], runN[ix]]; \
                     entries++; } runN[ix] = 0; } while (0)
