@@ -292,7 +292,7 @@ static int g_rw_dialog = 0, g_rw_boot = 0;
 static volatile int g_freeze_web = 0;   // v7.47: 直调建面板期间冻结喂值(防跨tick不自洽)
 // v7.56: 面板存续状态(前移声明, web_keeper 的 byte0 keeper 要用)
 static BOOL g_nativeBuilt = NO;          // 复刻面板已建成
-static volatile int g_panelWant = 1;     // 可见球设定的显隐意愿(keeper 维持 byte0=此值)
+static volatile int g_panelWant = 0;     // v7.93: 初值0=授权后面板不直接显现(老师真机行为: 点左上角才唤出); 可见球/原生球点击翻转到1
 static int g_rebuildCnt = 0;             // 被拆后重建计数(上限3, 防死循环)
 static void ACE_web_tick(void);   // v7.24 前置声明(定义在守护线程段)
 // ═══ v7.4: EndTime 补喂 ═══
@@ -734,6 +734,9 @@ static volatile int g_ring_i = 0, g_ring_n = 0;
 static volatile long long g_burst_until = 0;   // v7.17: 高精度突发采样截止时间(秒)
 static volatile int g_imgMapSaved87 = 0;       // v7.87: image映射已落日志
 static volatile uintptr_t g_cacheBase92 = 0;   // v7.92: dyld共享缓存基址(一次性读取)
+// v7.92b: 真SDK里该声明在 <mach-o/dyld_priv.h>; 不引额外头, 直接extern
+// (符号由libdyld导出, iOS13+; 隐式声明在真Xcode是error)
+extern const void *dyld_get_shared_cache_range(size_t *length);
 
 static void *ACE_heartbeat(void *arg) {
     (void)arg;
@@ -1240,7 +1243,9 @@ static void *ACE_web_keeper(void *arg) {
             // 任何脱同步状态自愈。
             {
                 static int v92Tick = 0;
-                if (++v92Tick >= 500) {
+                // v7.93: 验卡成功前不动视图树(授权前MTKView可能有靶场自有用途);
+                // g_rw_dialog>0 = 弹窗验卡结果已处理 = 授权后阶段才开始隐藏同步
+                if (g_rw_dialog > 0 && ++v92Tick >= 500) {
                     v92Tick = 0;
                     int want92 = g_panelWant;
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -4287,7 +4292,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
                         g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31: 冷冻器排除主线程用
-            ACETrace(@"=== v7.92 启动（v7.91已不崩✓ → 修验收两疑点: ①基地址0x0= v7.89把[3ff408]钉0防野调, 但m1面板基地址读源就是它(dis 0x3adf8铁证) → 改钉dyld共享缓存真基址=靶场设计本意+显示与真机一致; ②面板关不掉= visball加在旧keyWindow被授权后重建的UI容器盖住(点击从未送达) → 改独立顶层窗(Alert+100恒最前+空区透传) + keeper 500ms同步MTKView.hidden双保险）===");
+            ACETrace(@"=== v7.93 启动（v7.92修基地址+点击送达; 本版对齐老师验收流程: 真激活后面板不直接显现= g_panelWant初值0(授权后干净画面), 点左上角球→byte0=1+MTKView.hidden=NO→面板出, 再点→藏(v7.89教训: 初值0的安全前提是点击必达=v7.92顶层窗); hidden同步加验卡成功门(g_rw_dialog>0)防授权前误动视图树）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
