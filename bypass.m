@@ -3883,7 +3883,7 @@ static void ACE_self_range(void) {
     const struct mach_header *h = ACE_self_header();
     if (!h) return;
     unsigned long sz = 0;
-    getsegmentdata(h, "__LINKEDIT", &sz);
+    getsegmentdata((const struct mach_header_64 *)h, "__LINKEDIT", &sz);
     g_self_lo = (uintptr_t)h;
     g_self_hi = (uintptr_t)h + sz;
 }
@@ -4299,7 +4299,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
             g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31
-            ACETrace(@"=== v8.03 启动（★v8.03: v8.02基础上新增ace盲区层——改写ace的GOT: task_info(TASK_DYLD_INFO)返回摘除本镜像的过滤副本, vm_region_64/vm_region_recurse_64/mach_vm_region_recurse跳过本镜像区域; 全部只影响"ace看我们"的通道, ace其余逻辑与自身过检测零修改: 断点扫描器sub_53df8真值供血(v7.94分流规则原样)/区域冻结freezer全区扫描/全屏透传窗菜单球点按必切换(byte0/cfgPtr/hidden三直写+keeper自愈)）===");
+            ACETrace(@"=== v8.03 启动（★v8.03: v8.02基础上新增ace盲区层——改写ace的GOT: task_info(TASK_DYLD_INFO)返回摘除本镜像的过滤副本, vm_region_64/vm_region_recurse_64/mach_vm_region_recurse跳过本镜像区域; 全部只影响「ace看我们」的通道, ace其余逻辑与自身过检测零修改: 断点扫描器sub_53df8真值供血(v7.94分流规则原样)/区域冻结freezer全区扫描/全屏透传窗菜单球点按必切换(byte0/cfgPtr/hidden三直写+keeper自愈)）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
