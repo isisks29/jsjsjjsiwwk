@@ -1,4 +1,4 @@
-// bypass.m (v8.08)
+// bypass.m (v8.09)
 #define ACE_TRACE 1   // 必须保持 1
 
 #import <Foundation/Foundation.h>
@@ -4178,30 +4178,11 @@ static void ACE_probe_prologues(void) {
 }
 // --- 匿名 r-x trampoline 池扫描
 static void ACE_scan_rx_pools(void) {
-    kern_return_t (*real_vr)(vm_map_t, vm_address_t *, vm_size_t *, vm_region_flavor_t, vm_region_info_64_t, mach_msg_type_number_t *) =
-        (kern_return_t (*)(vm_map_t, vm_address_t *, vm_size_t *, vm_region_flavor_t, vm_region_info_64_t, mach_msg_type_number_t *))
-        dlsym(RTLD_DEFAULT, "vm_region_64");
-    if (!real_vr) return;
-    vm_address_t addr = 0;
-    int hits = 0;
-    while (hits < 24) {
-        vm_size_t sz = 0;
-        struct vm_region_basic_info_64 info;
-        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-        if (real_vr(mach_task_self(), &addr, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_64_t)&info, &cnt) != KERN_SUCCESS) break;
-        if ((info.protection & VM_PROT_EXECUTE) && sz && sz <= 0x100000) {
-            Dl_info di;
-            if (!dladdr((const void *)addr, &di)) {
-                const uint32_t *w = (const uint32_t *)addr;
-                ACETrace(@"[pool] ★匿名r-x池 @%p size=0x%llx head=%08x %08x (Dobby trampoline?)",
-                         (void *)addr, (unsigned long long)sz, w[0], w[1]);
-                hits++;
-            }
-        }
-        addr += sz;
-        if (!sz) break;
-    }
-    if (!hits) ACETrace(@"[pool] 未发现匿名r-x池");
+    // v8.09: 整体切除。全地址空间vm_region遍历会踩中iOS18桩函数OOL冷路径的NULL写
+    // (两次闪退实证: vm_region_64+72 / +552, str w8,[x20] x20=0)。
+    // 该探针目的(找Dobby蹦床池)已由ACE_probe_prologues覆盖, 且静态分析证明ace启动期不做inline hook。
+    static int once = 0;
+    if (!once) { once = 1; ACETrace(@"[pool] r-x池扫描已移除(v8.09): 系统vm_region桩函数边角崩溃, 探针无价值"); }
 }
 // --- UI 判决追踪+抑制
 static BOOL ACE_text_is_kick(NSString *s) {
@@ -4638,7 +4619,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
             g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31
-            ACETrace(@"=== v8.08 启动（★v8.08: HTTPS轨迹改为验卡后武装+completion先转发后异步日志(不碰启动窗/_delegate队列时序)+归因修正; 其余同v8.07; 仍零修改ace逻辑: 断点扫描器sub_53df8真值供血(v7.94分流规则原样)/区域冻结freezer全区扫描/全屏透传窗菜单球点按必切换(byte0/cfgPtr/hidden三直写+keeper自愈)）===");
+            ACETrace(@"=== v8.09 启动（★v8.09: 整体切除r-x池扫描(iOS18 vm_region桩NULL写闪退根因, 两次实证); HTTPS轨迹维持v8.08验卡后武装; 仍零修改ace逻辑: 断点扫描器sub_53df8真值供血(v7.94分流规则原样)/区域冻结freezer全区扫描/全屏透传窗菜单球点按必切换(byte0/cfgPtr/hidden三直写+keeper自愈)）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
