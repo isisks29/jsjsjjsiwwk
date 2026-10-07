@@ -1,4 +1,4 @@
-// bypass.m (v8.01)
+// bypass.m (v8.02)
 #define ACE_TRACE 1   // 必须保持 1
 
 #import <Foundation/Foundation.h>
@@ -3804,6 +3804,65 @@ static void ACE_install_result_hook(void) {
     }
 }
 
+
+// ═══ v8.02 ═══
+static unsigned long long ACE_knm_noop0(id self, SEL _cmd) {
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[knm] %@ -> 0", NSStringFromSelector(_cmd));
+        g_ace_busy = 0;
+    }
+    return 0;
+}
+static unsigned long long ACE_knm_noop1(id self, SEL _cmd, id a) {
+    if (g_ace_ready && !g_ace_busy) {
+        g_ace_busy = 1;
+        ACETrace(@"[knm] %@(%@) -> 0", NSStringFromSelector(_cmd), ACETrimStr(a, 80));
+        g_ace_busy = 0;
+    }
+    return 0;
+}
+static int g_knm_hooked = 0;
+static void ACE_knm_neuter(Class cls, const char *selname, IMP imp) {
+    if (!cls) return;
+    SEL s = NSSelectorFromString([NSString stringWithUTF8String:selname]);
+    if (!s) return;
+    Method m = class_getInstanceMethod(cls, s);
+    if (!m) return;
+    IMP cur = method_getImplementation(m);
+    if (cur == imp) return;
+    method_setImplementation(m, imp);
+    g_knm_hooked++;
+    ACETrace(@"[knm] 检测/处决方法已致盲: %@.%s (原IMP=%p)", NSStringFromClass(cls), selname, cur);
+}
+static void ACE_knm_sweep(void) {
+    @try {
+        static const char *detCls[] = { "_0x3F6A8E1C", "_0x7F2B4A6E", "_0xA5C3E8D1" };
+        static const char *detSel[] = { "performFullDetection", "isJailbroken",
+            "detectInjectedLibraries", "detectTweakInject", "detectSuspiciousFrameworks" };
+        for (int c = 0; c < 3; c++) {
+            Class k = NSClassFromString([NSString stringWithUTF8String:detCls[c]]);
+            if (!k) continue;
+            for (unsigned i = 0; i < sizeof(detSel)/sizeof(detSel[0]); i++)
+                ACE_knm_neuter(k, detSel[i], (IMP)ACE_knm_noop0);
+            ACE_knm_neuter(k, "getOffset:", (IMP)ACE_knm_noop1);
+        }
+        static const char *desSel[] = { "cleanupAndExit:", "forceExitWithReason:",
+            "showBanAlertWithReason:", "showServerClosedAlert:", "showVersionUpdateAlert:",
+            "showServerMessage:" };
+        Class d = NSClassFromString(@"_0x3A8D7F4C");
+        if (d) {
+            for (unsigned i = 0; i < sizeof(desSel)/sizeof(desSel[0]); i++)
+                ACE_knm_neuter(d, desSel[i], (IMP)ACE_knm_noop1);
+            ACE_knm_neuter(d, "isShuttingDown", (IMP)ACE_knm_noop0);
+        }
+    } @catch (NSException *e) { ACETrace(@"[knm] sweep异常: %@", e); }
+}
+static void ACE_knm_tick(void) {
+    ACE_knm_sweep();
+    dispatch_after(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), ^{ ACE_knm_tick(); });
+}
+
 // ═══ 屏幕悬浮按钮 ═══
 @interface ACELogWindow : UIWindow
 @end
@@ -4073,7 +4132,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
         @autoreleasepool {
             g_ace_busy = 1;
             g_main_th = mach_thread_self();   // v7.31
-            ACETrace(@"=== v8.01 启动（★v8.01: 代码偏移沿用v8.00; 46个数据槽按新构建实证重映射(ctx=0x3ff658, 分区移位-0x40/-0x3c/-4/-2, 0x3ee7b1等不变; K=1000.0硬编码); 行为最小化与菜单球机制沿用v7.95: 断点扫描器sub_53df8真值供血(v7.94分流规则原样)/区域冻结freezer全区扫描/全屏透传窗菜单球点按必切换(byte0/cfgPtr/hidden三直写+keeper自愈)）===");
+            ACETrace(@"=== v8.02 启动（★v8.02: v8.01数据槽重映射基础上, 新增knm检测器致盲(借鉴blue: _0x3F6A8E1C/_0x7F2B4A6E/_0xA5C3E8D1检测方法+_0x3A8D7F4C处决方法全部hook成返回0, 1s幂等巡检); 对ace与knm自身过检测逻辑零修改: 断点扫描器sub_53df8真值供血(v7.94分流规则原样)/区域冻结freezer全区扫描/全屏透传窗菜单球点按必切换(byte0/cfgPtr/hidden三直写+keeper自愈)）===");
             @try { ACE_report_last_crash(); } @catch (NSException *e) {}
             @try { ACE_install_crash_catcher(); } @catch (NSException *e) { ACETrace(@"崩溃捕捉器异常: %@", e); }
             @try { ACE_install_exc_server(); } @catch (NSException *e) { ACETrace(@"异常捕捉层异常: %@", e); }
@@ -4090,6 +4149,7 @@ static void ACE_addAct(id self, SEL _cmd, id action) {
             @try { ACE_install_tel_hooks(); } @catch (NSException *e) { ACETrace(@"[tel] 安装异常: %@", e); }
             g_ace_busy = 0;
             dispatch_after(dispatch_time(0, 1000000000), dispatch_get_main_queue(), ^{ ACE_setup_button(); });
+            ACE_knm_tick();   // v8.02
 // v7.44
             dispatch_after(dispatch_time(0, 8000000000LL), dispatch_get_main_queue(), ^{ ACE_post_sec_notif(0); });
             dispatch_after(dispatch_time(0, 9000000000LL), dispatch_get_main_queue(), ^{ ACE_build_panel_direct(0); });
