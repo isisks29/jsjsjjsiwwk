@@ -106,26 +106,90 @@ static BOOL CK_text_size_ok(const struct mach_header_64 *h) {
     return NO;
 }
 
+#import <dlfcn.h>
+
+static void CK_try_dlopen(void) {
+    // 目标安装名就是 /Library/1.dylib（LC_ID_DYLIB）；若注入器没把它带进进程，
+    // 我们自己拉进来。文件不存在时 dlopen 返回 NULL，无害。
+    static BOOL tried = NO;
+    if (tried) return;
+    tried = YES;
+    CKLog(@"镜像表未见目标，尝试 dlopen /Library/1.dylib");
+    void *h = dlopen("/Library/1.dylib", RTLD_NOW);
+    CKLog(@"dlopen 结果=%p err=%s", h, h ? "-" : (dlerror() ?: "?"));
+}
+
 static void CK_find_target(void) {
     if (g_tbase) return;
     uint32_t n = _dyld_image_count();
+    // 第一轮：只认 LC_UUID（决定性特征），不依赖文件名——
+    // 注入器可能把靶场改名成任意名字
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header_64 *h =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h || h->magic != MH_MAGIC_64) continue;
+        if (!CK_uuid_match(h)) continue;
+        if (!CK_text_size_ok(h)) {
+            CKLog(@"UUID 命中但 __TEXT 尺寸不符 #%u %s（跳过）", i,
+                  _dyld_get_image_name(i) ?: "?");
+            continue;
+        }
+        g_tbase = (uint8_t *)h;
+        CKLog(@"命中目标(UUID) #%u %s base=%p slide=%p",
+              i, _dyld_get_image_name(i) ?: "?", g_tbase,
+              (void *)_dyld_get_image_vmaddr_slide(i));
+        return;
+    }
+    // 第二轮：名字兜底（万一老师重编译过、UUID 变了）
     for (uint32_t i = 0; i < n; i++) {
         const char *nm = _dyld_get_image_name(i);
         if (!nm) continue;
         if (strstr(nm, "/usr/lib/") || strstr(nm, "/System/Library/") ||
-            strstr(nm, "/Developer/") || strstr(nm, "bypass")) continue;
+            strstr(nm, "/Developer/")) continue;
         const struct mach_header_64 *h =
             (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!h || h->magic != MH_MAGIC_64) continue;
         BOOL name_hit = (strstr(nm, "1.dylib") || strstr(nm, "Zhuanz") ||
                          strstr(nm, "第五课") || strstr(nm, "授权靶场"));
         if (!name_hit) continue;
-        if (!CK_text_size_ok(h) || !CK_uuid_match(h)) continue;
+        if (!CK_text_size_ok(h)) continue;
         g_tbase = (uint8_t *)h;
-        CKLog(@"命中目标 #%u %s base=%p slide=%p",
+        CKLog(@"命中目标(名字) #%u %s base=%p slide=%p",
               i, nm, g_tbase, (void *)_dyld_get_image_vmaddr_slide(i));
         return;
     }
+}
+
+
+// ═══ v9.02b 屏幕角标（无日志环境的状态回显）═══
+
+static UILabel *g_hud = nil;
+
+static void CK_hud(NSString *text, BOOL ok) {
+    dispatch_block_t work = ^{
+        UIWindow *kw = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow) { kw = w; break; }
+        }
+        if (!kw) kw = [UIApplication sharedApplication].windows.firstObject;
+        if (!kw) return;
+        if (!g_hud) {
+            g_hud = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, 320, 22)];
+            g_hud.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold];
+            g_hud.layer.zPosition = 9999;
+            g_hud.userInteractionEnabled = NO;
+            [kw addSubview:g_hud];
+        }
+        if (!g_hud.superview) [kw addSubview:g_hud];
+        g_hud.textColor = ok ? [UIColor colorWithRed:0.2 green:0.9 blue:0.4 alpha:1]
+                             : [UIColor colorWithRed:1 green:0.35 blue:0.3 alpha:1];
+        g_hud.text = text;
+        CGRect f = g_hud.frame;
+        f.origin.y = kw.safeAreaInsets.top + 2;
+        g_hud.frame = f;
+    };
+    if ([NSThread isMainThread]) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
 }
 
 // ═══ v9.02 授权状态强制 ═══
@@ -276,7 +340,12 @@ static void CK_watchdog(void) {
     g_ticks++;
     if (!g_tbase) {
         CK_find_target();
-        if (!g_tbase) return;
+        if (!g_tbase) {
+            if (g_ticks == 3) CK_try_dlopen();     // 第 3 拍仍没找到 → 自己拉
+            CK_hud([NSString stringWithFormat:@"bypass5: 找靶场中… t=%d", g_ticks], NO);
+            return;
+        }
+        CK_hud(@"bypass5: 靶场已定位，激活中…", NO);
         CKLog(@"看门狗内定位到目标，补跑激活序列");
         CK_decode_dialog_strings();
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -285,6 +354,7 @@ static void CK_watchdog(void) {
             CK_poke_state(YES);
             g_armed = YES;
             CK_install_ball();
+            CK_hud(@"bypass5: 已激活", YES);
         });
         return;
     }
@@ -299,6 +369,9 @@ static void CK_watchdog(void) {
               *(volatile uint32_t *)T(OFF_MAGIC_B),
               *(volatile uint8_t *)T(OFF_LIC_FLAG),
               bv, bv ? bv.superview : nil);
+        CK_hud([NSString stringWithFormat:@"bypass5: 已激活 球%@ t=%d",
+                (bv && bv.superview) ? @"在屏" : @"未上屏", g_ticks],
+               (bv && bv.superview) ? YES : NO);
     }
 }
 
@@ -327,6 +400,7 @@ static void CK_boot(void) {
                   *(volatile uint32_t *)T(OFF_MAGIC_A),
                   *(volatile uint8_t *)T(OFF_LIC_FLAG),
                   *(void * volatile *)T(OFF_BALL));
+            CK_hud(@"bypass5: 已激活", YES);
         });
     }
 
@@ -344,7 +418,7 @@ static void CK_boot(void) {
 
 __attribute__((constructor))
 static void CK5_main(void) {
-    CKLog(@"bypass5 加载 (第五课·强制激活+悬浮球) pid=%d", getpid());
+    CKLog(@"bypass5 v9.02 加载 (第五课·强制激活+悬浮球+HUD) pid=%d", getpid());
     CK_boot();
 }
 
