@@ -210,7 +210,7 @@ static void CK_poke_state(BOOL verbose) {
     *(volatile uint32_t *)T(OFF_MAGIC_A) = 0x7a31c9e5u;
     *(volatile uint32_t *)T(OFF_MAGIC_B) = 0xb4f27e13u;
     if (!g_keep_name) {
-        g_keep_name = [[NSString alloc] initWithFormat:@"已激活"];
+        g_keep_name = [[NSString alloc] initWithFormat:@"A"];   // 42pt 球面只装得下单字符，与原厂回退一致
         g_keep_card = [[NSString alloc] initWithFormat:@"CK5-LOCAL-0001"];
         g_keep_exp  = [[NSString alloc] initWithFormat:@"2099-12-31"];
         g_keep_dev  = [[NSString alloc] initWithFormat:@"local"];
@@ -332,6 +332,52 @@ static void CK_install_present_swizzle(void) {
     CKLog(@"present swizzle 完成");
 }
 
+
+// ═══ v9.03 TBPopup 页锁解除 ═══
+//  onSegChanged: 原生实现里 seg<4 时查 DAT_0021de00+seg*4 解锁位，
+//  未解锁强制 setSelectedSegmentIndex:4（用户所见：默认第5页、点其它页弹回）。
+//  解锁位写入方在被拆掉的激活桥里，永不置位。
+//  修法：runtime 级替换该方法为无门实现——不改靶场 .text。
+//  替换体只做原方法去掉门之后的事：_curPage=选中页 → rebuildPage → refreshState。
+
+static void (*g_orig_onSeg)(id, SEL, id) = NULL;
+static ptrdiff_t g_curPage_off = -1;
+
+static void CK_onSegChanged_nogate(id self, SEL _cmd, id sender) {
+    (void)_cmd;
+    if (g_curPage_off < 0) {
+        Ivar iv = class_getInstanceVariable(object_getClass(self), "_curPage");
+        if (iv) g_curPage_off = ivar_getOffset(iv);
+    }
+    NSInteger idx = 0;
+    if ([sender isKindOfClass:[UISegmentedControl class]]) {
+        idx = [(UISegmentedControl *)sender selectedSegmentIndex];
+    }
+    if (idx < 0) idx = 0;
+    if (idx > 4) idx = 4;
+    if (g_curPage_off >= 0) {
+        *(NSInteger *)((uint8_t *)(__bridge void *)self + g_curPage_off) = idx;
+    }
+    if (g_ticks % 10 == 1) CKLog(@"页切换 → %ld（无门）", (long)idx);
+    @try {
+        ((void (*)(id, SEL))objc_msgSend)(self, @selector(rebuildPage));
+        ((void (*)(id, SEL))objc_msgSend)(self, @selector(refreshState));
+    } @catch (NSException *e) {
+        CKLog(@"页重建异常: %@", e);
+    }
+}
+
+static void CK_unlock_tabs(void) {
+    Class cls = objc_getClass("TBPopup");
+    if (!cls) { CKLog(@"TBPopup 类未注册，页锁解除跳过"); return; }
+    SEL sel = @selector(onSegChanged:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { CKLog(@"onSegChanged: 未找到"); return; }
+    g_orig_onSeg = (void (*)(id, SEL, id))method_getImplementation(m);
+    method_setImplementation(m, (IMP)CK_onSegChanged_nogate);
+    CKLog(@"TBPopup 页锁已解除 (原 IMP=%p)", (void *)g_orig_onSeg);
+}
+
 // ═══ v9.05 看门狗与启动序列 ═══
 
 static dispatch_source_t g_timer = nil;
@@ -352,6 +398,7 @@ static void CK_watchdog(void) {
             CK_poke_state(YES);
             CK_run_session_and_enable();
             CK_poke_state(YES);
+            CK_unlock_tabs();
             g_armed = YES;
             CK_install_ball();
             CK_hud(@"bypass5: 已激活", YES);
@@ -394,6 +441,7 @@ static void CK_boot(void) {
             CK_poke_state(YES);
             CK_run_session_and_enable();
             CK_poke_state(YES);
+            CK_unlock_tabs();
             g_armed = YES;
             CK_install_ball();
             CKLog(@"首拍激活序列完成: magic=%08x flag=%u ball=%p",
@@ -418,7 +466,7 @@ static void CK_boot(void) {
 
 __attribute__((constructor))
 static void CK5_main(void) {
-    CKLog(@"bypass5 v9.02 加载 (第五课·强制激活+悬浮球+HUD) pid=%d", getpid());
+    CKLog(@"bypass5 v9.03 加载 (第五课·激活+悬浮球+页锁解除) pid=%d", getpid());
     CK_boot();
 }
 
