@@ -368,7 +368,7 @@ static NSString *CK6_status_line(void) {
     UIView *v = g.view;
     CGPoint p = [g translationInView:v.superview];
     v.center = CGPointMake(v.center.x + p.x, v.center.y + p.y);
-    [g setTranslation:CGPointZero inView:v.superview];
+    [g setTranslation:CGPointMake(0, 0) inView:v.superview];   // 不用 CGPointZero：避免依赖 CoreGraphics 常量符号（工作流未链 CG）
 }
 @end
 
