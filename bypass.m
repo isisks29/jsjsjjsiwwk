@@ -1,481 +1,454 @@
 // ═══════════════════════════════════════════════════════════════════
-//  bypass5.m — 第五课授权靶场 (Zhuanz-第五课-授权靶场.dylib) 激活 + 悬浮球
+//  bypass6.m — 第六课靶场 PitchKit.app (VocalPal 2.2.5) 会员解锁
 //
-//  路线：本地强制"已验证会话"状态 + 直调仍完整的悬浮球安装器 + 卡密弹窗拦截
-//  依据（全部来自 Ghidra 导出 + 反汇编逐条确认）：
-//    · 会话魔数   [base+0x13e8748]=0x7a31c9e5  [base+0x13e874c]=0xb4f27e13
-//                 (FUN_0014bc8c 验证成功后写入；安装器 FUN_001514c0 开头 ldar 比对)
-//    · 激活旗标   [base+0x13a2720] 字节 (安装器 ldrb+tbz #0；封印解析成功也置 1)
-//    · 授权字段   0x13a2750/2758/2760/2768 = NSString*4 (悬浮球标题/面板头显示)
-//                 0x13a2770/2778 = int64 (解析要求非 0，无其它消费者)
-//    · 悬浮球视图 0x13a2728 (UIButton*)  重试计数 0x13a2790 (int64, <0x1e)
-//    · 安装器     FUN_001514c0：主线程直调；自带 keyWindow 重试 30×0.4s；
-//                 已有 superview 时幂等早退。所有原生调用点(Ra_x1nY_Install/
-//                 _JH_OnLicenseChange/00152ab4/00152b3c/001574f4)均为 68B 空壳，
-//                 故必须由我们代调 —— 这正是"真激活也不出球"的原因。
-//    · 密钥派生   FUN_0014bc8c(NSData≥32B) 惰性 dlsym CC 符号→HMAC 派生会话密钥
-//                 →置魔数；FUN_0014618c(NSData≥32B) 派生功能密钥并打印
-//                 "tweak bypass enabled after license verification"。
-//                 我们喂一份自造 32B proof，派生全走目标自己的逻辑。
-//    · 卡密弹窗   FUN_0013ca64：UIAlertController+1输入框，经 presentViewController:
-//                 呈现；标题串由 FUN_0013ddfc 运行时解码到 0x25eebc(≤19B)。
-//                 swizzle present 精确按标题拦截；兜底：启动 3 分钟内带输入框
-//                 的 alert 且我方已激活时一并拦下。
-//    · 反制维持   FUN_00150cc8(远程 kill 路径)会清旗标/字段/魔数 → 2s 看门狗重申。
-//    · 目标识别   文件名 1.dylib/Zhuanz/第五课/授权靶场 + __TEXT vmsize==0x23c000
-//                 + LC_UUID 90229b4c-… 三重校验，防误伤其它注入镜像。
+//  目标识别：主可执行文件 PitchKit，LC_UUID d2ca6d1918b733b9a979e4020def2303
+//            Bundle ID com.leleyes.PitchAnalyzers，4,795,216 B
+//            MD5(ipa 内主二进制所在包) 3a3325bd9375f606cac2a0799c08c022
 //
-//  不修改目标 .text；只写 .data/.bss 状态位——与验证成功路径写入的是同一批全局。
+//  ── 会员机制全景（全部来自 Ghidra 导出 + 原始二进制逐字节互证）──
+//  · 纯 Swift + UIKit。业务核心 AccountManager（登录态）/ PurchaseManager
+//    （StoreKit 三商品 pro_half_year / pro_one_year / pro_forever @0x1003b7000
+//    Swift small-string 数组）/ RecordManager / StateEntityManager。
+//  · 服务器 api.leleyes.com：/api/auth/login、/api/auth/check-status、
+//    /api/apple/pay/index、/api/apple/restore、/api/auth/sms-code 等。
+//    响应信封 DataResponse{code,message,result:String?}，result 为
+//    base64(AES-256-CBC) 密文，KEY/IV 硬编码明文在二进制里：
+//      KEY "Njc8uIR3HzhoUPegDxtqJLOpVXAWrv6Q" @0x1002e72b0
+//      IV  "2gSmRTMbuKQ8wGo6"                  @0x1002e72e0
+//    解密变换 FUN_100084ff0 / FUN_100084e28，解密后 JSONDecoder 直接解码，
+//    无任何签名/MAC 校验。
+//  · 模型（__swift5_fieldmd 字段描述符还原）：
+//      LoginDataResponse { uid:Int, is_vip:Int?, vip_type:Int?,
+//                          vip_expired_at:Int?, token:String, is_new_user:Bool }
+//      CheckStatusResponse { uid:Int, is_vip:Int, vip_type:Int, vip_expired_at:Int? }
+//  · 会员判定唯一语义点 updateVipValidity = FUN_100085e44：
+//      isVipValid = (is_vip==1) && (vip_type==2 /*永久*/ || vip_expired_at>now)
+//  · 本地持久化 FUN_100086048：整个 LoginDataResponse JSONEncoder 编码后
+//    **明文**存 UserDefaults["loginDataKey"]（无加密无签名）；nil 时删键。
+//    启动恢复 FUN_100085758（HomeVC.viewDidLoad @0x100021080 调用）：
+//    dataForKey → JSONDecoder(LoginDataResponse) → Published 写入 →
+//    updateVipValidity。JSONDecoder 为默认配置（FUN_10008b884 仅取
+//    Decodable witness table，未设 keyDecodingStrategy）→ 键名=字段名。
+//  · 自动游客登录 FUN_100086314 仅当 loginDataResponse==nil 时触发
+//    → 预置伪造缓存即完全抑制。
+//  · ★ 功能门全部读同一个 UserDefaults 布尔键 "isVipValid"（boolForKey:），
+//    共 9 个读取点（按 movz#0x7369/movk 指令签名全量扫描，证明无遗漏）：
+//      0x1000557c4 FUN_100055708  录音启动门（非会员且 maxRecordTime≤20 拒录）
+//      0x10005634c FUN_100056168  录音计时门（20 秒强制截断+bugMember 弹窗）
+//      0x100035910 FUN_10003588c  VocaliseTips/底栏切换区
+//      0x100036338 FUN_100036244  HomeBottomSwichView 区
+//      0x10004d4c8+0x10004d714 FUN_10004d31c 练声曲目 cell 显示
+//      0x10004eec4 FUN_10004ee7c  HomePianoView 钢琴面板区
+//      0x1000535a0 FUN_100053558  HomeTonoView 主视图区
+//      0x10008f144 FUN_10008f080  登录/账号 UI 区
+//      0x100090e6c FUN_100090de4  VocaliseVC 滑动操作区
+//    该键唯一写入点 = 侧边栏 isVipValid 的 Combine sink FUN_1000b9928
+//    （setObject:forKey: objc_msgSend @0x1000b9b60）。
+//  · 内存态 isVipValid 为 AccountManager 的 @Published<Bool>（ivar cell
+//    0x1003c95f8），写入走 keypath 描述符对 (0x10030fee8,0x10030ff10)：
+//      判定写: FUN_100085e44 (updateVipValidity)
+//      清零写: FUN_100088140(无token)/FUN_100088530(check-status失败尾)
+//              /FUN_100088cf0(restore失败尾)/FUN_100089634(登出)
+//  · 本 App 无任何反调试/反注入/完整性自检（无 sysctl、无越狱探测、
+//    无黑名单、无心跳杀）。
+//
+//  ── 攻击设计（四层，全部运行时生效，不改磁盘文件）──
+//  A  构造期预置 UserDefaults：isVipValid=true + loginDataKey=伪造 VIP 缓存
+//     {uid,is_vip:1,vip_type:2(永久),vip_expired_at:null,token,is_new_user}
+//     → 启动恢复链原生算出 isVipValid=true；游客自动登录被抑制。
+//  B  swizzle -[NSUserDefaults boolForKey:]：键 "isVipValid" 恒 YES
+//     → 9 个功能门无论谁写过什么，读到永远 true（写入方全部失效化）。
+//  C  运行时内存补丁 13 点（仅 LC_UUID 精确匹配 + 每点原字节逐位校验通过
+//     才写；任一校验失败自动整体降级为 A+B+D，功能门不受影响）：
+//     C1×3 check-status 失败尾清零（0x1000886f4/0x100088734/0x10008873c→NOP）
+//          → 服务器拒绝伪造 token 时不再清内存态、不再删本地缓存
+//     C2×3 restore 失败尾清零（0x100088dac/0x100088df0/0x100088df4→NOP）
+//     C3×7 updateVipValidity 全部判定分支重定向到 true 路径（0x100085f6c）
+//          → 任何服务器响应（含真实免费账号）都判为有效会员
+//  D  2s 看门狗：维持两个键（blob 合并式强制，保留真实 uid/token）、
+//     swizzle 完整性自愈、HUD 状态。
+//
+//  兼容性：真实购买/真实登录不冲突——C3 只把判定抬成 true；A/D 的 blob
+//  合并保留服务器真 token，check-status 用真 token 成功时走原生更新。
+//  已知边界：用户主动「登出/注销」会清内存态（显式用户行为，不拦）；
+//  下次启动 A 层立即恢复 VIP。侧边栏 VIP 徽章由 C3 的 Published send
+//  原生点亮（sink 链完整，UI 自动刷新）。
 // ═══════════════════════════════════════════════════════════════════
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach/mach.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <CommonCrypto/CommonDigest.h>
-#import <unistd.h>
+#import <dlfcn.h>
+#import <libkern/OSCacheControl.h>
 
-// ═══ v9.01 目标定位 ═══
+#define CK6_BUNDLE_ID   @"com.leleyes.PitchAnalyzers"
+#define CK6_UUID_HEX    @"d2ca6d1918b733b9a979e4020def2303"
+#define CK6_UD_VIPKEY   @"isVipValid"
+#define CK6_UD_BLOBKEY  @"loginDataKey"
 
-static uint8_t *g_tbase = NULL;          // 目标 dylib 运行时基址
-static BOOL     g_armed  = NO;           // 首拍激活序列已完成
-static BOOL     g_booted = NO;           // CK_boot 只完整跑一次
-static BOOL     g_swizzled = NO;         // present swizzle 只装一次
-static int      g_ticks  = 0;            // 看门狗拍数
-
-#define T(off) ((void *)(g_tbase + (off)))
-
-// 关键偏移（Ghidra 静态地址，__TEXT vmaddr=0，运行时 = base + off）
-static const uint64_t OFF_MAGIC_A   = 0x13e8748;   // uint32 0x7a31c9e5
-static const uint64_t OFF_MAGIC_B   = 0x13e874c;   // uint32 0xb4f27e13
-static const uint64_t OFF_LIC_FLAG  = 0x13a2720;   // uint8  激活旗标
-static const uint64_t OFF_F_NAME    = 0x13a2750;   // NSString* 悬浮球标题
-static const uint64_t OFF_F_CARD    = 0x13a2758;   // NSString*
-static const uint64_t OFF_F_EXPSTR  = 0x13a2760;   // NSString* 面板到期显示
-static const uint64_t OFF_F_DEV     = 0x13a2768;   // NSString*
-static const uint64_t OFF_F_NUM1    = 0x13a2770;   // int64
-static const uint64_t OFF_F_NUM2    = 0x13a2778;   // int64
-static const uint64_t OFF_BALL      = 0x13a2728;   // UIButton* 悬浮球
-static const uint64_t OFF_RETRY     = 0x13a2790;   // int64 keyWindow 重试计数
-
-static const uint64_t OFF_FN_INSTALLER = 0x1514c0; // FUN_001514c0 装球
-static const uint64_t OFF_FN_SESSION   = 0x14bc8c; // FUN_0014bc8c 会话密钥+魔数
-static const uint64_t OFF_FN_ENABLE    = 0x14618c; // FUN_0014618c 功能密钥派生
-static const uint64_t OFF_FN_DLG_TITLE = 0x13ddfc; // FUN_0013ddfc 标题串解码器
-static const uint64_t OFF_FN_DLG_BTN   = 0x13df48; // FUN_0013df48 按钮串解码器
-static const uint64_t OFF_STR_DLG_TITLE= 0x25eebc; // 解码后 char[19]
-static const uint64_t OFF_STR_DLG_BTN  = 0x25ed2d; // 解码后 char[13]
-
-typedef void (*fn_void_t)(void);
-typedef void (*fn_data_t)(void *);
+static const mach_header_64 *g_mh = NULL;      // PitchKit 主二进制头
+static intptr_t g_slide = 0;                    // 运行时滑移
+static BOOL g_uuid_match = NO;
+static int  g_patch_ok = 0, g_patch_total = 0, g_patch_skip = 0;
+static BOOL g_swizzle_ok = NO;
+static UILabel *g_hud = NULL;
+static int g_tick = 0;
 
 static void CKLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSLog(@"[ck5] %@", s);
+    NSLog(@"[bypass6] %@", s);
 }
 
-// LC_UUID 前 4 字节 90229b4c（README: 90229b4c-2096-39c2-b3bc-1aa1d505ccc6）
-static BOOL CK_uuid_match(const struct mach_header_64 *h) {
-    const uint8_t *p = (const uint8_t *)h + sizeof(*h);
-    for (uint32_t i = 0; i < h->ncmds; i++) {
+// ───────────────────────── 目标识别 ─────────────────────────
+static NSString *CK6_uuid_of(const mach_header_64 *mh) {
+    const uint8_t *p = (const uint8_t *)mh + sizeof(mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)p;
         if (lc->cmd == LC_UUID) {
-            const struct uuid_command *uc = (const struct uuid_command *)lc;
-            return uc->uuid[0] == 0x90 && uc->uuid[1] == 0x22 &&
-                   uc->uuid[2] == 0x9b && uc->uuid[3] == 0x4c;
+            const uint8_t *u = p + sizeof(struct uuid_command);
+            NSMutableString *s = [NSMutableString string];
+            for (int k = 0; k < 16; k++) [s appendFormat:@"%02x", u[k]];
+            return s;
         }
         p += lc->cmdsize;
     }
-    return NO;
+    return @"";
 }
 
-static BOOL CK_text_size_ok(const struct mach_header_64 *h) {
-    const uint8_t *p = (const uint8_t *)h + sizeof(*h);
-    for (uint32_t i = 0; i < h->ncmds; i++) {
-        const struct load_command *lc = (const struct load_command *)p;
-        if (lc->cmd == LC_SEGMENT_64 &&
-            strncmp(((const struct segment_command_64 *)lc)->segname, "__TEXT", 16) == 0) {
-            return ((const struct segment_command_64 *)lc)->vmsize == 0x23c000;
-        }
-        p += lc->cmdsize;
-    }
-    return NO;
-}
-
-#import <dlfcn.h>
-
-static void CK_try_dlopen(void) {
-    // 目标安装名就是 /Library/1.dylib（LC_ID_DYLIB）；若注入器没把它带进进程，
-    // 我们自己拉进来。文件不存在时 dlopen 返回 NULL，无害。
-    static BOOL tried = NO;
-    if (tried) return;
-    tried = YES;
-    CKLog(@"镜像表未见目标，尝试 dlopen /Library/1.dylib");
-    void *h = dlopen("/Library/1.dylib", RTLD_NOW);
-    CKLog(@"dlopen 结果=%p err=%s", h, h ? "-" : (dlerror() ?: "?"));
-}
-
-static void CK_find_target(void) {
-    if (g_tbase) return;
-    uint32_t n = _dyld_image_count();
-    // 第一轮：只认 LC_UUID（决定性特征），不依赖文件名——
-    // 注入器可能把靶场改名成任意名字
-    for (uint32_t i = 0; i < n; i++) {
-        const struct mach_header_64 *h =
-            (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!h || h->magic != MH_MAGIC_64) continue;
-        if (!CK_uuid_match(h)) continue;
-        if (!CK_text_size_ok(h)) {
-            CKLog(@"UUID 命中但 __TEXT 尺寸不符 #%u %s（跳过）", i,
-                  _dyld_get_image_name(i) ?: "?");
-            continue;
-        }
-        g_tbase = (uint8_t *)h;
-        CKLog(@"命中目标(UUID) #%u %s base=%p slide=%p",
-              i, _dyld_get_image_name(i) ?: "?", g_tbase,
-              (void *)_dyld_get_image_vmaddr_slide(i));
-        return;
-    }
-    // 第二轮：名字兜底（万一老师重编译过、UUID 变了）
-    for (uint32_t i = 0; i < n; i++) {
+static void CK6_locate_target(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *nm = _dyld_get_image_name(i);
         if (!nm) continue;
-        if (strstr(nm, "/usr/lib/") || strstr(nm, "/System/Library/") ||
-            strstr(nm, "/Developer/")) continue;
-        const struct mach_header_64 *h =
-            (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!h || h->magic != MH_MAGIC_64) continue;
-        BOOL name_hit = (strstr(nm, "1.dylib") || strstr(nm, "Zhuanz") ||
-                         strstr(nm, "第五课") || strstr(nm, "授权靶场"));
-        if (!name_hit) continue;
-        if (!CK_text_size_ok(h)) continue;
-        g_tbase = (uint8_t *)h;
-        CKLog(@"命中目标(名字) #%u %s base=%p slide=%p",
-              i, nm, g_tbase, (void *)_dyld_get_image_vmaddr_slide(i));
+        NSString *path = [NSString stringWithUTF8String:nm];
+        if (![path.lastPathComponent isEqualToString:@"PitchKit"]) continue;
+        const mach_header_64 *mh = (const mach_header_64 *)_dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64 || mh->filetype != MH_EXECUTE) continue;
+        g_mh = mh;
+        g_slide = (intptr_t)mh - 0x100000000;
+        NSString *uuid = CK6_uuid_of(mh);
+        g_uuid_match = [uuid isEqualToString:CK6_UUID_HEX];
+        CKLog(@"命中主二进制 %s base=%p slide=0x%lx", nm, mh, (long)g_slide);
+        CKLog(@"LC_UUID=%@ 匹配=%@ (期望 %@)", uuid, g_uuid_match ? @"YES" : @"NO", CK6_UUID_HEX);
         return;
     }
-}
-
-
-// ═══ v9.02b 屏幕角标（无日志环境的状态回显）═══
-
-static UILabel *g_hud = nil;
-
-static void CK_hud(NSString *text, BOOL ok) {
-    dispatch_block_t work = ^{
-        UIWindow *kw = nil;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.isKeyWindow) { kw = w; break; }
-        }
-        if (!kw) kw = [UIApplication sharedApplication].windows.firstObject;
-        if (!kw) return;
-        if (!g_hud) {
-            g_hud = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, 320, 22)];
-            g_hud.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold];
-            g_hud.layer.zPosition = 9999;
-            g_hud.userInteractionEnabled = NO;
-            [kw addSubview:g_hud];
-        }
-        if (!g_hud.superview) [kw addSubview:g_hud];
-        g_hud.textColor = ok ? [UIColor colorWithRed:0.2 green:0.9 blue:0.4 alpha:1]
-                             : [UIColor colorWithRed:1 green:0.35 blue:0.3 alpha:1];
-        g_hud.text = text;
-        CGRect f = g_hud.frame;
-        f.origin.y = kw.safeAreaInsets.top + 2;
-        g_hud.frame = f;
-    };
-    if ([NSThread isMainThread]) work();
-    else dispatch_async(dispatch_get_main_queue(), work);
-}
-
-// ═══ v9.02 授权状态强制 ═══
-
-static NSString *g_keep_name = nil, *g_keep_card = nil,
-                *g_keep_exp  = nil, *g_keep_dev  = nil;
-static NSData   *g_proof = nil;
-
-static void CK_make_proof(void) {
-    if (g_proof) return;
-    const char *seed = "CK5-ZHUANZ-LOCAL-ACTIVATION-PROOF";
-    unsigned char md[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(seed, (CC_LONG)strlen(seed), md);
-    g_proof = [[NSData alloc] initWithBytes:md length:32];
-}
-
-static void CK_poke_state(BOOL verbose) {
-    *(volatile uint32_t *)T(OFF_MAGIC_A) = 0x7a31c9e5u;
-    *(volatile uint32_t *)T(OFF_MAGIC_B) = 0xb4f27e13u;
-    if (!g_keep_name) {
-        g_keep_name = [[NSString alloc] initWithFormat:@"A"];   // 42pt 球面只装得下单字符，与原厂回退一致
-        g_keep_card = [[NSString alloc] initWithFormat:@"CK5-LOCAL-0001"];
-        g_keep_exp  = [[NSString alloc] initWithFormat:@"2099-12-31"];
-        g_keep_dev  = [[NSString alloc] initWithFormat:@"local"];
-    }
-    *(void * volatile *)T(OFF_F_NAME)   = (__bridge void *)g_keep_name;
-    *(void * volatile *)T(OFF_F_CARD)   = (__bridge void *)g_keep_card;
-    *(void * volatile *)T(OFF_F_EXPSTR) = (__bridge void *)g_keep_exp;
-    *(void * volatile *)T(OFF_F_DEV)    = (__bridge void *)g_keep_dev;
-    *(volatile int64_t *)T(OFF_F_NUM1)  = 0x7fffffffffffffffLL;
-    *(volatile int64_t *)T(OFF_F_NUM2)  = 0x2710;
-    *(volatile uint8_t *)T(OFF_LIC_FLAG) = 1;   // 旗标最后写
-    if (verbose) {
-        CKLog(@"状态写入: magic=%08x/%08x flag=%u",
-              *(volatile uint32_t *)T(OFF_MAGIC_A),
-              *(volatile uint32_t *)T(OFF_MAGIC_B),
-              *(volatile uint8_t *)T(OFF_LIC_FLAG));
+    // 名字兜底：主可执行文件 + bundle id 校验
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    if ([bid isEqualToString:CK6_BUNDLE_ID]) {
+        const mach_header_64 *mh = (const mach_header_64 *)_dyld_get_image_header(0);
+        g_mh = mh;
+        g_slide = (intptr_t)mh - 0x100000000;
+        g_uuid_match = [CK6_uuid_of(mh) isEqualToString:CK6_UUID_HEX];
+        CKLog(@"按 bundle id 命中主二进制 base=%p uuid匹配=%d", mh, g_uuid_match);
     }
 }
 
-// bc8c/enable 各只喂一次（内部会调度 dispatch_after 链，重复调用会叠闹钟）
-static BOOL g_session_done = NO, g_enable_done = NO;
+static void *T(uint32_t off) {   // off = 静态 vmaddr - 0x100000000
+    return (void *)((uintptr_t)g_mh + off);
+}
 
-static void CK_run_session_and_enable(void) {
-    CK_make_proof();
-    if (!g_session_done) {
-        g_session_done = YES;
-        fn_data_t f = (fn_data_t)T(OFF_FN_SESSION);
-        CKLog(@"调用会话派生 %p (proof %luB)", f, (unsigned long)g_proof.length);
-        f((__bridge void *)g_proof);
-        if (*(volatile uint32_t *)T(OFF_MAGIC_A) != 0x7a31c9e5u) {
-            CKLog(@"会话派生未置魔数，直接写魔数兜底");
-            *(volatile uint32_t *)T(OFF_MAGIC_A) = 0x7a31c9e5u;
-            *(volatile uint32_t *)T(OFF_MAGIC_B) = 0xb4f27e13u;
+// ───────────────────────── C 层：内存补丁 ─────────────────────────
+typedef struct { uint32_t off; uint32_t expect; uint32_t patch; const char *what; } CK6Patch;
+
+// true 路径 = 0x100085f6c（getKeyPath(isVipValid) + mov w8,#1 + sturb + setter）
+static const CK6Patch kPatches[] = {
+    // C1: check-status 失败尾（FUN_100088530 @0x100088530）清零三连
+    {0x886f4, 0x94095f53, 0xd503201f, "C1a checkStatus失败尾·loginDataResponse=nil setter→NOP"},
+    {0x88734, 0x94095f43, 0xd503201f, "C1b checkStatus失败尾·isVipValid=false setter→NOP"},
+    {0x8873c, 0x97fff643, 0xd503201f, "C1c checkStatus失败尾·persist(删loginDataKey)→NOP"},
+    // C2: restore 失败尾（FUN_100088cf0）清零三连
+    {0x88dac, 0x94095da5, 0xd503201f, "C2a restore失败尾·loginDataResponse=nil setter→NOP"},
+    {0x88df0, 0x94095d94, 0xd503201f, "C2b restore失败尾·isVipValid=false setter→NOP"},
+    {0x88df4, 0x97fff495, 0xd503201f, "C2c restore失败尾·persist→NOP"},
+    // C3: updateVipValidity（FUN_100085e44）判定分支全部改道 true 路径
+    {0x85f18, 0xb4000888, 0x14000015, "C3-1 VIP判定·nil缓存早退→true"},
+    {0x85f54, 0x370004b7, 0x14000006, "C3-2 VIP判定·is_vip缺失→true"},
+    {0x85f5c, 0x54000461, 0x14000004, "C3-3 VIP判定·is_vip≠1→true"},
+    {0x85f60, 0x370001db, 0x14000003, "C3-4 VIP判定·vip_type缺失→true"},
+    {0x85f68, 0x54000181, 0x14000001, "C3-5 VIP判定·vip_type≠2→true"},
+    {0x85f98, 0x37000298, 0x17fffff5, "C3-6 VIP判定·到期时间缺失→true"},
+    {0x85fe4, 0x3707fc57, 0x17ffffe2, "C3-7 VIP判定·已过期→true"},
+};
+
+static BOOL CK6_write_word(void *addr, uint32_t val) {
+    vm_address_t page = (vm_address_t)addr & ~(vm_address_t)(vm_page_size - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size * 2,
+                                  FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS)
+        kr = vm_protect(mach_task_self(), page, vm_page_size * 2,
+                        TRUE, VM_PROT_READ | VM_PROT_WRITE);   // set-maximum 再试
+    if (kr != KERN_SUCCESS) {
+        CKLog(@"vm_protect RW 失败 @%p kr=%d", addr, kr);
+        return NO;
+    }
+    *(volatile uint32_t *)addr = val;
+    vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_EXEC);
+    sys_icache_invalidate(addr, 4);
+    return (*(volatile uint32_t *)addr) == val;
+}
+
+static void CK6_apply_patches(void) {
+    g_patch_total = (int)(sizeof(kPatches) / sizeof(kPatches[0]));
+    if (!g_uuid_match) {
+        CKLog(@"⚠️ UUID 不匹配（可能换了构建）——跳过全部代码补丁，A/B/D 层照常生效");
+        g_patch_skip = g_patch_total;
+        return;
+    }
+    for (int i = 0; i < g_patch_total; i++) {
+        const CK6Patch *p = &kPatches[i];
+        volatile uint32_t *site = (volatile uint32_t *)T(p->off);
+        uint32_t cur = *site;
+        if (cur == p->patch) { g_patch_ok++; continue; }        // 幂等
+        if (cur != p->expect) {
+            CKLog(@"✗ %s 原字节不符: 0x%08x ≠ 期望 0x%08x → 跳过该点", p->what, cur, p->expect);
+            g_patch_skip++;
+            continue;
+        }
+        if (CK6_write_word((void *)site, p->patch)) {
+            g_patch_ok++;
+            CKLog(@"✓ %s @0x%lx: %08x→%08x", p->what, (unsigned long)(0x100000000 + p->off), cur, p->patch);
+        } else {
+            g_patch_skip++;
+            CKLog(@"✗ %s 写入失败", p->what);
         }
     }
-    if (!g_enable_done) {
-        g_enable_done = YES;
-        fn_data_t f = (fn_data_t)T(OFF_FN_ENABLE);
-        CKLog(@"调用功能密钥派生 %p", f);
-        f((__bridge void *)g_proof);
+    CKLog(@"补丁结果: %d/%d 生效, %d 跳过", g_patch_ok, g_patch_total, g_patch_skip);
+}
+
+// ───────────────────────── B 层：boolForKey: swizzle ─────────────────────────
+typedef BOOL (*CK6_bool_imp)(id, SEL, NSString *);
+static CK6_bool_imp g_orig_boolForKey = NULL;
+static Method g_boolMethod = NULL;
+
+static BOOL CK6_boolForKey(id self, SEL _cmd, NSString *key) {
+    if ([key isKindOfClass:[NSString class]] && [key isEqualToString:CK6_UD_VIPKEY])
+        return YES;
+    return g_orig_boolForKey(self, _cmd, key);
+}
+
+static void CK6_install_swizzle(void) {
+    Class cls = [NSUserDefaults class];
+    g_boolMethod = class_getInstanceMethod(cls, @selector(boolForKey:));
+    if (!g_boolMethod) { CKLog(@"✗ boolForKey: 方法未找到"); return; }
+    g_orig_boolForKey = (CK6_bool_imp)method_getImplementation(g_boolMethod);
+    if (g_orig_boolForKey == (CK6_bool_imp)CK6_boolForKey) { g_swizzle_ok = YES; return; }
+    method_setImplementation(g_boolMethod, (IMP)CK6_boolForKey);
+    g_swizzle_ok = (method_getImplementation(g_boolMethod) == (IMP)CK6_boolForKey);
+    CKLog(@"B层 boolForKey: swizzle %@ (原IMP=%p)", g_swizzle_ok ? @"✓" : @"✗", g_orig_boolForKey);
+}
+
+static void CK6_check_swizzle(void) {   // 看门狗自愈
+    if (!g_boolMethod) { CK6_install_swizzle(); return; }
+    IMP cur = method_getImplementation(g_boolMethod);
+    if (cur != (IMP)CK6_boolForKey && g_orig_boolForKey != (CK6_bool_imp)cur) {
+        CKLog(@"swizzle 被覆盖(%p)，重新接管并保留链", cur);
+        g_orig_boolForKey = (CK6_bool_imp)cur;
+        method_setImplementation(g_boolMethod, (IMP)CK6_boolForKey);
+    } else if (cur != (IMP)CK6_boolForKey) {
+        method_setImplementation(g_boolMethod, (IMP)CK6_boolForKey);
     }
 }
 
-// ═══ v9.03 悬浮球安装器直调 ═══
-
-static void CK_install_ball(void) {
-    if (!g_tbase) return;
-    void *ball = *(void * volatile *)T(OFF_BALL);
-    UIView *bv = (__bridge UIView *)ball;
-    if (bv && bv.superview) return;                 // 已上屏，幂等
-    if (!bv) *(volatile int64_t *)T(OFF_RETRY) = 0; // 内部重试计数复位
-    fn_void_t inst = (fn_void_t)T(OFF_FN_INSTALLER);
-    CKLog(@"直调安装器 %p (ball=%p)", inst, ball);
-    inst();
+// ───────────────────────── A/D 层：UserDefaults 伪造与维持 ─────────────────────────
+static NSString *CK6_token(void) {
+    static NSString *t = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *raw = [[NSUUID UUID].UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""];
+        t = [NSString stringWithFormat:@"CK6LOCAL%@", [raw substringToIndex:16]];
+    });
+    return t;
 }
 
-// ═══ v9.04 卡密弹窗拦截 ═══
-
-static char g_dlg_title[24] = {0};
-static BOOL g_dlg_title_ok = NO;
-
-static void CK_decode_dialog_strings(void) {
-    if (g_dlg_title_ok || !g_tbase) return;
-    // 解码器幂等（内部一次性旗标 0x25eecf/0x25ed3a），可安全代调
-    ((fn_void_t)T(OFF_FN_DLG_TITLE))();
-    ((fn_void_t)T(OFF_FN_DLG_BTN))();
-    const char *t = (const char *)T(OFF_STR_DLG_TITLE);
-    const char *b = (const char *)T(OFF_STR_DLG_BTN);
-    size_t n = strnlen(t, 19);          // 缓冲区共 19B，含结尾 NUL
-    if (n == 0 || n > 18) { CKLog(@"弹窗标题解码异常 n=%zu", n); return; }
-    memcpy(g_dlg_title, t, n);
-    g_dlg_title[n] = 0;
-    g_dlg_title_ok = YES;
-    CKLog(@"卡密弹窗标题已解码: 「%s」按钮「%.*s」",
-          g_dlg_title, (int)strnlen(b, 13), b ? b : "?");
-}
-
-static void (*g_orig_present)(id, SEL, id, BOOL, void (^)(void));
-
-static BOOL CK_is_card_dialog(id vc) {
-    if (![vc isKindOfClass:[UIAlertController class]]) return NO;
-    UIAlertController *a = (UIAlertController *)vc;
-    if (g_dlg_title_ok && a.title) {
-        NSString *t = [[NSString alloc] initWithUTF8String:g_dlg_title];
-        if (t && [a.title isEqualToString:t]) return YES;
+// 合并式强制：保留已有 uid/token（真实登录过则用真 token），只抬 VIP 字段
+static BOOL CK6_enforce_blob(NSUserDefaults *ud) {
+    NSMutableDictionary *blob = nil;
+    NSData *d = [ud dataForKey:CK6_UD_BLOBKEY];
+    if (d) {
+        id j = [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers error:NULL];
+        if ([j isKindOfClass:[NSDictionary class]]) blob = [j mutableCopy];
     }
-    // 兜底：启动 3 分钟内、我方已激活、带输入框的 alert → 视为卡密弹窗拦下
-    if (g_armed && g_ticks < 90) {
-        @try {
-            NSArray *tfs = [a valueForKey:@"textFields"];
-            if (tfs.count > 0) {
-                CKLog(@"兜底拦截带输入框弹窗: 「%@」", a.title ?: @"(无题)");
-                return YES;
-            }
-        } @catch (NSException *e) {}
+    BOOL fresh = (blob == nil);
+    if (fresh) blob = [NSMutableDictionary dictionary];
+    BOOL dirty = fresh;
+    if (![blob[@"is_vip"] isEqual:@1])            { blob[@"is_vip"] = @1; dirty = YES; }
+    if (![blob[@"vip_type"] isEqual:@2])          { blob[@"vip_type"] = @2; dirty = YES; }
+    id exp = blob[@"vip_expired_at"];
+    if (exp && exp != [NSNull null])              { blob[@"vip_expired_at"] = [NSNull null]; dirty = YES; }
+    else if (!exp)                                { blob[@"vip_expired_at"] = [NSNull null]; dirty = YES; }
+    if (!blob[@"uid"])                            { blob[@"uid"] = @(88888888); dirty = YES; }
+    id tk = blob[@"token"];
+    if (![tk isKindOfClass:[NSString class]] || [(NSString *)tk length] < 8) {
+        blob[@"token"] = CK6_token(); dirty = YES;
+    }
+    if (!blob[@"is_new_user"])                    { blob[@"is_new_user"] = @NO; dirty = YES; }
+    if (dirty) {
+        NSData *out = [NSJSONSerialization dataWithJSONObject:blob options:0 error:NULL];
+        if (out) [ud setObject:out forKey:CK6_UD_BLOBKEY];
+        return YES;
     }
     return NO;
 }
 
-static void CK_present_hook(id self, SEL _cmd, id vc, BOOL anim, void (^comp)(void)) {
-    (void)self; (void)_cmd; (void)anim;
-    if (CK_is_card_dialog(vc)) {
-        CKLog(@"拦截卡密弹窗 present: 「%@」", [(UIAlertController *)vc title] ?: @"?");
-        if (comp) comp();
-        return;
+static void CK6_forge_defaults(BOOL verbose) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    // 诚实读回（objectForKey 未被 swizzle）
+    NSNumber *cur = [ud objectForKey:CK6_UD_VIPKEY];
+    if (![cur isKindOfClass:[NSNumber class]] || !cur.boolValue) {
+        [ud setObject:@YES forKey:CK6_UD_VIPKEY];
+        if (verbose) CKLog(@"A层 写入 %@=true（原值=%@）", CK6_UD_VIPKEY, cur);
     }
-    g_orig_present(self, _cmd, vc, anim, comp);
-}
-
-static void CK_install_present_swizzle(void) {
-    if (g_swizzled) return;
-    Class cls = [UIViewController class];
-    SEL sel = @selector(presentViewController:animated:completion:);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) { CKLog(@"present swizzle 失败: 方法未找到"); return; }
-    g_swizzled = YES;
-    g_orig_present = (void (*)(id, SEL, id, BOOL, void (^)(void)))method_getImplementation(m);
-    method_setImplementation(m, (IMP)CK_present_hook);
-    CKLog(@"present swizzle 完成");
-}
-
-
-// ═══ v9.03 TBPopup 页锁解除 ═══
-//  onSegChanged: 原生实现里 seg<4 时查 DAT_0021de00+seg*4 解锁位，
-//  未解锁强制 setSelectedSegmentIndex:4（用户所见：默认第5页、点其它页弹回）。
-//  解锁位写入方在被拆掉的激活桥里，永不置位。
-//  修法：runtime 级替换该方法为无门实现——不改靶场 .text。
-//  替换体只做原方法去掉门之后的事：_curPage=选中页 → rebuildPage → refreshState。
-
-static void (*g_orig_onSeg)(id, SEL, id) = NULL;
-static ptrdiff_t g_curPage_off = -1;
-
-static void CK_onSegChanged_nogate(id self, SEL _cmd, id sender) {
-    (void)_cmd;
-    if (g_curPage_off < 0) {
-        Ivar iv = class_getInstanceVariable(object_getClass(self), "_curPage");
-        if (iv) g_curPage_off = ivar_getOffset(iv);
-    }
-    NSInteger idx = 0;
-    if ([sender isKindOfClass:[UISegmentedControl class]]) {
-        idx = [(UISegmentedControl *)sender selectedSegmentIndex];
-    }
-    if (idx < 0) idx = 0;
-    if (idx > 4) idx = 4;
-    if (g_curPage_off >= 0) {
-        *(NSInteger *)((uint8_t *)(__bridge void *)self + g_curPage_off) = idx;
-    }
-    if (g_ticks % 10 == 1) CKLog(@"页切换 → %ld（无门）", (long)idx);
-    @try {
-        ((void (*)(id, SEL))objc_msgSend)(self, @selector(rebuildPage));
-        ((void (*)(id, SEL))objc_msgSend)(self, @selector(refreshState));
-    } @catch (NSException *e) {
-        CKLog(@"页重建异常: %@", e);
+    BOOL blobWritten = CK6_enforce_blob(ud);
+    if (verbose) {
+        NSData *d = [ud dataForKey:CK6_UD_BLOBKEY];
+        NSString *s = d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"(nil)";
+        CKLog(@"A层 loginDataKey=%@ (本次%@)", s, blobWritten ? @"重写" : @"已合规");
     }
 }
 
-static void CK_unlock_tabs(void) {
-    Class cls = objc_getClass("TBPopup");
-    if (!cls) { CKLog(@"TBPopup 类未注册，页锁解除跳过"); return; }
-    SEL sel = @selector(onSegChanged:);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) { CKLog(@"onSegChanged: 未找到"); return; }
-    g_orig_onSeg = (void (*)(id, SEL, id))method_getImplementation(m);
-    method_setImplementation(m, (IMP)CK_onSegChanged_nogate);
-    CKLog(@"TBPopup 页锁已解除 (原 IMP=%p)", (void *)g_orig_onSeg);
+// ───────────────────────── HUD ─────────────────────────
+@interface CK6HudTarget : NSObject
++ (instancetype)shared;
+- (void)tapped;
+- (void)panned:(UIPanGestureRecognizer *)g;
+@end
+
+static UIWindow *CK6_key_window(void) {
+    UIWindow *kw = nil;
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if ([sc isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)sc).windows)
+                if (w.isKeyWindow) kw = w;
+        }
+    }
+    if (!kw) for (UIWindow *w in [UIApplication sharedApplication].windows) if (w.isKeyWindow) kw = w;
+    if (!kw) kw = [UIApplication sharedApplication].windows.firstObject;
+    return kw;
 }
 
-// ═══ v9.05 看门狗与启动序列 ═══
+static NSString *CK6_status_line(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSNumber *vip = [ud objectForKey:CK6_UD_VIPKEY];      // 诚实读（objectForKey 未被 swizzle）
+    NSData *blob = [ud dataForKey:CK6_UD_BLOBKEY];
+    return [NSString stringWithFormat:
+        @"A 缓存伪造: %@ (blob %@B)\n"
+        @"B 门读取恒真: %@\n"
+        @"C 内存补丁: %d/%d (跳过%d) UUID%@\n"
+        @"D 看门狗: t=%d\n"
+        @"诚实读回 isVipValid=%@",
+        blob ? @"✓" : @"✗", blob ? @([blob length]) : @0,
+        g_swizzle_ok ? @"✓" : @"✗",
+        g_patch_ok, g_patch_total, g_patch_skip, g_uuid_match ? @"✓" : @"✗",
+        g_tick, vip];
+}
 
-static dispatch_source_t g_timer = nil;
+@implementation CK6HudTarget
++ (instancetype)shared {
+    static CK6HudTarget *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [CK6HudTarget new]; });
+    return s;
+}
+- (void)tapped {
+    UIViewController *vc = CK6_key_window().rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if (!vc) return;
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"bypass6 状态"
+        message:CK6_status_line() preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [vc presentViewController:al animated:YES completion:nil];
+}
+- (void)panned:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view;
+    CGPoint p = [g translationInView:v.superview];
+    v.center = CGPointMake(v.center.x + p.x, v.center.y + p.y);
+    [g setTranslation:CGPointZero inView:v.superview];
+}
+@end
 
-static void CK_watchdog(void) {
-    g_ticks++;
-    if (!g_tbase) {
-        CK_find_target();
-        if (!g_tbase) {
-            if (g_ticks == 3) CK_try_dlopen();     // 第 3 拍仍没找到 → 自己拉
-            CK_hud([NSString stringWithFormat:@"bypass5: 找靶场中… t=%d", g_ticks], NO);
+static UIControl *g_hudCtl = nil;
+static void CK6_make_hud(void) {
+    if (g_hudCtl) return;
+    UIWindow *kw = CK6_key_window();
+    if (!kw) return;
+    UIControl *ctl = [[UIControl alloc] initWithFrame:CGRectMake(12, 54, 132, 26)];
+    ctl.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+    ctl.layer.cornerRadius = 13;
+    ctl.clipsToBounds = YES;
+    UILabel *l = [[UILabel alloc] initWithFrame:ctl.bounds];
+    l.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    l.text = @"🎵VIP·bypass6";
+    l.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightSemibold];
+    l.textColor = [UIColor colorWithRed:0.35 green:1.0 blue:0.55 alpha:1.0];
+    l.textAlignment = NSTextAlignmentCenter;
+    l.userInteractionEnabled = NO;
+    [ctl addSubview:l];
+    g_hud = l;
+    [ctl addTarget:[CK6HudTarget shared] action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:[CK6HudTarget shared] action:@selector(panned:)];
+    [ctl addGestureRecognizer:pan];
+    [kw addSubview:ctl];
+    g_hudCtl = ctl;
+}
+
+// ───────────────────────── 看门狗 ─────────────────────────
+static dispatch_source_t g_timer = NULL;   // 必须静态持有，ARC 下局部变量出作用域即被释放
+static void CK6_watchdog(void) {
+    if (g_timer) return;
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                              2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(t, ^{
+        g_tick++;
+        CK6_check_swizzle();
+        CK6_forge_defaults(NO);
+        if (!g_hudCtl) CK6_make_hud();
+        if (g_hud) {
+            g_hud.text = [NSString stringWithFormat:@"🎵VIP·b6 C%d/%d t%d",
+                          g_patch_ok, g_patch_total, g_tick];
+        }
+        if (g_tick % 15 == 1) {   // 每 30s 一次心跳日志
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            CKLog(@"心跳 t=%d 诚实读回 isVipValid=%@ blob=%luB 补丁=%d/%d swizzle=%d",
+                  g_tick, [ud objectForKey:CK6_UD_VIPKEY],
+                  (unsigned long)[[ud dataForKey:CK6_UD_BLOBKEY] length],
+                  g_patch_ok, g_patch_total, g_swizzle_ok);
+        }
+    });
+    g_timer = t;
+    dispatch_resume(t);
+}
+
+// ───────────────────────── 入口 ─────────────────────────
+__attribute__((constructor))
+static void CK6_ctor(void) {
+    @autoreleasepool {
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
+        if (![bid isEqualToString:CK6_BUNDLE_ID]) {
+            // 注入进错进程：完全静默，不动任何东西
+            NSLog(@"[bypass6] 宿主不是 PitchKit (%@)，本 dylib 不动作", bid);
             return;
         }
-        CK_hud(@"bypass5: 靶场已定位，激活中…", NO);
-        CKLog(@"看门狗内定位到目标，补跑激活序列");
-        CK_decode_dialog_strings();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            CK_poke_state(YES);
-            CK_run_session_and_enable();
-            CK_poke_state(YES);
-            CK_unlock_tabs();
-            g_armed = YES;
-            CK_install_ball();
-            CK_hud(@"bypass5: 已激活", YES);
+        CKLog(@"══ bypass6 装载 ══ 宿主=%@ ver=%@", bid,
+              [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"]);
+        CK6_locate_target();
+        if (!g_mh) { CKLog(@"✗ 未找到主二进制映像，仅 A/B/D 数据层生效"); }
+        CK6_install_swizzle();          // B：先于一切 App 代码
+        CK6_forge_defaults(YES);        // A：抢在 viewDidLoad 恢复之前
+        if (g_mh) CK6_apply_patches();  // C：UUID+逐点字节双校验
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            CK6_make_hud();
+            CKLog(@"状态:\n%@", CK6_status_line());
         });
-        return;
+        CK6_watchdog();                 // D
+        CKLog(@"装载完成：9 个功能门（boolForKey:\"isVipValid\"）恒通，"
+              @"启动恢复链将原生判为永久会员(vip_type=2)");
     }
-    CK_poke_state(NO);                    // 对抗远程清除路径
-    void *ball = *(void * volatile *)T(OFF_BALL);
-    UIView *bv = (__bridge UIView *)ball;
-    if (!bv || !bv.superview) CK_install_ball();   // 定时器在主队列，直接调
-    if (g_ticks <= 30 && g_ticks % 5 == 0) {
-        CKLog(@"体检 t=%d magic=%08x/%08x flag=%u ball=%p superview=%p",
-              g_ticks,
-              *(volatile uint32_t *)T(OFF_MAGIC_A),
-              *(volatile uint32_t *)T(OFF_MAGIC_B),
-              *(volatile uint8_t *)T(OFF_LIC_FLAG),
-              bv, bv ? bv.superview : nil);
-        CK_hud([NSString stringWithFormat:@"bypass5: 已激活 球%@ t=%d",
-                (bv && bv.superview) ? @"在屏" : @"未上屏", g_ticks],
-               (bv && bv.superview) ? YES : NO);
-    }
-}
-
-static void CK_boot(void) {
-    if (g_booted) return;
-    g_booted = YES;
-
-    CK_find_target();
-    if (g_tbase) {
-        CKLog(@"目标 base=%p", g_tbase);
-        CK_decode_dialog_strings();
-    } else {
-        CKLog(@"启动时未见目标镜像，交给看门狗轮询");
-    }
-    CK_install_present_swizzle();         // 先装拦截再激活，弹窗无缝隙
-    CK_make_proof();
-
-    if (g_tbase) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            CK_poke_state(YES);
-            CK_run_session_and_enable();
-            CK_poke_state(YES);
-            CK_unlock_tabs();
-            g_armed = YES;
-            CK_install_ball();
-            CKLog(@"首拍激活序列完成: magic=%08x flag=%u ball=%p",
-                  *(volatile uint32_t *)T(OFF_MAGIC_A),
-                  *(volatile uint8_t *)T(OFF_LIC_FLAG),
-                  *(void * volatile *)T(OFF_BALL));
-            CK_hud(@"bypass5: 已激活", YES);
-        });
-    }
-
-    if (!g_timer) {
-        g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                         dispatch_get_main_queue());
-        dispatch_source_set_timer(g_timer,
-                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                                  (uint64_t)(2.0 * NSEC_PER_SEC),
-                                  (uint64_t)(0.2 * NSEC_PER_SEC));
-        dispatch_source_set_event_handler(g_timer, ^{ CK_watchdog(); });
-        dispatch_resume(g_timer);
-    }
-}
-
-__attribute__((constructor))
-static void CK5_main(void) {
-    CKLog(@"bypass5 v9.03 加载 (第五课·激活+悬浮球+页锁解除) pid=%d", getpid());
-    CK_boot();
-}
-
-__attribute__((constructor))
-static void CK5_main2(void) {
-    // 防呆：半秒后若仍未定位到目标，再扫一遍并补跑
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (!g_booted) CK_boot();
-        else if (!g_tbase) { CK_find_target(); }
-    });
 }
