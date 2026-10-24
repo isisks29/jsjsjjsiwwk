@@ -90,7 +90,7 @@
 #define CK6_UD_VIPKEY   @"isVipValid"
 #define CK6_UD_BLOBKEY  @"loginDataKey"
 
-static const mach_header_64 *g_mh = NULL;      // PitchKit 主二进制头
+static const struct mach_header_64 *g_mh = NULL;      // PitchKit 主二进制头
 static intptr_t g_slide = 0;                    // 运行时滑移
 static BOOL g_uuid_match = NO;
 static int  g_patch_ok = 0, g_patch_total = 0, g_patch_skip = 0;
@@ -106,12 +106,13 @@ static void CKLog(NSString *fmt, ...) {
 }
 
 // ───────────────────────── 目标识别 ─────────────────────────
-static NSString *CK6_uuid_of(const mach_header_64 *mh) {
-    const uint8_t *p = (const uint8_t *)mh + sizeof(mach_header_64);
+static NSString *CK6_uuid_of(const struct mach_header_64 *mh) {
+    const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)p;
         if (lc->cmd == LC_UUID) {
-            const uint8_t *u = p + sizeof(struct uuid_command);
+            const struct uuid_command *uc = (const struct uuid_command *)lc;
+            const uint8_t *u = uc->uuid;
             NSMutableString *s = [NSMutableString string];
             for (int k = 0; k < 16; k++) [s appendFormat:@"%02x", u[k]];
             return s;
@@ -127,7 +128,7 @@ static void CK6_locate_target(void) {
         if (!nm) continue;
         NSString *path = [NSString stringWithUTF8String:nm];
         if (![path.lastPathComponent isEqualToString:@"PitchKit"]) continue;
-        const mach_header_64 *mh = (const mach_header_64 *)_dyld_get_image_header(i);
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!mh || mh->magic != MH_MAGIC_64 || mh->filetype != MH_EXECUTE) continue;
         g_mh = mh;
         g_slide = (intptr_t)mh - 0x100000000;
@@ -140,7 +141,7 @@ static void CK6_locate_target(void) {
     // 名字兜底：主可执行文件 + bundle id 校验
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     if ([bid isEqualToString:CK6_BUNDLE_ID]) {
-        const mach_header_64 *mh = (const mach_header_64 *)_dyld_get_image_header(0);
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
         g_mh = mh;
         g_slide = (intptr_t)mh - 0x100000000;
         g_uuid_match = [CK6_uuid_of(mh) isEqualToString:CK6_UUID_HEX];
@@ -187,7 +188,7 @@ static BOOL CK6_write_word(void *addr, uint32_t val) {
         return NO;
     }
     *(volatile uint32_t *)addr = val;
-    vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_EXEC);
+    vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     sys_icache_invalidate(addr, 4);
     return (*(volatile uint32_t *)addr) == val;
 }
