@@ -1,6 +1,20 @@
 // =====================================================================
-//  bypass7.m — 第七课 v1.04（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
+//  bypass7.m — 第七课 v1.05（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
 //  目标：注入后直接获得会员权益（SVIP 界面 + 连接不被拒 + 会话不被服务端掐断）
+//
+//  ▍v1.05 变更（实测：choose 200→save 成功→start YES 全链路放行，但 UI 仍
+//             「未连接」→ 失败在 Tunnel.appex 扩展进程内部，主程序不可见）
+//   1. 隧道进程钩子：startTunnelWithOptions:completionHandler:（包回调抓
+//      error）/ cancelTunnelWithError: / stopTunnelWithReason: —— 扩展侧
+//      真实失败原因直接进日志
+//   2. 隧道日志经 App 组共享文件（Library/Caches/ck7_tunnel.log，96KB 截尾）
+//      带回主程序：单击悬浮窗复制的诊断自带「隧道进程日志」段
+//   3. 隧道环境自检：running_config.json（实证在组容器根目录，FUN_10007dc5c）
+//      存在性/大小/开头 + 组容器 kAccessToken + 日志路径
+//   4. 主程序：startVPNTunnel 返回 YES 后按秒轮询 connection.status 30s，
+//      记录 Connecting→Connected/Disconnected 迁移——扩展起没起来一目了然
+//   5. 注意：需注入器覆盖 com.zheyoutech.app.tunnel，隧道段日志才有内容；
+//      若「隧道日志: 空」即注入未覆盖扩展进程
 //
 //  ▍v1.04 变更（实测：choose 已 200 下发 accessLink，但「网络异常」且连不上；
 //             该文案不在两个二进制/资源里 → 服务端下发或系统层，且不走已钩 API）
@@ -166,6 +180,7 @@ static id (*g_origJSON)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
 #pragma mark - 日志
 
 static NSString *CK7StatusLine(void);   // 前置声明（HUD/直启共用）
+static void CK7PollStatus(id conn);     // v1.05 前置声明（NE start 钩子用）
 
 // v1.02: 环形日志缓存（点悬浮窗一键复制诊断用），多线程安全
 #define CK7_RING_MAX 60
@@ -174,6 +189,56 @@ static NSMutableArray<NSString *> *g_logRing = nil;
 static void CK7RingInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ g_logRing = [NSMutableArray array]; });
+}
+
+// v1.05: 隧道进程日志经 App 组共享文件带回主程序诊断（扩展进程的 NSLog
+// 主程序看不到，落盘 <AppGroup>/Library/Caches/ck7_tunnel.log，上限 96KB 截尾）
+static NSString *CK7TunnelLogPath(void) {
+    static NSString *path = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSURL *dir = [[NSFileManager defaultManager]
+            containerURLForSecurityApplicationGroupIdentifier:@"group.com.zheyoutech.app"];
+        if (dir) {
+            NSURL *caches = [dir URLByAppendingPathComponent:@"Library/Caches"
+                                                 isDirectory:YES];
+            [[NSFileManager defaultManager] createDirectoryAtURL:caches
+                                     withIntermediateDirectories:YES
+                                                      attributes:nil
+                                                           error:NULL];
+            path = [[caches URLByAppendingPathComponent:@"ck7_tunnel.log"] path];
+        }
+    });
+    return path;
+}
+
+static void CK7TunnelLogAppend(NSString *line) {
+    NSString *p = CK7TunnelLogPath();
+    if (!p) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"HH:mm:ss";
+    NSString *entry = [NSString stringWithFormat:@"[%@] %@\n",
+                       [df stringFromDate:[NSDate date]], line];
+    NSData *d = [entry dataUsingEncoding:NSUTF8StringEncoding];
+    if ([fm fileExistsAtPath:p]) {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        @try {
+            unsigned long long sz = [fh seekToEndOfFile];
+            if (sz > 96 * 1024) {   // 超限截尾：保留后半
+                NSData *all = [NSData dataWithContentsOfFile:p];
+                NSData *tail = [all subdataWithRange:NSMakeRange(all.length / 2,
+                                                                 all.length - all.length / 2)];
+                [fh truncateFileAtOffset:0];
+                [fh writeData:tail];
+                [fh seekToEndOfFile];
+            }
+            [fh writeData:d];
+        } @catch (NSException *ex) { /* 忽略 */ }
+        [fh closeFile];
+    } else {
+        [d writeToFile:p atomically:YES];
+    }
 }
 
 static void CKLog(NSString *fmt, ...) {
@@ -187,6 +252,7 @@ static void CKLog(NSString *fmt, ...) {
         [g_logRing addObject:msg];
         while (g_logRing.count > CK7_RING_MAX) [g_logRing removeObjectAtIndex:0];
     }
+    if (g_mode == CK7ModeTunnel) CK7TunnelLogAppend(msg);   // v1.05
 }
 
 static NSString *CK7UUIDHex(void) {
@@ -725,6 +791,7 @@ static BOOL CK7StartTunnel(id self, SEL _cmd, NSDictionary *options, NSError **e
     }
     CKLog(@"NE startVPNTunnelWithOptions 结果=%@ err=%@",
           ok ? @"YES" : @"NO", e ?: @"无");
+    if (ok) CK7PollStatus(self);   // v1.05: 跟踪扩展进程是否真把隧道拉起来
     return ok;
 }
 
@@ -867,6 +934,139 @@ static void CK7InstallLabelHook(void) {
     CKLog(@"v1.04 UILabel 文案哨兵完成");
 }
 
+#pragma mark - v1.05 隧道进程观测 + 主程序状态轮询
+
+// ---- 隧道进程：包 startTunnel / cancel / stop，抓扩展侧真实错误 ----
+static void (*g_origTunStart)(id, SEL, NSDictionary *, void (^)(NSError *));
+static void CK7TunStart(id self, SEL _cmd, NSDictionary *options,
+                        void (^completion)(NSError *)) {
+    CKLog(@"TUN startTunnelWithOptions 进入 options=%@", options ?: @"(nil)");
+    void (^wrapped)(NSError *) = ^(NSError *error) {
+        CKLog(@"TUN startTunnel 完成回调 err=%@", error ?: @"nil(成功)");
+        if (completion) completion(error);
+    };
+    g_origTunStart(self, _cmd, options, wrapped);
+}
+
+static void (*g_origTunCancel)(id, SEL, NSError *);
+static void CK7TunCancel(id self, SEL _cmd, NSError *error) {
+    CKLog(@"TUN cancelTunnelWithError: %@", error ?: @"(nil)");
+    if (g_origTunCancel) g_origTunCancel(self, _cmd, error);
+}
+
+static void (*g_origTunStop)(id, SEL, NSInteger, void (^)(void));
+static void CK7TunStop(id self, SEL _cmd, NSInteger reason, void (^completion)(void)) {
+    CKLog(@"TUN stopTunnelWithReason:%ld", (long)reason);
+    if (g_origTunStop) g_origTunStop(self, _cmd, reason, completion);
+}
+
+static void CK7InstallTunnelHooks(void) {
+    Class ptp = NSClassFromString(@"_TtC6Tunnel20PacketTunnelProvider");
+    if (!ptp) ptp = NSClassFromString(@"Tunnel.PacketTunnelProvider");
+    if (!ptp) {
+        CKLog(@"TUN 未找到 PacketTunnelProvider 类（注入未覆盖扩展或类名变化）");
+        return;
+    }
+    SEL s1 = NSSelectorFromString(@"startTunnelWithOptions:completionHandler:");
+    Method m1 = class_getInstanceMethod(ptp, s1);
+    if (m1) {
+        g_origTunStart = (void (*)(id, SEL, NSDictionary *, void (^)(NSError *)))
+            method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)CK7TunStart);
+    }
+    SEL s2 = @selector(cancelTunnelWithError:);
+    Method m2 = class_getInstanceMethod(ptp, s2);
+    if (!m2) {
+        Class base = NSClassFromString(@"NEPacketTunnelProvider");
+        if (base) m2 = class_getInstanceMethod(base, s2);
+    }
+    if (m2) {
+        g_origTunCancel = (void (*)(id, SEL, NSError *))method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)CK7TunCancel);
+    }
+    SEL s3 = NSSelectorFromString(@"stopTunnelWithReason:completionHandler:");
+    Method m3 = class_getInstanceMethod(ptp, s3);
+    if (m3) {
+        g_origTunStop = (void (*)(id, SEL, NSInteger, void (^)(void)))
+            method_getImplementation(m3);
+        method_setImplementation(m3, (IMP)CK7TunStop);
+    }
+    CKLog(@"TUN 钩子完成 (start/cancel/stop)");
+}
+
+// 隧道进程环境自检：running_config.json / token / 日志路径
+static void CK7TunnelEnvReport(void) {
+    CKLog(@"TUN 日志文件: %@", CK7TunnelLogPath() ?: @"(App组容器不可用!)");
+    NSURL *dir = [[NSFileManager defaultManager]
+        containerURLForSecurityApplicationGroupIdentifier:@"group.com.zheyoutech.app"];
+    if (dir) {
+        // 实证（FUN_10007dc5c）：running_config.json 在 App 组容器根目录
+        NSArray *cands = @[
+            [dir URLByAppendingPathComponent:@"running_config.json"],
+            [dir URLByAppendingPathComponent:@"Library/Caches/running_config.json"],
+        ];
+        for (NSURL *cfg in cands) {
+            NSData *d = [NSData dataWithContentsOfURL:cfg];
+            CKLog(@"TUN %@: %@ (%lu 字节)%@", cfg.lastPathComponent,
+                  d ? @"存在" : @"不存在", (unsigned long)d.length,
+                  d ? [NSString stringWithFormat:@" 开头=%@",
+                        [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(0, MIN(120, d.length))]
+                                               encoding:NSUTF8StringEncoding]] : @"");
+            if (d) break;
+        }
+        NSUserDefaults *grp =
+            [[NSUserDefaults alloc] initWithSuiteName:@"group.com.zheyoutech.app"];
+        NSString *tok = [grp stringForKey:@"kAccessToken"];
+        CKLog(@"TUN 组容器 token: %@ (len=%lu)", tok ? @"有" : @"无",
+              (unsigned long)tok.length);
+    } else {
+        CKLog(@"TUN App组容器获取失败——entitlement 可能缺失");
+    }
+}
+
+// ---- 主程序：start 返回 YES 后轮询 connection.status，看扩展是否真起来 ----
+static id g_pollConn = nil;
+static NSString *CK7NEStatusName(NSInteger st) {
+    switch (st) {
+        case 0: return @"Invalid";
+        case 1: return @"Connecting";
+        case 2: return @"Connected";
+        case 3: return @"Reasserting";
+        case 4: return @"Disconnecting";
+        case 5: return @"Disconnected";
+        default: return @"?";
+    }
+}
+
+static void CK7PollStatus(id conn) {
+    g_pollConn = conn;   // 强持有防释放
+    __block NSInteger last = -1;
+    __block int n = 0;
+    dispatch_source_t t =
+        dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                              NSEC_PER_SEC, 500 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{
+        n++;
+        NSInteger st = -1;
+        @try { st = [[g_pollConn valueForKey:@"status"] integerValue]; }
+        @catch (NSException *ex) { st = -2; }
+        if (st != last) {
+            CKLog(@"NE 状态: %@ → %@ (第%ds)", CK7NEStatusName(last),
+                  CK7NEStatusName(st), n);
+            last = st;
+        }
+        if (n >= 30 || st == 2) {
+            dispatch_source_cancel(t);
+            if (st != 2)
+                CKLog(@"NE 状态轮询结束(30s)：终态=%@ —— 扩展进程未能建立隧道，"
+                      @"看诊断尾部「隧道日志」段", CK7NEStatusName(st));
+            g_pollConn = nil;
+        }
+    });
+    dispatch_resume(t);
+}
+
 #pragma mark - HUD（主程序）
 
 static NSString *CK7StatusLine(void) {
@@ -885,7 +1085,7 @@ static NSString *CK7Diagnostics(void) {
     NSMutableString *s = [NSMutableString string];
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"HH:mm:ss";
-    [s appendFormat:@"== bypass7 v1.04 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
+    [s appendFormat:@"== bypass7 v1.05 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
     [s appendFormat:@"进程: %@ | 模式: %@\n",
         [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
         (g_mode == CK7ModeApp ? @"主程序" : (g_mode == CK7ModeTunnel ? @"隧道" : @"惰性"))];
@@ -905,6 +1105,19 @@ static NSString *CK7Diagnostics(void) {
     CK7RingInit();
     @synchronized (g_logRing) {
         for (NSString *line in g_logRing) [s appendFormat:@"%@\n", line];
+    }
+    // v1.05: 附隧道进程日志尾部（App 组共享文件，扩展侧错误在这）
+    NSString *tp = CK7TunnelLogPath();
+    if (tp) {
+        NSData *td = [NSData dataWithContentsOfFile:tp];
+        if (td.length > 0) {
+            if (td.length > 8192)
+                td = [td subdataWithRange:NSMakeRange(td.length - 8192, 8192)];
+            NSString *ts = [[NSString alloc] initWithData:td encoding:NSUTF8StringEncoding];
+            [s appendFormat:@"---- 隧道进程日志(尾部) ----\n%@", ts ?: @"(解码失败)"];
+        } else {
+            [s appendString:@"---- 隧道日志: 空（注入未覆盖 Tunnel.appex 或扩展未启动过）----\n"];
+        }
     }
     return s;
 }
@@ -1096,7 +1309,10 @@ __attribute__((constructor)) static void CK7Ctor(void) {
                 CK7ProbeSavedCfg();   // v1.01: 启动即探测一次已存隧道配置
             });
         } else {
-            CKLog(@"就绪：L4 保活免疫（connectionState=0 改写 + keep 重放）");
+            // v1.05: 隧道进程——装 start/cancel/stop 钩子 + 环境自检
+            CK7InstallTunnelHooks();
+            CK7TunnelEnvReport();
+            CKLog(@"就绪：L4 保活免疫（connectionState=0 改写 + keep 重放）+ 隧道观测");
         }
         CK7Watchdog();
     }
