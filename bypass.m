@@ -1,6 +1,19 @@
 // =====================================================================
-//  bypass7.m — 第七课 v1.03（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
+//  bypass7.m — 第七课 v1.04（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
 //  目标：注入后直接获得会员权益（SVIP 界面 + 连接不被拒 + 会话不被服务端掐断）
+//
+//  ▍v1.04 变更（实测：choose 已 200 下发 accessLink，但「网络异常」且连不上；
+//             该文案不在两个二进制/资源里 → 服务端下发或系统层，且不走已钩 API）
+//   1. NE 观测钩子：saveToPreferences / loadAll / load / startVPNTunnel×2
+//      全部包日志——entitlement 缺失、VPN 权限被拒、配置保存失败等系统层
+//      真实错误直接进诊断（最后一公里失败点现形）
+//   2. SVProgressHUD 追加 showSuccess/showInfo/showImage:status: 日志钩子
+//   3. UILabel setText: 关键词哨兵（网络异常/失败/错误/权限/denied/无法，
+//      3s 去重、先放行后记录，零行为影响）——无论文案从哪条路渲染都能抓到
+//   4. L1 到期时间按服务端格式改写：字符串型 → "2100-12-31 00:00:00"
+//      （实测服务端格式 yyyy-MM-dd HH:mm:ss），界面不再显示裸时间戳
+//   5. 实测确认：游客未注册即自动获 10 分钟会员试用（vipGranted=1 +
+//      vipExpires=now+10min，服务端下发）；体验时长不按设备限领（L6 保留作后备）
 //
 //  ▍v1.03 变更（实测：901「未开通会员或会员已过期」；新账号无免费时长）
 //   1. L6 设备码轮换：出站 JSON 同点交换 dataWithJSONObject:options:error:，
@@ -210,11 +223,12 @@ static id CK7RewriteVIPDict(NSDictionary *d) {
     // 保持原类型：Int→NSNumber，String→NSString（App 端 dynamicCast 依赖类型）
     m[kCK7Vip] = [g isKindOfClass:[NSString class]] ? @"1" : @(1);
     id e = d[kCK7Exp];
-    if (e == nil || [e isKindOfClass:[NSString class]]) {
-        // 无该键时按 HomeMemberView 的 String() 拼接路径给字符串；
-        // 原值是字符串也给字符串
-        if (e == nil) m[kCK7Exp] = @(kCK7ExpForever);
-        else m[kCK7Exp] = [NSString stringWithFormat:@"%lld", kCK7ExpForever];
+    // v1.04: 服务端日期格式实证为 "yyyy-MM-dd HH:mm:ss"（如 2026-10-25 15:04:57），
+    // 字符串型给同格式远期日期，数字型给 epoch，界面显示不再出现裸时间戳
+    if (e == nil) {
+        m[kCK7Exp] = @(kCK7ExpForever);
+    } else if ([e isKindOfClass:[NSString class]]) {
+        m[kCK7Exp] = @"2100-12-31 00:00:00";
     } else {
         m[kCK7Exp] = @(kCK7ExpForever);
     }
@@ -665,6 +679,184 @@ static void CK7InstallToastHook(void) {
     CKLog(@"L3 SVProgressHUD 钩子完成");
 }
 
+#pragma mark - v1.04 最后一公里观测（NE / SVProgressHUD / UILabel 钩子）
+
+// ---- NetworkExtension：拿系统层真实错误（entitlement/权限/配置保存失败都在这现形）----
+static void (*g_origSaveToPrefs)(id, SEL, void (^)(NSError *));
+static void CK7SaveToPrefs(id self, SEL _cmd, void (^completion)(NSError *)) {
+    CKLog(@"NE saveToPreferences 调用");
+    void (^wrapped)(NSError *) = completion ? ^(NSError *error) {
+        CKLog(@"NE saveToPreferences 结果: %@", error ? error : @"成功");
+        completion(error);
+    } : nil;
+    g_origSaveToPrefs(self, _cmd, wrapped);
+}
+
+static void (*g_origLoadAllFromPrefs)(id, SEL, void (^)(NSArray *, NSError *));
+static void CK7LoadAllFromPrefs(id self, SEL _cmd,
+                                void (^completion)(NSArray *, NSError *)) {
+    void (^wrapped)(NSArray *, NSError *) = ^(NSArray *mgrs, NSError *error) {
+        CKLog(@"NE loadAllFromPreferences: %lu 个管理器, err=%@",
+              (unsigned long)mgrs.count, error ?: @"无");
+        if (completion) completion(mgrs, error);
+    };
+    g_origLoadAllFromPrefs(self, _cmd, wrapped);
+}
+
+static void (*g_origLoadFromPrefs)(id, SEL, void (^)(id, NSError *));
+static void CK7LoadFromPrefs(id self, SEL _cmd, void (^completion)(id, NSError *)) {
+    void (^wrapped)(id, NSError *) = ^(id mgr, NSError *error) {
+        CKLog(@"NE loadFromPreferences: mgr=%@ err=%@",
+              mgr ? @"有" : @"无", error ?: @"无");
+        if (completion) completion(mgr, error);
+    };
+    g_origLoadFromPrefs(self, _cmd, wrapped);
+}
+
+static BOOL (*g_origStartTunnel)(id, SEL, NSDictionary *, NSError **);
+static BOOL CK7StartTunnel(id self, SEL _cmd, NSDictionary *options, NSError **error) {
+    NSError *local = nil;
+    BOOL ok = g_origStartTunnel(self, _cmd, options, error ? error : &local);
+    NSError *e = error ? *error : local;
+    CKLog(@"NE startVPNTunnelWithOptions 结果=%@ err=%@",
+          ok ? @"YES" : @"NO", e ?: @"无");
+    return ok;
+}
+
+static BOOL (*g_origStartTunnelSimple)(id, SEL, NSError **);
+static BOOL CK7StartTunnelSimple(id self, SEL _cmd, NSError **error) {
+    NSError *local = nil;
+    BOOL ok = g_origStartTunnelSimple(self, _cmd, error ? error : &local);
+    NSError *e = error ? *error : local;
+    CKLog(@"NE startVPNTunnel 结果=%@ err=%@", ok ? @"YES" : @"NO", e ?: @"无");
+    return ok;
+}
+
+static void CK7InstallNEHooks(void) {
+    void *ne = dlopen("/System/Library/Frameworks/NetworkExtension.framework/"
+                      "NetworkExtension", RTLD_NOW);
+    if (!ne) { CKLog(@"NE dlopen 失败，跳过 NE 钩子"); return; }
+    Class vpnMgr = NSClassFromString(@"NEVPNManager");
+    if (vpnMgr) {
+        SEL s1 = NSSelectorFromString(@"saveToPreferencesWithCompletionHandler:");
+        Method m1 = class_getInstanceMethod(vpnMgr, s1);
+        if (m1) {
+            g_origSaveToPrefs =
+                (void (*)(id, SEL, void (^)(NSError *)))method_getImplementation(m1);
+            method_setImplementation(m1, (IMP)CK7SaveToPrefs);
+        }
+        SEL s2 = NSSelectorFromString(@"loadAllFromPreferencesWithCompletionHandler:");
+        Method m2 = class_getClassMethod(vpnMgr, s2);
+        if (m2) {
+            g_origLoadAllFromPrefs =
+                (void (*)(id, SEL, void (^)(NSArray *, NSError *)))method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)CK7LoadAllFromPrefs);
+        }
+        SEL s2b = NSSelectorFromString(@"loadFromPreferencesWithCompletionHandler:");
+        Method m2b = class_getInstanceMethod(vpnMgr, s2b);
+        if (m2b) {
+            g_origLoadFromPrefs =
+                (void (*)(id, SEL, void (^)(id, NSError *)))method_getImplementation(m2b);
+            method_setImplementation(m2b, (IMP)CK7LoadFromPrefs);
+        }
+    }
+    Class conn = NSClassFromString(@"NEVPNConnection");
+    if (conn) {
+        SEL s3 = NSSelectorFromString(@"startVPNTunnelWithOptions:andReturnError:");
+        Method m3 = class_getInstanceMethod(conn, s3);
+        if (m3) {
+            g_origStartTunnel =
+                (BOOL (*)(id, SEL, NSDictionary *, NSError **))method_getImplementation(m3);
+            method_setImplementation(m3, (IMP)CK7StartTunnel);
+        }
+        SEL s4 = NSSelectorFromString(@"startVPNTunnelAndReturnError:");
+        Method m4 = class_getInstanceMethod(conn, s4);
+        if (m4) {
+            g_origStartTunnelSimple =
+                (BOOL (*)(id, SEL, NSError **))method_getImplementation(m4);
+            method_setImplementation(m4, (IMP)CK7StartTunnelSimple);
+        }
+    }
+    CKLog(@"v1.04 NE 钩子完成（save/loadAll/load/start×2）");
+}
+
+// ---- SVProgressHUD 其余展示 API：全部入日志 ----
+static void (*g_origShowSuccess)(id, SEL, NSString *);
+static void CK7ShowSuccess(id self, SEL _cmd, NSString *status) {
+    CKLog(@"toast(成功):「%@」", status);
+    if (g_origShowSuccess) g_origShowSuccess(self, _cmd, status);
+}
+
+static void (*g_origShowInfo)(id, SEL, NSString *);
+static void CK7ShowInfo(id self, SEL _cmd, NSString *status) {
+    CKLog(@"toast(信息):「%@」", status);
+    if (g_origShowInfo) g_origShowInfo(self, _cmd, status);
+}
+
+static void (*g_origShowImage)(id, SEL, UIImage *, NSString *);
+static void CK7ShowImage(id self, SEL _cmd, UIImage *image, NSString *status) {
+    CKLog(@"toast(图片):「%@」", status);
+    if (g_origShowImage) g_origShowImage(self, _cmd, image, status);
+}
+
+static void CK7InstallMoreToastHooks(void) {
+    Class cls = NSClassFromString(@"SVProgressHUD");
+    if (!cls) return;
+    struct { SEL sel; IMP imp; void **slot; } hooks[] = {
+        { NSSelectorFromString(@"showSuccessWithStatus:"), (IMP)CK7ShowSuccess, (void **)&g_origShowSuccess },
+        { NSSelectorFromString(@"showInfoWithStatus:"), (IMP)CK7ShowInfo, (void **)&g_origShowInfo },
+        { NSSelectorFromString(@"showImage:status:"), (IMP)CK7ShowImage, (void **)&g_origShowImage },
+    };
+    int n = 0;
+    for (unsigned i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
+        Method m = class_getClassMethod(cls, hooks[i].sel);
+        if (!m) continue;
+        IMP orig = method_getImplementation(m);
+        if (orig == hooks[i].imp) continue;
+        *hooks[i].slot = (void *)orig;
+        method_setImplementation(m, hooks[i].imp);
+        n++;
+    }
+    CKLog(@"v1.04 SVProgressHUD 追加钩子 %d 个", n);
+}
+
+// ---- UILabel setText: 关键词哨兵：抓「网络异常」等不在二进制里的服务端/系统文案 ----
+static void (*g_origLabelText)(id, SEL, NSString *);
+static NSString *g_lastLabelHit = nil;
+static NSTimeInterval g_lastLabelHitAt = 0;
+
+static void CK7LabelSetText(id self, SEL _cmd, NSString *text) {
+    if (g_origLabelText) g_origLabelText(self, _cmd, text);   // 先放行，观测零影响
+    if (![text isKindOfClass:[NSString class]]) return;
+    if (text.length < 2 || text.length > 120) return;
+    static NSArray *needles = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        needles = @[ @"网络异常", @"失败", @"错误", @"权限", @"denied", @"无法" ];
+    });
+    BOOL hit = NO;
+    for (NSString *nd in needles) {
+        if ([text rangeOfString:nd options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            hit = YES; break;
+        }
+    }
+    if (!hit) return;
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (g_lastLabelHit && [g_lastLabelHit isEqualToString:text] &&
+        now - g_lastLabelHitAt < 3.0) return;   // 3s 去重
+    g_lastLabelHit = text;
+    g_lastLabelHitAt = now;
+    CKLog(@"UILabel 命中文案:「%@」", text);
+}
+
+static void CK7InstallLabelHook(void) {
+    Method m = class_getInstanceMethod([UILabel class], @selector(setText:));
+    if (!m) { CKLog(@"UILabel setText: 未找到"); return; }
+    g_origLabelText = (void (*)(id, SEL, NSString *))method_getImplementation(m);
+    method_setImplementation(m, (IMP)CK7LabelSetText);
+    CKLog(@"v1.04 UILabel 文案哨兵完成");
+}
+
 #pragma mark - HUD（主程序）
 
 static NSString *CK7StatusLine(void) {
@@ -683,7 +875,7 @@ static NSString *CK7Diagnostics(void) {
     NSMutableString *s = [NSMutableString string];
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"HH:mm:ss";
-    [s appendFormat:@"== bypass7 v1.02 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
+    [s appendFormat:@"== bypass7 v1.04 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
     [s appendFormat:@"进程: %@ | 模式: %@\n",
         [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
         (g_mode == CK7ModeApp ? @"主程序" : (g_mode == CK7ModeTunnel ? @"隧道" : @"惰性"))];
@@ -879,6 +1071,9 @@ __attribute__((constructor)) static void CK7Ctor(void) {
         CK7InstallJSONSwizzle();
         if (g_mode == CK7ModeApp) {
             CK7InstallToastHook();
+            CK7InstallMoreToastHooks();   // v1.04
+            CK7InstallNEHooks();          // v1.04
+            CK7InstallLabelHook();        // v1.04
             CKLog(@"link 缓存: %@ | keep 缓存: 不适用",
                   CK7CachedLink() ? @"已有" : @"空（需先成功连一次）");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
@@ -896,3 +1091,4 @@ __attribute__((constructor)) static void CK7Ctor(void) {
         CK7Watchdog();
     }
 }
+
