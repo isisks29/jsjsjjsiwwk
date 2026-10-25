@@ -1,6 +1,13 @@
 // =====================================================================
-//  bypass7.m — 第七课 v1.01（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
+//  bypass7.m — 第七课 v1.02（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
 //  目标：注入后直接获得会员权益（SVIP 界面 + 连接不被拒 + 会话不被服务端掐断）
+//
+//  ▍v1.02 变更
+//   1. 悬浮窗单击 = 一键复制完整诊断到剪贴板（模式/UUID/五层计数/最近60条
+//      日志环形缓存），直接粘贴即可提交分析；HUD 短暂显示「✓ 诊断已复制」
+//   2. 长按悬浮窗 = 原弹窗详情；拖动不变
+//   3. HUD 计数改纯 ASCII（C1/C0 代替 ✓/✗，部分字体渲染成方框）
+//   4. CKLog 全部进入线程安全环形缓存（信封/toast/重放记录都能被复制出来）
 //
 //  ▍v1.01 变更（实测反馈：点连接无反应且无任何提示）
 //   1. L3 不再无脑吞错误 toast：仅当兜底可用（有缓存 link 或系统已保存
@@ -131,12 +138,26 @@ static id (*g_origJSON)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
 
 static NSString *CK7StatusLine(void);   // 前置声明（HUD/直启共用）
 
+// v1.02: 环形日志缓存（点悬浮窗一键复制诊断用），多线程安全
+#define CK7_RING_MAX 60
+static NSMutableArray<NSString *> *g_logRing = nil;
+
+static void CK7RingInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ g_logRing = [NSMutableArray array]; });
+}
+
 static void CKLog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"[bypass7] %@", msg);
+    CK7RingInit();
+    @synchronized (g_logRing) {
+        [g_logRing addObject:msg];
+        while (g_logRing.count > CK7_RING_MAX) [g_logRing removeObjectAtIndex:0];
+    }
 }
 
 static NSString *CK7UUIDHex(void) {
@@ -522,11 +543,38 @@ static void CK7InstallToastHook(void) {
 static NSString *CK7StatusLine(void) {
     NSString *mode = (g_mode == CK7ModeApp) ? @"APP" :
                      (g_mode == CK7ModeTunnel) ? @"TUN" : @"--";
-    NSString *cached = CK7CachedLink() ? @"✓" : @"✗";
+    // v1.02: 全 ASCII 计数（✓/✗ 在部分字体下渲染成方框）
+    int cached = CK7CachedLink().length > 0 ? 1 : 0;
     return [NSString stringWithFormat:
-        @"🛰VIP·b7 %@ V%ld R%ld C%@ S%d W%ld D%ld K%ld/%ld",
+        @"🛰VIP·b7 %@ V%ld R%ld C%d S%d W%ld D%ld K%ld/%ld",
         mode, g_vipRewrite, g_replay, cached, (int)g_savedCfg,
         g_toastSwallowed, g_directStart, g_cutBlocked, g_keepReplay];
+}
+
+// v1.02: 完整诊断文本（点悬浮窗复制到剪贴板，直接粘给分析者）
+static NSString *CK7Diagnostics(void) {
+    NSMutableString *s = [NSMutableString string];
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"HH:mm:ss";
+    [s appendFormat:@"== bypass7 v1.02 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
+    [s appendFormat:@"进程: %@ | 模式: %@\n",
+        [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
+        (g_mode == CK7ModeApp ? @"主程序" : (g_mode == CK7ModeTunnel ? @"隧道" : @"惰性"))];
+    [s appendFormat:@"UUID: %@\n", CK7UUIDHex()];
+    [s appendFormat:@"L1 会员改写=%ld | L2 重放=%ld(link更新%ld,缓存%@) | "
+                    @"L3 直启=%ld(toast见%ld/吞%ld,已存配置%d) | L4 拦截=%ld/keep重放=%ld\n",
+        g_vipRewrite, g_replay, g_linkSeen,
+        CK7CachedLink().length > 0 ? @"有" : @"无",
+        g_directStart, g_toastSeen, g_toastSwallowed, (int)g_savedCfg,
+        g_cutBlocked, g_keepReplay];
+    [s appendFormat:@"swizzle存活: %@ | tick=%ld\n",
+        CK7SwizzleAlive() ? @"是" : @"否", g_tick];
+    [s appendString:@"---- 最近日志(旧→新) ----\n"];
+    CK7RingInit();
+    @synchronized (g_logRing) {
+        for (NSString *line in g_logRing) [s appendFormat:@"%@\n", line];
+    }
+    return s;
 }
 
 @interface CK7HudTarget : NSObject
@@ -540,6 +588,22 @@ static NSString *CK7StatusLine(void) {
     return s;
 }
 - (void)tapped {
+    // v1.02: 单击 = 一键复制完整诊断到剪贴板（直接粘贴给分析者）
+    NSString *diag = CK7Diagnostics();
+    [UIPasteboard generalPasteboard].string = diag;
+    CKLog(@"诊断已复制到剪贴板（%lu 字节），长按悬浮窗可看弹窗详情",
+          (unsigned long)diag.length);
+    if (g_hudLabel) {
+        NSString *old = g_hudLabel.text;
+        g_hudLabel.text = @"✓ 诊断已复制";
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (g_hudLabel) g_hudLabel.text = CK7StatusLine();
+            (void)old;
+        });
+    }
+}
+- (void)longPressed {
     NSString *msg = [NSString stringWithFormat:
         @"模式: %@\n"
         @"L1 会员字段改写: %ld 次\n"
@@ -547,7 +611,8 @@ static NSString *CK7StatusLine(void) {
         @"L3 直启隧道: %ld 次（toast 见到 %ld / 吞掉 %ld）\n"
         @"L4 掐断拦截: %ld 次 / keep 重放: %ld 次\n"
         @"系统已存隧道配置: %@（直启兜底前提）\n"
-        @"swizzle 存活: %@\n主程序 UUID: %@",
+        @"swizzle 存活: %@\n主程序 UUID: %@\n\n"
+        @"（单击悬浮窗 = 复制完整诊断到剪贴板）",
         (g_mode == CK7ModeApp ? @"主程序" : @"隧道"),
         g_vipRewrite, g_replay, g_linkSeen, g_directStart,
         g_toastSeen, g_toastSwallowed, g_cutBlocked, g_keepReplay,
@@ -622,6 +687,12 @@ static void CK7MakeHUD(void) {
         [[UIPanGestureRecognizer alloc] initWithTarget:[CK7HudTarget shared]
                                                 action:@selector(panned:)];
     [c addGestureRecognizer:pan];
+    // v1.02: 长按 = 弹窗详情（单击已改为一键复制诊断）
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:[CK7HudTarget shared]
+                                                      action:@selector(longPressed)];
+    lp.minimumPressDuration = 0.6;
+    [c addGestureRecognizer:lp];
     [w addSubview:c];
     g_hud = c;
     g_hudLabel = l;
