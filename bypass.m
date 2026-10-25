@@ -1,6 +1,16 @@
 // =====================================================================
-//  bypass7.m — 第七课 v1.02（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
+//  bypass7.m — 第七课 v1.03（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
 //  目标：注入后直接获得会员权益（SVIP 界面 + 连接不被拒 + 会话不被服务端掐断）
+//
+//  ▍v1.03 变更（实测：901「未开通会员或会员已过期」；新账号无免费时长）
+//   1. L6 设备码轮换：出站 JSON 同点交换 dataWithJSONObject:options:error:，
+//      请求体 rk_terminalCode_mv（HardwareUnitStore 的 UUID().uuidString，
+//      FUN_10006a48c 实证）统一替换为持久化轮换 UUID → 服务端把新注册
+//      视为新设备，体验时长按设备限领时被绕过
+//   2. 诊断增强：信封日志追加会员/新人字段值（newcomer/vipGranted/
+//      vipExpires/accountRole/joinedAt/usedAt/signInCount/welcomeSeconds，
+//      敏感值不落日志）+ relayDetails 摘要；HUD 加 T(设备码改写) 计数
+//   3. 诊断文本含轮换码与 L6 计数；看门狗自愈同时护两个方向的交换
 //
 //  ▍v1.02 变更
 //   1. 悬浮窗单击 = 一键复制完整诊断到剪贴板（模式/UUID/五层计数/最近60条
@@ -107,6 +117,10 @@ static NSString *const kCK7Conn   = @"rk_connectionState_mv";
 // 本 dylib 自己的缓存键（standardUserDefaults，避免污染 App 组容器）
 static NSString *const kCK7CacheLink = @"ck7_cached_access_link";
 static NSString *const kCK7CacheKeep = @"ck7_cached_keep_envelope";
+static NSString *const kCK7RotatedDev = @"ck7_rotated_device_code";  // v1.03
+// v1.03: 请求体里的设备码键（HardwareUnitStore 生成 UUID().uuidString 存 Keychain，
+//        FUN_10006a48c 实证）——服务端体验时长按它限领，故出站统一轮换
+static NSString *const kCK7TermCode = @"rk_terminalCode_mv";
 // 伪造的到期时间：2100-12-31 00:00:00 UTC
 static const long long kCK7ExpForever = 4133376000LL;
 
@@ -126,6 +140,8 @@ static long g_directStart = 0;   // L3 直启次数
 static long g_toastSeen = 0;     // v1.01: 看到的错误 toast 数
 static long g_toastSwallowed = 0;// v1.01: 有兜底时吞掉的 toast 数
 static BOOL g_savedCfg = NO;     // v1.01: 系统里是否有本 App 已保存的隧道配置
+static long g_devRewrite = 0;    // v1.03: 出站请求设备码改写次数
+static BOOL g_inReqRewrite = NO; // v1.03: 出站重序列化防递归
 static long g_tick = 0;
 static dispatch_source_t g_timer = nil;
 static UIControl *g_hud = nil;
@@ -247,6 +263,22 @@ static id CK7RewriteApp(id obj, NSInteger depth) {
                                  ? (NSString *)d[kCK7Note] : @"(非字符串)";
             if (note.length > 80) note = [[note substringToIndex:80] stringByAppendingString:@"…"];
             CKLog(@"信封 state=%@ note=「%@」 bodyKeys=%@", d[kCK7State], note, bk);
+            // v1.03: 会员/新人相关字段值（白名单，敏感值不落日志）
+            if ([body isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *bd = (NSDictionary *)body;
+                for (NSString *vk in @[ @"rk_newcomer_mv", @"rk_vipGranted_mv",
+                                        @"rk_vipExpires_mv", @"rk_accountRole_mv",
+                                        @"rk_joinedAt_mv", @"rk_usedAt_mv",
+                                        @"rk_signInCount_mv", @"rk_welcomeSeconds_mv" ]) {
+                    if (bd[vk]) CKLog(@"  ↳ %@ = %@", vk, bd[vk]);
+                }
+                id relay = bd[@"rk_relayDetails_mv"];
+                if (relay) {
+                    NSString *rs = [relay description];
+                    if (rs.length > 200) rs = [[rs substringToIndex:200] stringByAppendingString:@"…"];
+                    CKLog(@"  ↳ rk_relayDetails_mv ≈ %@", rs);
+                }
+            }
         }
         // 顶层信封：被拒 → 用缓存 link 合成成功信封
         if (d[kCK7State] != nil && d[kCK7Note] != nil && CK7IsDeniedEnvelope(d)) {
@@ -364,6 +396,83 @@ static id CK7Rewrite(id obj, NSInteger depth) {
     return obj;
 }
 
+#pragma mark - L6 设备码轮换（出站请求改写，v1.03）
+
+// 轮换设备码：首次生成 UUID（与 HardwareUnitStore 同格式），持久化保证跨启动稳定
+static NSString *CK7RotatedDeviceCode(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *code = [ud stringForKey:kCK7RotatedDev];
+    if (code.length < 8) {
+        code = [[NSUUID UUID].UUIDString uppercaseString];
+        [ud setObject:code forKey:kCK7RotatedDev];
+        CKLog(@"L6 生成轮换设备码 %@（持久化，跨启动稳定）", code);
+    }
+    return code;
+}
+
+// 递归改写请求对象里的 rk_terminalCode_mv；copy-on-write，未命中返回原对象
+static id CK7RewriteRequestObject(id obj, NSInteger depth) {
+    if (depth > 4) return obj;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)obj;
+        NSMutableDictionary *m = nil;
+        id tc = d[kCK7TermCode];
+        if ([tc isKindOfClass:[NSString class]]) {
+            NSString *rot = CK7RotatedDeviceCode();
+            if (![tc isEqualToString:rot]) {
+                static BOOL logged = NO;
+                if (!logged) {
+                    logged = YES;
+                    CKLog(@"L6 原始设备码 len=%lu 前8位=%@… → 一律替换为轮换码",
+                          (unsigned long)((NSString *)tc).length,
+                          [(NSString *)tc substringToIndex:MIN(8, ((NSString *)tc).length)]);
+                }
+                m = [d mutableCopy];
+                m[kCK7TermCode] = rot;
+                g_devRewrite++;
+            }
+        }
+        for (NSString *k in d) {
+            id nv = CK7RewriteRequestObject(d[k], depth + 1);
+            if (nv != d[k]) {
+                if (!m) m = [d mutableCopy];
+                m[k] = nv;
+            }
+        }
+        return m ? m : obj;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *a = (NSArray *)obj;
+        NSMutableArray *m = nil;
+        for (NSUInteger i = 0; i < a.count; i++) {
+            id nv = CK7RewriteRequestObject(a[i], depth + 1);
+            if (nv != a[i]) {
+                if (!m) m = [a mutableCopy];
+                m[i] = nv;
+            }
+        }
+        return m ? m : obj;
+    }
+    return obj;
+}
+
+static NSData *(*g_origJSONData)(id, SEL, id, NSJSONWritingOptions, NSError **);
+
+static NSData *CK7DataWithJSONObject(id self, SEL _cmd, id obj,
+                                     NSJSONWritingOptions opt, NSError **error) {
+    if (g_mode == CK7ModeApp && !g_inReqRewrite &&
+        [obj isKindOfClass:[NSDictionary class]] && ((NSDictionary *)obj)[kCK7TermCode]) {
+        id rw = CK7RewriteRequestObject(obj, 0);
+        if (rw != obj) {
+            g_inReqRewrite = YES;
+            NSData *out = g_origJSONData(self, _cmd, rw, opt, error);
+            g_inReqRewrite = NO;
+            return out;
+        }
+    }
+    return g_origJSONData(self, _cmd, obj, opt, error);
+}
+
 #pragma mark - NSJSONSerialization swizzle（L1/L2/L4 的单点入口）
 
 static id CK7JSONObjectWithData(id self, SEL _cmd, NSData *data,
@@ -393,18 +502,36 @@ static BOOL CK7InstallJSONSwizzle(void) {
     Method m = class_getClassMethod(cls, sel);
     if (!m) { CKLog(@"未找到 JSONObjectWithData:options:error:"); return NO; }
     IMP orig = method_getImplementation(m);
-    if (orig == (IMP)CK7JSONObjectWithData) { g_swizzled = YES; return YES; }
-    g_origJSON = (id(*)(id, SEL, NSData *, NSJSONReadingOptions, NSError **))orig;
-    method_setImplementation(m, (IMP)CK7JSONObjectWithData);
+    if (orig != (IMP)CK7JSONObjectWithData) {
+        g_origJSON = (id(*)(id, SEL, NSData *, NSJSONReadingOptions, NSError **))orig;
+        method_setImplementation(m, (IMP)CK7JSONObjectWithData);
+        CKLog(@"L1/L2/L4 JSON 响应单点交换完成 (原 IMP=%p)", (void *)orig);
+    }
     g_swizzled = YES;
-    CKLog(@"L1/L2/L4 JSON 单点交换完成 (原 IMP=%p)", (void *)orig);
+    // v1.03: 出站方向同点交换（设备码轮换）
+    SEL sel2 = @selector(dataWithJSONObject:options:error:);
+    Method m2 = class_getClassMethod(cls, sel2);
+    if (m2) {
+        IMP orig2 = method_getImplementation(m2);
+        if (orig2 != (IMP)CK7DataWithJSONObject) {
+            g_origJSONData = (NSData *(*)(id, SEL, id, NSJSONWritingOptions, NSError **))orig2;
+            method_setImplementation(m2, (IMP)CK7DataWithJSONObject);
+            CKLog(@"L6 JSON 请求单点交换完成 (原 IMP=%p)", (void *)orig2);
+        }
+    } else {
+        CKLog(@"未找到 dataWithJSONObject:options:error:（L6 不可用）");
+    }
     return YES;
 }
 
 static BOOL CK7SwizzleAlive(void) {
-    Method m = class_getClassMethod([NSJSONSerialization class],
-                                    @selector(JSONObjectWithData:options:error:));
-    return m && method_getImplementation(m) == (IMP)CK7JSONObjectWithData;
+    Class cls = [NSJSONSerialization class];
+    Method m = class_getClassMethod(cls, @selector(JSONObjectWithData:options:error:));
+    BOOL ok = m && method_getImplementation(m) == (IMP)CK7JSONObjectWithData;
+    Method m2 = class_getClassMethod(cls, @selector(dataWithJSONObject:options:error:));
+    if (m2 && g_origJSONData &&
+        method_getImplementation(m2) != (IMP)CK7DataWithJSONObject) ok = NO;
+    return ok;
 }
 
 #pragma mark - L3 直启兜底（主程序）
@@ -546,9 +673,9 @@ static NSString *CK7StatusLine(void) {
     // v1.02: 全 ASCII 计数（✓/✗ 在部分字体下渲染成方框）
     int cached = CK7CachedLink().length > 0 ? 1 : 0;
     return [NSString stringWithFormat:
-        @"🛰VIP·b7 %@ V%ld R%ld C%d S%d W%ld D%ld K%ld/%ld",
+        @"🛰VIP·b7 %@ V%ld R%ld C%d S%d W%ld D%ld T%ld K%ld/%ld",
         mode, g_vipRewrite, g_replay, cached, (int)g_savedCfg,
-        g_toastSwallowed, g_directStart, g_cutBlocked, g_keepReplay];
+        g_toastSwallowed, g_directStart, g_devRewrite, g_cutBlocked, g_keepReplay];
 }
 
 // v1.02: 完整诊断文本（点悬浮窗复制到剪贴板，直接粘给分析者）
@@ -567,6 +694,9 @@ static NSString *CK7Diagnostics(void) {
         CK7CachedLink().length > 0 ? @"有" : @"无",
         g_directStart, g_toastSeen, g_toastSwallowed, (int)g_savedCfg,
         g_cutBlocked, g_keepReplay];
+    [s appendFormat:@"L6 设备码改写=%ld 次 | 轮换码=%@\n",
+        g_devRewrite,
+        [[NSUserDefaults standardUserDefaults] stringForKey:kCK7RotatedDev] ?: @"(未生成)"];
     [s appendFormat:@"swizzle存活: %@ | tick=%ld\n",
         CK7SwizzleAlive() ? @"是" : @"否", g_tick];
     [s appendString:@"---- 最近日志(旧→新) ----\n"];
