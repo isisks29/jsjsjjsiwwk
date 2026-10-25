@@ -715,9 +715,14 @@ static void CK7LoadFromPrefs(id self, SEL _cmd, void (^completion)(id, NSError *
 
 static BOOL (*g_origStartTunnel)(id, SEL, NSDictionary *, NSError **);
 static BOOL CK7StartTunnel(id self, SEL _cmd, NSDictionary *options, NSError **error) {
-    NSError *local = nil;
-    BOOL ok = g_origStartTunnel(self, _cmd, options, error ? error : &local);
-    NSError *e = error ? *error : local;
+    BOOL ok;
+    NSError *e = nil;
+    if (error) {
+        ok = g_origStartTunnel(self, _cmd, options, error);
+        e = *error;
+    } else {
+        ok = g_origStartTunnel(self, _cmd, options, &e);
+    }
     CKLog(@"NE startVPNTunnelWithOptions 结果=%@ err=%@",
           ok ? @"YES" : @"NO", e ?: @"无");
     return ok;
@@ -725,9 +730,14 @@ static BOOL CK7StartTunnel(id self, SEL _cmd, NSDictionary *options, NSError **e
 
 static BOOL (*g_origStartTunnelSimple)(id, SEL, NSError **);
 static BOOL CK7StartTunnelSimple(id self, SEL _cmd, NSError **error) {
-    NSError *local = nil;
-    BOOL ok = g_origStartTunnelSimple(self, _cmd, error ? error : &local);
-    NSError *e = error ? *error : local;
+    BOOL ok;
+    NSError *e = nil;
+    if (error) {
+        ok = g_origStartTunnelSimple(self, _cmd, error);
+        e = *error;
+    } else {
+        ok = g_origStartTunnelSimple(self, _cmd, &e);
+    }
     CKLog(@"NE startVPNTunnel 结果=%@ err=%@", ok ? @"YES" : @"NO", e ?: @"无");
     return ok;
 }
@@ -1091,4 +1101,3 @@ __attribute__((constructor)) static void CK7Ctor(void) {
         CK7Watchdog();
     }
 }
-
