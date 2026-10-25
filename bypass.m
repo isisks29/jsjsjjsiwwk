@@ -1,6 +1,12 @@
 // =====================================================================
-//  bypass7.m — 第七课 v1.05（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
+//  bypass7.m — 第七课 v1.06（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
 //  目标：注入后直接获得会员权益（SVIP 界面 + 连接不被拒 + 会话不被服务端掐断）
+//
+//  ▍v1.06 变更（实测 v1.05：NE 状态 Connecting→Disconnected 循环——扩展进程
+//             起来即失败；主程序侧已全绿）
+//   1. 用靶场硬编码 AES-128-ECB key 解开缓存 accessLink：诊断/日志直接给出
+//      vmess 节点 host:port/net/tls——判断隧道失败是否因老师节点已下线
+//   2. 缓存 link 更新与启动自检日志都带节点信息
 //
 //  ▍v1.05 变更（实测：choose 200→save 成功→start YES 全链路放行，但 UI 仍
 //             「未连接」→ 失败在 Tunnel.appex 扩展进程内部，主程序不可见）
@@ -128,6 +134,7 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <CommonCrypto/CommonCrypto.h>   // v1.06: 解缓存 accessLink 用（libSystem 内置）
 
 #define CK7_APP_BID     "com.zheyoutech.app"
 #define CK7_TUNNEL_BID  "com.zheyoutech.app.tunnel"
@@ -181,6 +188,7 @@ static id (*g_origJSON)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
 
 static NSString *CK7StatusLine(void);   // 前置声明（HUD/直启共用）
 static void CK7PollStatus(id conn);     // v1.05 前置声明（NE start 钩子用）
+static NSString *CK7InspectLink(NSString *link);   // v1.06 前置声明（缓存日志用）
 
 // v1.02: 环形日志缓存（点悬浮窗一键复制诊断用），多线程安全
 #define CK7_RING_MAX 60
@@ -309,12 +317,49 @@ static void CK7CacheLink(NSString *link) {
     if (![link isEqualToString:old]) {
         [ud setObject:link forKey:kCK7CacheLink];
         g_linkSeen++;
-        CKLog(@"L2 已缓存 accessLink（%lu 字节）", (unsigned long)link.length);
+        CKLog(@"L2 已缓存 accessLink（%lu 字节）vmess节点=%@",
+              (unsigned long)link.length, CK7InspectLink(link) ?: @"?");
     }
 }
 
 static NSString *CK7CachedLink(void) {
     return [[NSUserDefaults standardUserDefaults] stringForKey:kCK7CacheLink];
+}
+
+// v1.06: 用靶场硬编码 AES-128-ECB key（"81zvl1fk9mcruawg" @0x1002a6de0，
+// SymmetricCryptographicProcessMechanism / CCCrypt FUN_10007b4d8 实证）解开
+// 缓存的 accessLink，暴露 vmess 节点地址——判断“隧道起不来”是不是节点已死
+static NSString *CK7InspectLink(NSString *link) {
+    if (link.length < 16) return nil;
+    NSData *ct = [[NSData alloc] initWithBase64EncodedString:link options:0];
+    if (!ct.length) return @"(外层base64失败)";
+    char key[16];
+    memcpy(key, "81zvl1fk9mcruawg", 16);
+    NSMutableData *pt = [NSMutableData dataWithLength:ct.length + 32];
+    size_t moved = 0;
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES128,
+                                 kCCOptionPKCS7Padding | kCCOptionECBMode,
+                                 key, 16, NULL, ct.bytes, ct.length,
+                                 pt.mutableBytes, pt.length, &moved);
+    if (st != kCCSuccess) return [NSString stringWithFormat:@"(AES失败 %d)", (int)st];
+    pt.length = moved;
+    NSString *s = [[NSString alloc] initWithData:pt encoding:NSUTF8StringEncoding];
+    if (!s) return @"(解密后非UTF8)";
+    if (![s hasPrefix:@"vmess://"])
+        return [NSString stringWithFormat:@"(前缀异常:%@)",
+                [s substringToIndex:MIN((NSUInteger)24, s.length)]];
+    NSData *jd = [[NSData alloc] initWithBase64EncodedString:[s substringFromIndex:8]
+                                                     options:0];
+    if (!jd) return @"(内层base64失败)";
+    id j = g_origJSON
+        ? g_origJSON([NSJSONSerialization class],
+                     @selector(JSONObjectWithData:options:error:), jd, 0, NULL)
+        : [NSJSONSerialization JSONObjectWithData:jd options:0 error:NULL];
+    if (![j isKindOfClass:[NSDictionary class]]) return @"(vmess JSON解析失败)";
+    NSDictionary *d = (NSDictionary *)j;
+    return [NSString stringWithFormat:@"%@:%@ net=%@ tls=%@ ps=%@",
+            d[@"add"] ?: d[@"address"] ?: @"?", d[@"port"] ?: @"?",
+            d[@"net"] ?: @"?", d[@"tls"] ?: @"-", d[@"ps"] ?: @"-"];
 }
 
 static BOOL CK7IsDeniedEnvelope(NSDictionary *d) {
@@ -1085,7 +1130,7 @@ static NSString *CK7Diagnostics(void) {
     NSMutableString *s = [NSMutableString string];
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"HH:mm:ss";
-    [s appendFormat:@"== bypass7 v1.05 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
+    [s appendFormat:@"== bypass7 v1.06 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
     [s appendFormat:@"进程: %@ | 模式: %@\n",
         [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
         (g_mode == CK7ModeApp ? @"主程序" : (g_mode == CK7ModeTunnel ? @"隧道" : @"惰性"))];
@@ -1099,6 +1144,8 @@ static NSString *CK7Diagnostics(void) {
     [s appendFormat:@"L6 设备码改写=%ld 次 | 轮换码=%@\n",
         g_devRewrite,
         [[NSUserDefaults standardUserDefaults] stringForKey:kCK7RotatedDev] ?: @"(未生成)"];
+    [s appendFormat:@"缓存 link 的 vmess 节点: %@\n",
+        CK7InspectLink(CK7CachedLink()) ?: @"(无缓存或解析失败)"];
     [s appendFormat:@"swizzle存活: %@ | tick=%ld\n",
         CK7SwizzleAlive() ? @"是" : @"否", g_tick];
     [s appendString:@"---- 最近日志(旧→新) ----\n"];
@@ -1297,8 +1344,9 @@ __attribute__((constructor)) static void CK7Ctor(void) {
             CK7InstallMoreToastHooks();   // v1.04
             CK7InstallNEHooks();          // v1.04
             CK7InstallLabelHook();        // v1.04
-            CKLog(@"link 缓存: %@ | keep 缓存: 不适用",
-                  CK7CachedLink() ? @"已有" : @"空（需先成功连一次）");
+            CKLog(@"link 缓存: %@ 节点=%@ | keep 缓存: 不适用",
+                  CK7CachedLink() ? @"已有" : @"空（需先成功连一次）",
+                  CK7InspectLink(CK7CachedLink()) ?: @"-");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 CK7MakeHUD();
