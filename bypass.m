@@ -1,6 +1,16 @@
 // =====================================================================
-//  bypass7.m — 第七课（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
+//  bypass7.m — 第七课 v1.01（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
 //  目标：注入后直接获得会员权益（SVIP 界面 + 连接不被拒 + 会话不被服务端掐断）
+//
+//  ▍v1.01 变更（实测反馈：点连接无反应且无任何提示）
+//   1. L3 不再无脑吞错误 toast：仅当兜底可用（有缓存 link 或系统已保存
+//      隧道配置）才吞并直启；否则原样放行并打日志——v1.00 在两者皆无时
+//      把服务端的真实拒绝原因（如 permission denied）静默吃掉了
+//   2. 新增信封诊断日志：主程序每个 API 回包打印 state/note/bodyKeys，
+//      直接看清 route/choose 到底回了什么
+//   3. 所有 SVProgressHUD 错误 toast 全量入日志（含被放行的）
+//   4. 新增 g_savedCfg 探测（启动 4s + 每 30s）：loadAllFromPreferences
+//      检查系统里有无本 App 隧道配置；HUD 增加 S(已存配置)/W(吞toast) 字段
 //
 //  ▍靶场结构（全部来自 Ghidra 导出 + 原始二进制交叉验证）
 //   主程序  Payload/Catspiration.app/Catspiration        (4,071,968 B, Swift)
@@ -106,6 +116,9 @@ static long g_linkSeen = 0;      // 缓存 link 更新次数
 static long g_cutBlocked = 0;    // L4 掐断拦截次数
 static long g_keepReplay = 0;    // L4 keep 重放次数
 static long g_directStart = 0;   // L3 直启次数
+static long g_toastSeen = 0;     // v1.01: 看到的错误 toast 数
+static long g_toastSwallowed = 0;// v1.01: 有兜底时吞掉的 toast 数
+static BOOL g_savedCfg = NO;     // v1.01: 系统里是否有本 App 已保存的隧道配置
 static long g_tick = 0;
 static dispatch_source_t g_timer = nil;
 static UIControl *g_hud = nil;
@@ -204,6 +217,16 @@ static id CK7RewriteApp(id obj, NSInteger depth) {
     if (depth > 5) return obj;
     if ([obj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *d = (NSDictionary *)obj;
+        // v1.01: 信封诊断日志（state/note/body 键名，定位“点击无反应”）
+        if (d[kCK7State] != nil) {
+            id body = d[kCK7Body];
+            NSArray *bk = [body isKindOfClass:[NSDictionary class]]
+                              ? ((NSDictionary *)body).allKeys : @[];
+            NSString *note = [d[kCK7Note] isKindOfClass:[NSString class]]
+                                 ? (NSString *)d[kCK7Note] : @"(非字符串)";
+            if (note.length > 80) note = [[note substringToIndex:80] stringByAppendingString:@"…"];
+            CKLog(@"信封 state=%@ note=「%@」 bodyKeys=%@", d[kCK7State], note, bk);
+        }
         // 顶层信封：被拒 → 用缓存 link 合成成功信封
         if (d[kCK7State] != nil && d[kCK7Note] != nil && CK7IsDeniedEnvelope(d)) {
             NSString *link = CK7CachedLink();
@@ -414,6 +437,33 @@ static void CK7DirectStartTunnel(void) {
     });
 }
 
+// v1.01: 探测系统偏好里是否存有本 App 的隧道配置（L3 直启 / toast 吞并的前提）
+static void CK7ProbeSavedCfg(void) {
+    if (g_mode != CK7ModeApp) return;
+    void *ne = dlopen("/System/Library/Frameworks/NetworkExtension.framework/"
+                      "NetworkExtension", RTLD_NOW);
+    if (!ne) return;
+    Class mgrCls = NSClassFromString(@"NETunnelProviderManager");
+    if (!mgrCls) return;
+    SEL loadSel = NSSelectorFromString(@"loadAllFromPreferencesWithCompletionHandler:");
+    void (*sendLoad)(id, SEL, void (^)(NSArray *, NSError *)) =
+        (void (*)(id, SEL, void (^)(NSArray *, NSError *)))objc_msgSend;
+    sendLoad(mgrCls, loadSel, ^(NSArray *managers, NSError *error) {
+        BOOL found = NO;
+        for (id mgr in managers) {
+            @try {
+                id proto = [mgr valueForKey:@"protocolConfiguration"];
+                NSString *pbid = [proto valueForKey:@"providerBundleIdentifier"];
+                if ([pbid isEqualToString:@CK7_PROVIDER]) { found = YES; break; }
+            } @catch (NSException *ex) { /* 跳过 */ }
+        }
+        if (found != g_savedCfg) {
+            g_savedCfg = found;
+            CKLog(@"探测：系统已保存隧道配置 = %@", found ? @"有" : @"无");
+        }
+    });
+}
+
 static NSArray<NSString *> *CK7FailNeedles(void) {
     return @[ @"permission denied", @"配置数据结构缺失", @"Vmess配置解析失败",
               @"服务器响应格式异常", @"rk_accessLink_mv", @"Base64 解码失败" ];
@@ -423,6 +473,8 @@ static NSArray<NSString *> *CK7FailNeedles(void) {
 static void (*g_origShowError)(id, SEL, NSString *);
 
 static void CK7ShowErrorWithStatus(id self, SEL _cmd, NSString *status) {
+    g_toastSeen++;
+    CKLog(@"toast#%ld:「%@」", g_toastSeen, status);   // v1.01: 全量记录，不再静默
     BOOL hit = NO;
     if (g_mode == CK7ModeApp && [status isKindOfClass:[NSString class]]) {
         for (NSString *needle in CK7FailNeedles()) {
@@ -432,13 +484,24 @@ static void CK7ShowErrorWithStatus(id self, SEL _cmd, NSString *status) {
             }
         }
     }
-    if (hit) {
-        CKLog(@"L3 吞掉失败 toast「%@」，1.5s 后直启已保存隧道", status);
+    // v1.01: 只有存在可行兜底（缓存 link 或系统已保存隧道配置）才吞 toast；
+    // 否则原样放行——静默失败会掩盖真实拒绝原因（v1.00 教训）
+    BOOL canFallback = (CK7CachedLink().length > 0) || g_savedCfg;
+    if (hit && canFallback) {
+        g_toastSwallowed++;
+        CKLog(@"L3 吞掉失败 toast「%@」(兜底可用)，1.5s 后直启已保存隧道", status);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             CK7DirectStartTunnel();
         });
         return;   // 不调原实现 → 用户看不到报错
+    }
+    if (hit && !canFallback) {
+        CKLog(@"L3 放行 toast「%@」：无缓存 link 且无已保存隧道配置——"
+              @"需先成功连一次（新号有体验时长）以建立重放缓存", status);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_hudLabel) g_hudLabel.text = @"⚠️需先成功连一次建立缓存";
+        });
     }
     if (g_origShowError) g_origShowError(self, _cmd, status);
 }
@@ -460,9 +523,10 @@ static NSString *CK7StatusLine(void) {
     NSString *mode = (g_mode == CK7ModeApp) ? @"APP" :
                      (g_mode == CK7ModeTunnel) ? @"TUN" : @"--";
     NSString *cached = CK7CachedLink() ? @"✓" : @"✗";
-    return [NSString stringWithFormat:@"🛰VIP·b7 %@ V%ld R%ld C%@ D%ld K%ld/%ld",
-                                      mode, g_vipRewrite, g_replay, cached,
-                                      g_directStart, g_cutBlocked, g_keepReplay];
+    return [NSString stringWithFormat:
+        @"🛰VIP·b7 %@ V%ld R%ld C%@ S%d W%ld D%ld K%ld/%ld",
+        mode, g_vipRewrite, g_replay, cached, (int)g_savedCfg,
+        g_toastSwallowed, g_directStart, g_cutBlocked, g_keepReplay];
 }
 
 @interface CK7HudTarget : NSObject
@@ -480,12 +544,14 @@ static NSString *CK7StatusLine(void) {
         @"模式: %@\n"
         @"L1 会员字段改写: %ld 次\n"
         @"L2 拒绝重放: %ld 次（link 缓存更新 %ld 次）\n"
-        @"L3 直启隧道: %ld 次\n"
+        @"L3 直启隧道: %ld 次（toast 见到 %ld / 吞掉 %ld）\n"
         @"L4 掐断拦截: %ld 次 / keep 重放: %ld 次\n"
+        @"系统已存隧道配置: %@（直启兜底前提）\n"
         @"swizzle 存活: %@\n主程序 UUID: %@",
         (g_mode == CK7ModeApp ? @"主程序" : @"隧道"),
         g_vipRewrite, g_replay, g_linkSeen, g_directStart,
-        g_cutBlocked, g_keepReplay,
+        g_toastSeen, g_toastSwallowed, g_cutBlocked, g_keepReplay,
+        g_savedCfg ? @"有" : @"无",
         CK7SwizzleAlive() ? @"是" : @"否（看门狗将重挂）",
         CK7UUIDHex()];
     UIAlertController *ac =
@@ -580,6 +646,7 @@ static void CK7Watchdog(void) {
         if (g_mode == CK7ModeApp) {
             if (!g_hud) CK7MakeHUD();
             if (g_hudLabel) g_hudLabel.text = CK7StatusLine();
+            if (g_tick % 15 == 1) CK7ProbeSavedCfg();   // v1.01: 每30s探测已存配置
         }
         if (g_tick - lastBeat >= 15) {   // 30s 心跳
             lastBeat = g_tick;
@@ -617,6 +684,10 @@ __attribute__((constructor)) static void CK7Ctor(void) {
                            dispatch_get_main_queue(), ^{
                 CK7MakeHUD();
                 CKLog(@"就绪：L1 会员改写 + L2 拒绝重放 + L3 直启兜底 + L5 看门狗");
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                CK7ProbeSavedCfg();   // v1.01: 启动即探测一次已存隧道配置
             });
         } else {
             CKLog(@"就绪：L4 保活免疫（connectionState=0 改写 + keep 重放）");
