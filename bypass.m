@@ -1,6 +1,15 @@
 // =====================================================================
-//  bypass7.m — 第七课 v1.06（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
+//  bypass7.m — 第七课 v1.07（快连 VPN / Catspiration · com.zheyoutech.app v1.03）
 //  目标：注入后直接获得会员权益（SVIP 界面 + 连接不被拒 + 会话不被服务端掐断）
+//
+//  ▍v1.07 变更（实测 v1.06：短暂 Connected 后循环掉线；诊断缺「隧道日志」段
+//             → 主程序 App 组容器不可用嫌疑；vmess 解密出非 UTF8）
+//   1. AES 修正：反汇编 FUN_10007b4d8 @0x10007ba14 实证 CCCrypt 的 IV=KEY 自身、
+//      options=PKCS7（CBC 模式）——不是 ECB；vmess 节点解密恢复
+//   2. App 组容器探针：启动即日志 + 诊断行——容器不可用 ⇒ 重签名丢 App Groups
+//      entitlement ⇒ running_config.json 无法共享给扩展 ⇒ 隧道必失败（环境级根因）
+//   3. loadFromPreferences 回调签名修正（只有 NSError* 一个参数）
+//   4. 状态轮询改单实例（多次点击不再叠加 poller 混淆日志）
 //
 //  ▍v1.06 变更（实测 v1.05：NE 状态 Connecting→Disconnected 循环——扩展进程
 //             起来即失败；主程序侧已全绿）
@@ -91,8 +100,9 @@
 //   连接授权（服务端）：
 //    · route/choose 返回 state==901 → 弹订阅窗 SubscriptionView (FUN_100084698)
 //    · stateNote=="permission denied" → 原样 toast（FUN_10000e650 @0x10000e660）
-//    · state==200 → body.rk_accessLink_mv = AES-128-ECB(硬编码key
-//      "81zvl1fk9mcruawg" @0x1002a6de0) + base64("vmess://"+base64(JSON))
+//    · state==200 → body.rk_accessLink_mv = base64(AES-128-CBC[IV=KEY](
+//      "vmess://"+base64(JSON)))，key="81zvl1fk9mcruawg"(@0x1002a6e00，
+//      IV=KEY 自身，FUN_10007b4d8 @0x10007ba14 反汇编实证)
 //      → 解密解析(FUN_1000841b4) → 写 App组 running_config.json +
 //      NETunnelProviderProtocol 存系统偏好(FUN_1000790c8) → startVPNTunnel
 //   会话掐断（服务端）：
@@ -174,6 +184,7 @@ static long g_directStart = 0;   // L3 直启次数
 static long g_toastSeen = 0;     // v1.01: 看到的错误 toast 数
 static long g_toastSwallowed = 0;// v1.01: 有兜底时吞掉的 toast 数
 static BOOL g_savedCfg = NO;     // v1.01: 系统里是否有本 App 已保存的隧道配置
+static BOOL g_groupOK = NO;      // v1.07: App 组容器是否可用（entitlement 探针）
 static long g_devRewrite = 0;    // v1.03: 出站请求设备码改写次数
 static BOOL g_inReqRewrite = NO; // v1.03: 出站重序列化防递归
 static long g_tick = 0;
@@ -337,9 +348,10 @@ static NSString *CK7InspectLink(NSString *link) {
     memcpy(key, "81zvl1fk9mcruawg", 16);
     NSMutableData *pt = [NSMutableData dataWithLength:ct.length + 32];
     size_t moved = 0;
-    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES128,
-                                 kCCOptionPKCS7Padding | kCCOptionECBMode,
-                                 key, 16, NULL, ct.bytes, ct.length,
+    // v1.07 实证修正：FUN_10007b4d8 反汇编 @0x10007ba14 `ldr x23,[x8,#0x10]`
+    // → CCCrypt(op, AES128, PKCS7, key, 16, iv=key自身, …) —— CBC 模式、IV=KEY
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding,
+                                 key, 16, key, ct.bytes, ct.length,
                                  pt.mutableBytes, pt.length, &moved);
     if (st != kCCSuccess) return [NSString stringWithFormat:@"(AES失败 %d)", (int)st];
     pt.length = moved;
@@ -814,12 +826,12 @@ static void CK7LoadAllFromPrefs(id self, SEL _cmd,
     g_origLoadAllFromPrefs(self, _cmd, wrapped);
 }
 
-static void (*g_origLoadFromPrefs)(id, SEL, void (^)(id, NSError *));
-static void CK7LoadFromPrefs(id self, SEL _cmd, void (^completion)(id, NSError *)) {
-    void (^wrapped)(id, NSError *) = ^(id mgr, NSError *error) {
-        CKLog(@"NE loadFromPreferences: mgr=%@ err=%@",
-              mgr ? @"有" : @"无", error ?: @"无");
-        if (completion) completion(mgr, error);
+// v1.07 修正：loadFromPreferencesWithCompletionHandler: 的回调只有 (NSError*) 一个参数
+static void (*g_origLoadFromPrefs)(id, SEL, void (^)(NSError *));
+static void CK7LoadFromPrefs(id self, SEL _cmd, void (^completion)(NSError *)) {
+    void (^wrapped)(NSError *) = ^(NSError *error) {
+        CKLog(@"NE loadFromPreferences: err=%@", error ?: @"无(成功)");
+        if (completion) completion(error);
     };
     g_origLoadFromPrefs(self, _cmd, wrapped);
 }
@@ -878,7 +890,7 @@ static void CK7InstallNEHooks(void) {
         Method m2b = class_getInstanceMethod(vpnMgr, s2b);
         if (m2b) {
             g_origLoadFromPrefs =
-                (void (*)(id, SEL, void (^)(id, NSError *)))method_getImplementation(m2b);
+                (void (*)(id, SEL, void (^)(NSError *)))method_getImplementation(m2b);
             method_setImplementation(m2b, (IMP)CK7LoadFromPrefs);
         }
     }
@@ -1085,6 +1097,9 @@ static NSString *CK7NEStatusName(NSInteger st) {
 
 static void CK7PollStatus(id conn) {
     g_pollConn = conn;   // 强持有防释放
+    // v1.07: 单实例轮询——多次点击不再叠加多个 poller 混淆日志
+    static dispatch_source_t sPoll = nil;
+    if (sPoll) { dispatch_source_cancel(sPoll); sPoll = nil; }
     __block NSInteger last = -1;
     __block int n = 0;
     dispatch_source_t t =
@@ -1103,12 +1118,14 @@ static void CK7PollStatus(id conn) {
         }
         if (n >= 30 || st == 2) {
             dispatch_source_cancel(t);
+            if (sPoll == t) sPoll = nil;
             if (st != 2)
-                CKLog(@"NE 状态轮询结束(30s)：终态=%@ —— 扩展进程未能建立隧道，"
-                      @"看诊断尾部「隧道日志」段", CK7NEStatusName(st));
+                CKLog(@"NE 状态轮询结束(30s)：终态=%@ —— 扩展进程未能稳定建立隧道，"
+                      @"看诊断尾部「隧道日志」段与 App组容器状态", CK7NEStatusName(st));
             g_pollConn = nil;
         }
     });
+    sPoll = t;
     dispatch_resume(t);
 }
 
@@ -1130,7 +1147,7 @@ static NSString *CK7Diagnostics(void) {
     NSMutableString *s = [NSMutableString string];
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"HH:mm:ss";
-    [s appendFormat:@"== bypass7 v1.06 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
+    [s appendFormat:@"== bypass7 v1.07 诊断 %@ ==\n", [df stringFromDate:[NSDate date]]];
     [s appendFormat:@"进程: %@ | 模式: %@\n",
         [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
         (g_mode == CK7ModeApp ? @"主程序" : (g_mode == CK7ModeTunnel ? @"隧道" : @"惰性"))];
@@ -1146,7 +1163,8 @@ static NSString *CK7Diagnostics(void) {
         [[NSUserDefaults standardUserDefaults] stringForKey:kCK7RotatedDev] ?: @"(未生成)"];
     [s appendFormat:@"缓存 link 的 vmess 节点: %@\n",
         CK7InspectLink(CK7CachedLink()) ?: @"(无缓存或解析失败)"];
-    [s appendFormat:@"swizzle存活: %@ | tick=%ld\n",
+    [s appendFormat:@"App组容器: %@ | swizzle存活: %@ | tick=%ld\n",
+        g_groupOK ? @"可用" : @"不可用(重签名丢entitlement?)",
         CK7SwizzleAlive() ? @"是" : @"否", g_tick];
     [s appendString:@"---- 最近日志(旧→新) ----\n"];
     CK7RingInit();
@@ -1338,6 +1356,18 @@ __attribute__((constructor)) static void CK7Ctor(void) {
         }
         CKLog(@"==== bypass7 注入 %@ (%@) UUID=%@ ====",
               bid, g_mode == CK7ModeApp ? @"主程序" : @"隧道", CK7UUIDHex());
+        // v1.07: App 组容器可用性——重签名丢 App Groups entitlement 时此值为空，
+        // running_config.json 无法共享给隧道进程（连接必失败的根因候选）
+        {
+            NSURL *grp = [[NSFileManager defaultManager]
+                containerURLForSecurityApplicationGroupIdentifier:
+                    @"group.com.zheyoutech.app"];
+            g_groupOK = (grp != nil);
+            CKLog(@"App组容器(group.com.zheyoutech.app): %@%@",
+                  grp ? @"可用 " : @"不可用‼️ 重签名很可能丢了 App Groups "
+                                  @"entitlement——隧道进程将读不到 running_config.json",
+                  grp ? [grp path] : @"");
+        }
         CK7InstallJSONSwizzle();
         if (g_mode == CK7ModeApp) {
             CK7InstallToastHook();
