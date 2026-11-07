@@ -147,6 +147,9 @@ static BOOL looksLikeObject(id o) {
     return p > 0x100000000ULL && p < 0x00007FFFFFFFFFFFULL;
 }
 
+// 说明：不要再通过 _0xE4C8719B 去读面板「开关对象」。
+// 实测该返回值不是可安全解引用的对象，读取会直接 EXC_BAD_ACCESS。
+
 // ---------------------------------------------------------------- 描述对象
 
 static NSString *descObj(id o) {
@@ -496,32 +499,6 @@ static void diagSetHidden(id self, SEL _cmd, BOOL hidden) {
     if (origSetHidden) ((void (*)(id, SEL, BOOL))origSetHidden)(self, _cmd, hidden);
 }
 
-static void probeSwitch(NSString *name, uintptr_t p) {
-    if (!p) { L(@"开关[%@]: 对象不存在", name); return; }
-    id o = (__bridge id)(void *)p;
-    SEL s = NSSelectorFromString(@"_0xE4C8719B");
-    if (![o respondsToSelector:s]) { L(@"开关[%@]: 没有读取方法", name); return; }
-    id sw = ((id (*)(id, SEL))objc_msgSend)(o, s);
-    if (!sw) { L(@"开关[%@]: 值为 nil", name); return; }
-    if (!looksLikeObject(sw)) { L(@"开关[%@]: 值=%p(非对象)", name, (__bridge void *)sw); return; }
-    Class c = object_getClass(sw);
-    uint8_t b = *(uint8_t *)(__bridge void *)sw;
-    L(@"开关[%@]: 对象=%p 类=%s 首字节=%u", name, (__bridge void *)sw,
-      c ? class_getName(c) : "?", (unsigned)b);
-}
-
-static void forceSwitchOn(NSString *name, uintptr_t p) {
-    if (!p) return;
-    id o = (__bridge id)(void *)p;
-    SEL s = NSSelectorFromString(@"_0xE4C8719B");
-    if (![o respondsToSelector:s]) return;
-    id sw = ((id (*)(id, SEL))objc_msgSend)(o, s);
-    if (!sw || !looksLikeObject(sw)) return;
-    uint8_t old = *(uint8_t *)(__bridge void *)sw;
-    *(uint8_t *)(__bridge void *)sw = 1;
-    L(@"开关[%@]: 首字节 %u -> 1", name, (unsigned)old);
-}
-
 static void diagDraw(id self, SEL _cmd, id view) {
     int n = __sync_add_and_fetch(&gDrawCount, 1);
     if (n == 1 || (n % 120) == 0) L(@"[drawInMTKView#%d] %@", n, NSStringFromClass([self class]));
@@ -724,8 +701,8 @@ static void qxtdiag_init(void) {
                            dispatch_get_main_queue(), ^{ forcePanelVisible(@"7s"); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                probeSwitch(@"图标", G(0x18581E0));
-                probeSwitch(@"面板", G(0x18581D8));
+                L(@"指针(4.5s): 图标=%p 面板=%p 窗口=%p",
+                  (void *)G(0x18581E0), (void *)G(0x18581D8), (void *)G(0x1852128));
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
