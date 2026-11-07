@@ -369,18 +369,15 @@ static void forcePanelVisible(NSString *tag) {
     logPanelState(tag);
 }
 
-static void autoClickIcon(void) {
-    uintptr_t p = G(0x18581E0);
-    if (!p) { L(@"自动点击: 图标不存在"); return; }
-    id o = (__bridge id)(void *)p;
-    if (![o isKindOfClass:[UIView class]]) { L(@"自动点击: 不是视图"); return; }
-    SEL s = NSSelectorFromString(@"iconOnClick");
-    if (![o respondsToSelector:s]) { L(@"自动点击: 没有 iconOnClick"); return; }
-    logPanelState(@"点击前");
-    L(@"自动点击: 调用 iconOnClick ...");
-    ((void (*)(id, SEL))objc_msgSend)(o, s);
-    L(@"自动点击: 调用完成");
-    logPanelState(@"点击后");
+// 静默把当前日志写进剪贴板（不弹窗）。用于每个阶段结束时，
+// 这样即使 App 崩在后面某一步，崩溃前的现场也已经留在剪贴板里。
+static void saveClip(void) {
+    NSString *text = nil;
+    [gLock lock];
+    text = [gLog copy];
+    [gLock unlock];
+    if (text.length > 120000) text = [text substringToIndex:120000];
+    UIPasteboard.generalPasteboard.string = text;
 }
 
 // ---------------------------------------------------------------- 快照
@@ -680,29 +677,37 @@ static void qxtdiag_init(void) {
             listImages();
             listObfuscatedClasses();
             installHooks();
+            saveClip();
 
             scheduleWatch();
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ snap(@"3s"); });
+                           dispatch_get_main_queue(), ^{ snap(@"3s"); saveClip(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ placeIconTopRight(@"3.5s"); });
+                           dispatch_get_main_queue(), ^{ placeIconTopRight(@"3.5s"); saveClip(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ makeIconVisible(); });
+                           dispatch_get_main_queue(), ^{ makeIconVisible(); saveClip(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ autoClickIcon(); });
+                           dispatch_get_main_queue(), ^{
+                // 不再自动点图标：实测在卡密未通过时点它会让靶场直接崩。
+                L(@"5s: 图标保持可见，未自动点击");
+                logPanelState(@"5s");
+                saveClip();
+            });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 L(@"[实验] 修改两处面板显示逻辑");
                 patchInsn(0xAE4A0, 0x52800022, 0x52800002);
                 patchInsn(0xCD35C0, 0x54002B41, 0xD503201F);
+                saveClip();
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ forcePanelVisible(@"7s"); });
+                           dispatch_get_main_queue(), ^{ forcePanelVisible(@"7s"); saveClip(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 L(@"指针(4.5s): 图标=%p 面板=%p 窗口=%p",
                   (void *)G(0x18581E0), (void *)G(0x18581D8), (void *)G(0x1852128));
+                saveClip();
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
