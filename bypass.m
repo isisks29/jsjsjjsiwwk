@@ -290,6 +290,47 @@ static void logPanelState(NSString *tag) {
       (unsigned)GB(0x1851F34));
 }
 
+static void makeIconVisible(void) {
+    uintptr_t p = G(0x18581E0);
+    if (!p) { L(@"图标配色: 图标不存在"); return; }
+    id o = (__bridge id)(void *)p;
+    if (![o isKindOfClass:[UIView class]]) { L(@"图标配色: 不是视图"); return; }
+    UIView *icon = (UIView *)o;
+    UIImageView *iv = nil;
+    for (UIView *sv in icon.subviews) {
+        if ([sv isKindOfClass:[UIImageView class]]) { iv = (UIImageView *)sv; break; }
+    }
+    if (!iv) { L(@"图标配色: 没有图片子视图"); return; }
+    if (iv.image) {
+        L(@"图标配色: 已有图片 %@", NSStringFromCGSize(iv.image.size));
+        return;
+    }
+    UIGraphicsImageRenderer *r =
+        [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(45, 45)];
+    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [[UIColor redColor] setFill];
+        [ctx fillRect:CGRectMake(0, 0, 45, 45)];
+    }];
+    iv.image = img;
+    iv.hidden = NO;
+    iv.alpha = 1.0;
+    icon.hidden = NO;
+    icon.alpha = 1.0;
+    L(@"图标配色: 已填入红色占位图，图标hidden=%d alpha=%.2f", (int)icon.hidden, icon.alpha);
+}
+
+static void forcePanelVisible(NSString *tag) {
+    uintptr_t p = G(0x18581D8);
+    if (!p) { L(@"强制显示[%@]: 面板不存在", tag); return; }
+    id o = (__bridge id)(void *)p;
+    if (![o isKindOfClass:[UIView class]]) { L(@"强制显示[%@]: 不是视图", tag); return; }
+    UIView *v = (UIView *)o;
+    L(@"强制显示[%@]: hidden %d -> 0", tag, (int)v.hidden);
+    v.hidden = NO;
+    v.alpha = 1.0;
+    logPanelState(tag);
+}
+
 static void autoClickIcon(void) {
     uintptr_t p = G(0x18581E0);
     if (!p) { L(@"自动点击: 图标不存在"); return; }
@@ -556,8 +597,12 @@ static void qxtdiag_init(void) {
                            dispatch_get_main_queue(), ^{ snap(@"3s"); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ placeIconTopRight(@"3.5s"); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ makeIconVisible(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ autoClickIcon(); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ forcePanelVisible(@"7s"); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ placeIconTopRight(@"6s"); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
