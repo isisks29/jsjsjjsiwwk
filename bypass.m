@@ -17,6 +17,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
+#import <libkern/OSCacheControl.h>
 #import <dispatch/dispatch.h>
 #import <stdarg.h>
 #import <string.h>
@@ -136,7 +137,7 @@ static void patchInsn(uintptr_t off, uint32_t expect, uint32_t newInsn) {
         return;
     }
     *p = newInsn;
-    __builtin___clear_cache((char *)addr, (char *)(addr + 4));
+    sys_icache_invalidate((void *)addr, 4);
     L(@"改代码[0x%lx]: 0x%08x -> 0x%08x 权限=%d 读回=0x%08x",
       (unsigned long)off, old, newInsn, (int)kr, *p);
 }
