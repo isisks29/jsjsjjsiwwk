@@ -16,6 +16,7 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach/mach.h>
 #import <dispatch/dispatch.h>
 #import <stdarg.h>
 #import <string.h>
@@ -116,6 +117,29 @@ static void SD(uintptr_t off, int32_t v) {
 }
 
 static BOOL gForceShow = NO;
+
+static void patchInsn(uintptr_t off, uint32_t expect, uint32_t newInsn) {
+    if (!gBase) { L(@"改代码: base 为空"); return; }
+    uintptr_t addr = gBase + off;
+    uint32_t *p = (uint32_t *)addr;
+    uint32_t old = *p;
+    if (old == newInsn) { L(@"改代码[0x%lx]: 已是目标值", (unsigned long)off); return; }
+    if (old != expect) {
+        L(@"改代码[0x%lx]: 原值不符 old=0x%08x", (unsigned long)off, old);
+        return;
+    }
+    uintptr_t page = addr & ~(uintptr_t)0xFFF;
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x1000, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        L(@"改代码[0x%lx]: 无写权限 权限=%d，跳过", (unsigned long)off, (int)kr);
+        return;
+    }
+    *p = newInsn;
+    __builtin___clear_cache((char *)addr, (char *)(addr + 4));
+    L(@"改代码[0x%lx]: 0x%08x -> 0x%08x 权限=%d 读回=0x%08x",
+      (unsigned long)off, old, newInsn, (int)kr, *p);
+}
 
 static BOOL looksLikeObject(id o) {
     uintptr_t p = (uintptr_t)(__bridge void *)o;
@@ -454,25 +478,66 @@ static void diagTouchE(id self, SEL _cmd, NSSet *touches, UIEvent *ev) {
     if (origTouchE) ((void (*)(id, SEL, NSSet *, UIEvent *))origTouchE)(self, _cmd, touches, ev);
 }
 
-static void diagDraw(id self, SEL _cmd, id view) {
-    int n = __sync_add_and_fetch(&gDrawCount, 1);
-    if (n == 1 || (n % 120) == 0) L(@"[drawInMTKView#%d] %@", n, NSStringFromClass([self class]));
-    if (gForceShow) {
-        if (GD(0x185ACB8) != -1) SD(0x185ACB8, -1);
-        if ([self isKindOfClass:[UIView class]]) {
-            UIView *v = (UIView *)self;
-            if (v.hidden || v.alpha < 0.99) {
-                static int fixedCount = 0;
-                fixedCount++;
-                if (fixedCount <= 5) {
-                    L(@"[实验] 绘制回调中面板是隐藏的，已恢复显示(第%d次)", fixedCount);
-                }
-                v.hidden = NO;
-                v.alpha = 1.0;
+static IMP origSetHidden = NULL;
+
+static void diagSetHidden(id self, SEL _cmd, BOOL hidden) {
+    if (hidden) {
+        Class pc = objc_getClass("_0x1E6B7A93");
+        if (pc && [self isKindOfClass:pc]) {
+            static int cnt = 0;
+            cnt++;
+            if (cnt <= 6) {
+                NSArray *bt = [NSThread callStackSymbols];
+                L(@"[隐藏面板#%d] 调用栈: %@", cnt, [bt componentsJoinedByString:@" | "]);
             }
         }
     }
+    if (origSetHidden) ((void (*)(id, SEL, BOOL))origSetHidden)(self, _cmd, hidden);
+}
+
+static void probeSwitch(NSString *name, uintptr_t p) {
+    if (!p) { L(@"开关[%@]: 对象不存在", name); return; }
+    id o = (__bridge id)(void *)p;
+    SEL s = NSSelectorFromString(@"_0xE4C8719B");
+    if (![o respondsToSelector:s]) { L(@"开关[%@]: 没有读取方法", name); return; }
+    id sw = ((id (*)(id, SEL))objc_msgSend)(o, s);
+    if (!sw) { L(@"开关[%@]: 值为 nil", name); return; }
+    if (!looksLikeObject(sw)) { L(@"开关[%@]: 值=%p(非对象)", name, (__bridge void *)sw); return; }
+    Class c = object_getClass(sw);
+    uint8_t b = *(uint8_t *)(__bridge void *)sw;
+    L(@"开关[%@]: 对象=%p 类=%s 首字节=%u", name, (__bridge void *)sw,
+      c ? class_getName(c) : "?", (unsigned)b);
+}
+
+static void forceSwitchOn(NSString *name, uintptr_t p) {
+    if (!p) return;
+    id o = (__bridge id)(void *)p;
+    SEL s = NSSelectorFromString(@"_0xE4C8719B");
+    if (![o respondsToSelector:s]) return;
+    id sw = ((id (*)(id, SEL))objc_msgSend)(o, s);
+    if (!sw || !looksLikeObject(sw)) return;
+    uint8_t old = *(uint8_t *)(__bridge void *)sw;
+    *(uint8_t *)(__bridge void *)sw = 1;
+    L(@"开关[%@]: 首字节 %u -> 1", name, (unsigned)old);
+}
+
+static void diagDraw(id self, SEL _cmd, id view) {
+    int n = __sync_add_and_fetch(&gDrawCount, 1);
+    if (n == 1 || (n % 120) == 0) L(@"[drawInMTKView#%d] %@", n, NSStringFromClass([self class]));
+    if (gForceShow) SD(0x185ACB8, -1);
     if (origDraw) ((void (*)(id, SEL, id))origDraw)(self, _cmd, view);
+    if (gForceShow && [self isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)self;
+        if (v.hidden || v.alpha < 0.99) {
+            static int fixedCount = 0;
+            fixedCount++;
+            if (fixedCount <= 3) {
+                L(@"[实验] 绘制后恢复显示(第%d次)", fixedCount);
+            }
+            v.hidden = NO;
+            v.alpha = 1.0;
+        }
+    }
 }
 
 static void installHooks(void) {
@@ -495,6 +560,7 @@ static void installHooks(void) {
     if (viewCls) {
         swizzleMethod(viewCls, NSSelectorFromString(@"drawInMTKView:"), (IMP)diagDraw, &origDraw);
     }
+    swizzleMethod([UIView class], @selector(setHidden:), (IMP)diagSetHidden, &origSetHidden);
 
     dumpMethods(winCls, "窗口类");
     dumpMethods(iconCls, "图标类");
@@ -647,12 +713,28 @@ static void qxtdiag_init(void) {
                            dispatch_get_main_queue(), ^{ makeIconVisible(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ autoClickIcon(); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                L(@"[实验] 修改两处面板显示逻辑");
+                patchInsn(0xAE4A0, 0x52800022, 0x52800002);
+                patchInsn(0xCD35C0, 0x54002B41, 0xD503201F);
+            });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ forcePanelVisible(@"7s"); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                probeSwitch(@"图标", G(0x18581E0));
+                probeSwitch(@"面板", G(0x18581D8));
+            });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 gForceShow = YES;
                 L(@"[实验] 开始持续强制显示面板并打开绘制门槛");
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                probeSwitch(@"面板(10s)", G(0x18581D8));
+                probeSwitch(@"图标(10s)", G(0x18581E0));
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ placeIconTopRight(@"6s"); });
