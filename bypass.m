@@ -108,7 +108,7 @@ static uint8_t GB(uintptr_t off) {
 }
 
 static BOOL looksLikeObject(id o) {
-    uintptr_t p = (uintptr_t)o;
+    uintptr_t p = (uintptr_t)(__bridge void *)o;
     return p > 0x100000000ULL && p < 0x00007FFFFFFFFFFFULL;
 }
 
@@ -116,19 +116,19 @@ static BOOL looksLikeObject(id o) {
 
 static NSString *descObj(id o) {
     if (!o) return @"nil";
-    if (!looksLikeObject(o)) return [NSString stringWithFormat:@"(bad ptr %p)", (void *)o];
+    if (!looksLikeObject(o)) return [NSString stringWithFormat:@"(bad ptr %p)", (__bridge void *)o];
     @try {
         NSString *cn = NSStringFromClass(object_getClass(o));
         if ([o isKindOfClass:[UIView class]]) {
             UIView *v = (UIView *)o;
             return [NSString stringWithFormat:
                     @"<%@ %p> f=%@ h=%d a=%.2f win=%@ sub=%lu",
-                    cn, (void *)o, NSStringFromCGRect(v.frame),
+                    cn, (__bridge void *)o, NSStringFromCGRect(v.frame),
                     (int)v.hidden, v.alpha,
                     v.window ? NSStringFromClass([v.window class]) : @"nil",
                     (unsigned long)v.subviews.count];
         }
-        return [NSString stringWithFormat:@"<%@ %p>", cn, (void *)o];
+        return [NSString stringWithFormat:@"<%@ %p>", cn, (__bridge void *)o];
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"(desc error %@)", e.reason];
     }
@@ -139,11 +139,41 @@ static void dumpView(UIView *v, int depth, int *budget) {
     (*budget)--;
     NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2)
                                       withString:@" " startingAtIndex:0];
-    L(@"%@%@ f=%@ h=%d a=%.2f tag=%ld",
+    L(@"%@%@ f=%@ h=%d a=%.2f tag=%ld win=%@ sup=%@",
       pad, NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
-      (int)v.hidden, v.alpha, (long)v.tag);
-    if (depth >= 6) return;
+      (int)v.hidden, v.alpha, (long)v.tag,
+      v.window ? NSStringFromClass([v.window class]) : @"nil",
+      v.superview ? NSStringFromClass([v.superview class]) : @"nil");
+    if (depth >= 8) return;
     for (UIView *s in v.subviews) dumpView(s, depth + 1, budget);
+}
+
+// 视图祖先链（判断对象到底挂在哪个窗口上）
+static NSString *parentChain(id o) {
+    if (![o isKindOfClass:[UIView class]]) return @"(不是视图)";
+    NSMutableArray *a = [NSMutableArray array];
+    UIView *v = (UIView *)o;
+    for (int i = 0; i < 12 && v; i++) {
+        [a addObject:NSStringFromClass([v class])];
+        v = v.superview;
+    }
+    return [a componentsJoinedByString:@" < "];
+}
+
+// 同时收集 app.windows 与 UIScene 场景窗口（iOS 13+ 某些 App 的 windows 为空）
+static NSArray<UIWindow *> *allWindows(void) {
+    NSMutableArray<UIWindow *> *arr = [NSMutableArray array];
+    UIApplication *app = UIApplication.sharedApplication;
+    for (UIWindow *w in app.windows) { if (![arr containsObject:w]) [arr addObject:w]; }
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in app.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (![arr containsObject:w]) [arr addObject:w];
+            }
+        }
+    }
+    return arr;
 }
 
 // ---------------------------------------------------------------- 类名清单
@@ -171,24 +201,26 @@ static void snap(NSString *tag) {
         L(@"---------- 快照 %@ ----------", tag);
         L(@"base=%p", (void *)gBase);
 
-        L(@"全局 container(0x18581E0)=%@", descObj((id)G(0x18581E0)));
-        L(@"全局 view(0x18581D8)=%@",      descObj((id)G(0x18581D8)));
+        L(@"全局 container(0x18581E0)=%@", descObj((__bridge id)(void *)G(0x18581E0)));
+        L(@"  祖先链: %@", parentChain((__bridge id)(void *)G(0x18581E0)));
+        L(@"全局 view(0x18581D8)=%@",      descObj((__bridge id)(void *)G(0x18581D8)));
+        L(@"  祖先链: %@", parentChain((__bridge id)(void *)G(0x18581D8)));
         L(@"开关 0x1851CE0[0]=%u  0x1851F34=%u  0x1851CA0=%p  0x1851CA8=%p  0x1851CB0=%p",
           GB(0x1851CE0), GB(0x1851F34),
           (void *)G(0x1851CA0), (void *)G(0x1851CA8), (void *)G(0x1851CB0));
 
-        UIApplication *app = UIApplication.sharedApplication;
-        NSArray<UIWindow *> *wins = app.windows;
-        L(@"窗口数=%lu keyWindow=%@", (unsigned long)wins.count,
-          descObj(app.keyWindow));
+        NSArray<UIWindow *> *wins = allWindows();
+        UIWindow *keyWin = nil;
+        for (UIWindow *w in wins) { if (w.isKeyWindow) { keyWin = w; break; } }
+        L(@"窗口数=%lu keyWindow=%@", (unsigned long)wins.count, descObj(keyWin));
 
         for (UIWindow *w in wins) {
             L(@"WIN <%@ %p> level=%.1f h=%d a=%.2f f=%@ rvc=%@",
-              NSStringFromClass([w class]), (void *)w,
+              NSStringFromClass([w class]), (__bridge void *)w,
               (double)w.windowLevel, (int)w.hidden, w.alpha,
               NSStringFromCGRect(w.frame),
               w.rootViewController ? NSStringFromClass([w.rootViewController class]) : @"nil");
-            int budget = 30;
+            int budget = 80;
             for (UIView *s in w.subviews) dumpView(s, 1, &budget);
         }
 
@@ -264,7 +296,7 @@ static void installHooks(void) {
     Class winCls  = objc_getClass("_0x8C2F4D71");
     Class iconCls = objc_getClass("_0xD4E9A3C7");
     Class viewCls = objc_getClass("_0x1E6B7A93");
-    L(@"目标类: win=%p icon=%p view=%p", winCls, iconCls, viewCls);
+    L(@"目标类: win=%p icon=%p view=%p", (__bridge void *)winCls, (__bridge void *)iconCls, (__bridge void *)viewCls);
 
     if (winCls) {
         swizzleMethod(winCls, @selector(hitTest:withEvent:), (IMP)diagHitTest, &origHitTest);
