@@ -482,15 +482,22 @@ static void diagTouchE(id self, SEL _cmd, NSSet *touches, UIEvent *ev) {
 static IMP origSetHidden = NULL;
 
 static void diagSetHidden(id self, SEL _cmd, BOOL hidden) {
-    if (hidden) {
-        Class pc = objc_getClass("_0x1E6B7A93");
-        if (pc && [self isKindOfClass:pc]) {
-            static int cnt = 0;
-            cnt++;
-            if (cnt <= 6) {
-                NSArray *bt = [NSThread callStackSymbols];
-                L(@"[隐藏面板#%d] 调用栈: %@", cnt, [bt componentsJoinedByString:@" | "]);
-            }
+    Class pc = objc_getClass("_0x1E6B7A93");
+    BOOL isPanel = (pc && [self isKindOfClass:pc]);
+    if (isPanel && hidden && gForceShow) {
+        // 渲染循环每帧都会把面板藏起来，这里直接把「藏」改成「显示」。
+        static int swallowed = 0;
+        swallowed++;
+        if (swallowed <= 3) L(@"[拦截] 面板隐藏请求被改成显示(第%d次)", swallowed);
+        if (origSetHidden) ((void (*)(id, SEL, BOOL))origSetHidden)(self, _cmd, NO);
+        return;
+    }
+    if (isPanel && hidden) {
+        static int cnt = 0;
+        cnt++;
+        if (cnt <= 3) {
+            NSArray *bt = [NSThread callStackSymbols];
+            L(@"[隐藏面板#%d] 调用栈: %@", cnt, [bt componentsJoinedByString:@" | "]);
         }
     }
     if (origSetHidden) ((void (*)(id, SEL, BOOL))origSetHidden)(self, _cmd, hidden);
@@ -709,10 +716,11 @@ static void qxtdiag_init(void) {
                   (void *)G(0x18581E0), (void *)G(0x18581D8), (void *)G(0x1852128));
                 saveClip();
             });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.2 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 gForceShow = YES;
-                L(@"[实验] 开始持续强制显示面板并打开绘制门槛");
+                L(@"[实验] 开始拦截面板隐藏并打开绘制门槛");
+                saveClip();
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
