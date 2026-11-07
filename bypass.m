@@ -119,6 +119,16 @@ static NSString *descObj(id o) {
     if (!looksLikeObject(o)) return [NSString stringWithFormat:@"(bad ptr %p)", (__bridge void *)o];
     @try {
         NSString *cn = NSStringFromClass(object_getClass(o));
+        if ([o isKindOfClass:[UIImageView class]]) {
+            UIImageView *iv = (UIImageView *)o;
+            UIImage *img = iv.image;
+            return [NSString stringWithFormat:
+                    @"<%@ %p> f=%@ h=%d a=%.2f img=%@ 交互=%d",
+                    cn, (__bridge void *)o, NSStringFromCGRect(iv.frame),
+                    (int)iv.hidden, iv.alpha,
+                    img ? NSStringFromCGSize(img.size) : @"nil",
+                    (int)iv.userInteractionEnabled];
+        }
         if ([o isKindOfClass:[UIView class]]) {
             UIView *v = (UIView *)o;
             return [NSString stringWithFormat:
@@ -176,9 +186,27 @@ static NSArray<UIWindow *> *allWindows(void) {
     return arr;
 }
 
+// ---------------------------------------------------------------- 镜像清单
+
+static void listImages(void) {
+    uint32_t n = _dyld_image_count();
+    int shown = 0;
+    for (uint32_t i = 0; i < n && shown < 80; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        if (strstr(nm, "/System/") || strstr(nm, "/usr/lib/")) continue;
+        if (!strstr(nm, ".dylib") && !strstr(nm, ".framework")) continue;
+        L(@"镜像[%u]: %s", i, nm);
+        shown++;
+    }
+}
+
 // ---------------------------------------------------------------- 类名清单
 
 static void listObfuscatedClasses(void) {
+    static BOOL listed = NO;
+    if (listed) return;
+    listed = YES;
     int total = objc_getClassList(NULL, 0);
     if (total <= 0) return;
     Class *buf = (Class *)malloc(sizeof(Class) * (size_t)total);
@@ -194,25 +222,82 @@ static void listObfuscatedClasses(void) {
       [names componentsJoinedByString:@" "]);
 }
 
+// ---------------------------------------------------------------- 方法清单
+
+static void dumpMethods(Class c, const char *label) {
+    if (!c) { L(@"方法清单 %s: （类不存在）", label); return; }
+    Class sup = class_getSuperclass(c);
+    L(@"方法 %s = %@  父类=%@", label, NSStringFromClass(c),
+      sup ? NSStringFromClass(sup) : @"nil");
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    NSMutableArray *im = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) {
+        [im addObject:NSStringFromSelector(method_getName(ms[i]))];
+    }
+    free(ms);
+    NSString *imj = [im componentsJoinedByString:@" "];
+    if (imj.length > 3000) imj = [imj substringToIndex:3000];
+    L(@"  实例方法(%u): %@", n, imj);
+    unsigned int cn = 0;
+    Method *cms = class_copyMethodList(object_getClass(c), &cn);
+    NSMutableArray *cm = [NSMutableArray array];
+    for (unsigned int i = 0; i < cn; i++) {
+        [cm addObject:NSStringFromSelector(method_getName(cms[i]))];
+    }
+    free(cms);
+    NSString *cmj = [cm componentsJoinedByString:@" "];
+    if (cmj.length > 2000) cmj = [cmj substringToIndex:2000];
+    L(@"  类方法(%u): %@", cn, cmj);
+}
+
+// ---------------------------------------------------------------- 图标定位
+
+static void placeIconTopRight(NSString *why) {
+    uintptr_t p = G(0x18581E0);
+    if (!p) { L(@"定位[%@]: 图标不存在", why); return; }
+    id o = (__bridge id)(void *)p;
+    if (![o isKindOfClass:[UIView class]]) { L(@"定位[%@]: 不是视图", why); return; }
+    UIView *v = (UIView *)o;
+    UIView *host = v.superview;
+    CGFloat W = 1080;
+    if (host) W = host.bounds.size.width;
+    else if (v.window) W = v.window.bounds.size.width;
+    CGRect old = v.frame;
+    CGFloat x = W - old.size.width - 20;
+    if (x < 0) x = W - old.size.width;
+    v.frame = CGRectMake(x, 58, old.size.width, old.size.height);
+    L(@"定位[%@]: 原=%@ 新=%@ 宿主=%@",
+      why, NSStringFromCGRect(old), NSStringFromCGRect(v.frame),
+      host ? NSStringFromClass([host class]) : @"nil");
+}
+
 // ---------------------------------------------------------------- 快照
 
 static void snap(NSString *tag) {
     @autoreleasepool {
         L(@"---------- 快照 %@ ----------", tag);
-        L(@"base=%p", (void *)gBase);
+        L(@"base=%p 宿主=%@", (void *)gBase, NSBundle.mainBundle.bundleIdentifier);
+        L(@"屏幕=%@ scale=%.1f", NSStringFromCGRect(UIScreen.mainScreen.bounds),
+          (double)UIScreen.mainScreen.scale);
 
         L(@"全局 container(0x18581E0)=%@", descObj((__bridge id)(void *)G(0x18581E0)));
         L(@"  祖先链: %@", parentChain((__bridge id)(void *)G(0x18581E0)));
         L(@"全局 view(0x18581D8)=%@",      descObj((__bridge id)(void *)G(0x18581D8)));
         L(@"  祖先链: %@", parentChain((__bridge id)(void *)G(0x18581D8)));
+        L(@"对象 0x1851CA0=%@", descObj((__bridge id)(void *)G(0x1851CA0)));
+        L(@"对象 0x1851CA8=%@", descObj((__bridge id)(void *)G(0x1851CA8)));
+        L(@"对象 0x1851CB0=%@", descObj((__bridge id)(void *)G(0x1851CB0)));
+        L(@"对象 0x1852128=%@", descObj((__bridge id)(void *)G(0x1852128)));
         L(@"开关 0x1851CE0[0]=%u  0x1851F34=%u  0x1851CA0=%p  0x1851CA8=%p  0x1851CB0=%p",
-          GB(0x1851CE0), GB(0x1851F34),
+          (unsigned)GB(0x1851CE0), (unsigned)GB(0x1851F34),
           (void *)G(0x1851CA0), (void *)G(0x1851CA8), (void *)G(0x1851CB0));
 
         NSArray<UIWindow *> *wins = allWindows();
         UIWindow *keyWin = nil;
         for (UIWindow *w in wins) { if (w.isKeyWindow) { keyWin = w; break; } }
         L(@"窗口数=%lu keyWindow=%@", (unsigned long)wins.count, descObj(keyWin));
+        if (keyWin) L(@"  keyWindow safeArea=%@", NSStringFromUIEdgeInsets(keyWin.safeAreaInsets));
 
         for (UIWindow *w in wins) {
             L(@"WIN <%@ %p> level=%.1f h=%d a=%.2f f=%@ rvc=%@",
@@ -293,6 +378,8 @@ static void diagDraw(id self, SEL _cmd, id view) {
 }
 
 static void installHooks(void) {
+    static BOOL hooked = NO;
+    if (hooked) return;
     Class winCls  = objc_getClass("_0x8C2F4D71");
     Class iconCls = objc_getClass("_0xD4E9A3C7");
     Class viewCls = objc_getClass("_0x1E6B7A93");
@@ -310,6 +397,72 @@ static void installHooks(void) {
     if (viewCls) {
         swizzleMethod(viewCls, NSSelectorFromString(@"drawInMTKView:"), (IMP)diagDraw, &origDraw);
     }
+
+    dumpMethods(winCls, "窗口类");
+    dumpMethods(iconCls, "图标类");
+    dumpMethods(viewCls, "渲染视图类");
+
+    if (winCls || iconCls || viewCls) hooked = YES;
+}
+
+// ---------------------------------------------------------------- 变化监视
+
+static void scheduleWatch(void);
+
+static void watchTick(void) {
+    if (!gBase) {
+        gBase = findQxtBase();
+        if (gBase) {
+            L(@"watch: 延迟拿到 base=%p", (void *)gBase);
+            listObfuscatedClasses();
+            installHooks();
+        }
+        return;
+    }
+
+    static BOOL firstTick = YES;
+    static uint8_t  lf34, lce0;
+    static uintptr_t lc0, lc8, lb0, le0, ld8, lw2128;
+    static int lwin;
+
+    uint8_t  f34  = GB(0x1851F34);
+    uint8_t  ce0  = GB(0x1851CE0);
+    uintptr_t c0  = G(0x1851CA0);
+    uintptr_t c8  = G(0x1851CA8);
+    uintptr_t b0  = G(0x1851CB0);
+    uintptr_t e0  = G(0x18581E0);
+    uintptr_t d8  = G(0x18581D8);
+    uintptr_t w2128 = G(0x1852128);
+    int wc = (int)allWindows().count;
+
+    if (firstTick) {
+        firstTick = NO;
+        lf34 = f34; lce0 = ce0; lc0 = c0; lc8 = c8; lb0 = b0;
+        le0 = e0; ld8 = d8; lw2128 = w2128; lwin = wc;
+        L(@"[初值] 0x1851F34=%u 0x1851CE0=%u 0x1851CA0=%p 0x1851CA8=%p 0x1851CB0=%p",
+          (unsigned)f34, (unsigned)ce0, (void *)c0, (void *)c8, (void *)b0);
+        L(@"[初值] container=%p view=%p win2128=%p 窗口数=%d",
+          (void *)e0, (void *)d8, (void *)w2128, wc);
+        return;
+    }
+
+    if (f34 != lf34) { L(@"[变化] 0x1851F34: %u -> %u", (unsigned)lf34, (unsigned)f34); lf34 = f34; }
+    if (ce0 != lce0) { L(@"[变化] 0x1851CE0: %u -> %u", (unsigned)lce0, (unsigned)ce0); lce0 = ce0; }
+    if (c0  != lc0)  { L(@"[变化] 0x1851CA0: %p -> %p", (void *)lc0, (void *)c0); lc0 = c0; }
+    if (c8  != lc8)  { L(@"[变化] 0x1851CA8: %p -> %p", (void *)lc8, (void *)c8); lc8 = c8; }
+    if (b0  != lb0)  { L(@"[变化] 0x1851CB0: %p -> %p", (void *)lb0, (void *)b0); lb0 = b0; }
+    if (e0  != le0)  { L(@"[变化] container(0x18581E0): %p -> %p", (void *)le0, (void *)e0); le0 = e0; }
+    if (d8  != ld8)  { L(@"[变化] view(0x18581D8): %p -> %p", (void *)ld8, (void *)d8); ld8 = d8; }
+    if (w2128 != lw2128) { L(@"[变化] win(0x1852128): %p -> %p", (void *)lw2128, (void *)w2128); lw2128 = w2128; }
+    if (wc != lwin) { L(@"[变化] 窗口数: %d -> %d", lwin, wc); lwin = wc; }
+}
+
+static void scheduleWatch(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        watchTick();
+        scheduleWatch();
+    });
 }
 
 // ---------------------------------------------------------------- 剪贴板
@@ -319,10 +472,31 @@ static void publish(void) {
     [gLock lock];
     text = [gLog copy];
     [gLock unlock];
-    if (text.length > 14000) text = [text substringToIndex:14000];
+    if (text.length > 120000) text = [text substringToIndex:120000];
     dispatch_async(dispatch_get_main_queue(), ^{
         UIPasteboard.generalPasteboard.string = text;
         NSLog(@"[QXTDIAG] 报告已写入剪贴板：%lu 字符", (unsigned long)text.length);
+        static BOOL notified = NO;
+        if (notified) return;
+        notified = YES;
+        UIWindow *kw = nil;
+        NSArray<UIWindow *> *ws = allWindows();
+        for (UIWindow *w in ws) { if (w.isKeyWindow) { kw = w; break; } }
+        if (!kw) for (UIWindow *w in ws) {
+            if (!w.hidden && w.windowLevel < 100) { kw = w; break; }
+        }
+        UIViewController *vc = kw.rootViewController;
+        if (!vc) return;
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:@"诊断完成"
+            message:[NSString stringWithFormat:@"报告已复制到剪贴板（%lu 字符），可直接粘贴发送。",
+                     (unsigned long)text.length]
+            preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"好"
+                                               style:UIAlertActionStyleDefault
+                                             handler:nil]];
+        [vc presentViewController:ac animated:YES completion:nil];
     });
 }
 
@@ -341,11 +515,18 @@ static void qxtdiag_init(void) {
             L(@"时间: %@", [NSDate date]);
             gBase = findQxtBase();
             L(@"靶场 base=%p", (void *)gBase);
+            listImages();
             listObfuscatedClasses();
             installHooks();
 
+            scheduleWatch();
+
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ snap(@"3s"); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ placeIconTopRight(@"3.5s"); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ placeIconTopRight(@"6s"); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ snap(@"8s"); publish(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_SEC)),
