@@ -106,6 +106,16 @@ static uint8_t GB(uintptr_t off) {
     if (!gBase) return 0;
     return *(uint8_t *)(gBase + off);
 }
+static int32_t GD(uintptr_t off) {
+    if (!gBase) return 0;
+    return *(int32_t *)(gBase + off);
+}
+static void SD(uintptr_t off, int32_t v) {
+    if (!gBase) return;
+    *(int32_t *)(gBase + off) = v;
+}
+
+static BOOL gForceShow = NO;
 
 static BOOL looksLikeObject(id o) {
     uintptr_t p = (uintptr_t)(__bridge void *)o;
@@ -364,6 +374,7 @@ static void snap(NSString *tag) {
         L(@"开关 0x1851CE0[0]=%u  0x1851F34=%u  0x1851CA0=%p  0x1851CA8=%p  0x1851CB0=%p",
           (unsigned)GB(0x1851CE0), (unsigned)GB(0x1851F34),
           (void *)G(0x1851CA0), (void *)G(0x1851CA8), (void *)G(0x1851CB0));
+        L(@"绘制门槛 0x185ACB8=%d", GD(0x185ACB8));
 
         NSArray<UIWindow *> *wins = allWindows();
         UIWindow *keyWin = nil;
@@ -446,6 +457,21 @@ static void diagTouchE(id self, SEL _cmd, NSSet *touches, UIEvent *ev) {
 static void diagDraw(id self, SEL _cmd, id view) {
     int n = __sync_add_and_fetch(&gDrawCount, 1);
     if (n == 1 || (n % 120) == 0) L(@"[drawInMTKView#%d] %@", n, NSStringFromClass([self class]));
+    if (gForceShow) {
+        if (GD(0x185ACB8) != -1) SD(0x185ACB8, -1);
+        if ([self isKindOfClass:[UIView class]]) {
+            UIView *v = (UIView *)self;
+            if (v.hidden || v.alpha < 0.99) {
+                static int fixedCount = 0;
+                fixedCount++;
+                if (fixedCount <= 5) {
+                    L(@"[实验] 绘制回调中面板是隐藏的，已恢复显示(第%d次)", fixedCount);
+                }
+                v.hidden = NO;
+                v.alpha = 1.0;
+            }
+        }
+    }
     if (origDraw) ((void (*)(id, SEL, id))origDraw)(self, _cmd, view);
 }
 
@@ -527,6 +553,26 @@ static void watchTick(void) {
     if (d8  != ld8)  { L(@"[变化] view(0x18581D8): %p -> %p", (void *)ld8, (void *)d8); ld8 = d8; }
     if (w2128 != lw2128) { L(@"[变化] win(0x1852128): %p -> %p", (void *)lw2128, (void *)w2128); lw2128 = w2128; }
     if (wc != lwin) { L(@"[变化] 窗口数: %d -> %d", lwin, wc); lwin = wc; }
+
+    if (gForceShow) {
+        int32_t gate = GD(0x185ACB8);
+        if (gate != -1) {
+            SD(0x185ACB8, -1);
+            L(@"[实验] 绘制门槛 0x185ACB8: %d -> -1", gate);
+        }
+        uintptr_t pv = G(0x18581D8);
+        if (pv) {
+            id po = (__bridge id)(void *)pv;
+            if ([po isKindOfClass:[UIView class]]) {
+                UIView *v = (UIView *)po;
+                if (v.hidden || v.alpha < 0.99) {
+                    L(@"[实验] 面板被隐藏(hidden=%d alpha=%.2f)，已重新显示", (int)v.hidden, v.alpha);
+                    v.hidden = NO;
+                    v.alpha = 1.0;
+                }
+            }
+        }
+    }
 }
 
 static void scheduleWatch(void) {
@@ -603,6 +649,11 @@ static void qxtdiag_init(void) {
                            dispatch_get_main_queue(), ^{ autoClickIcon(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ forcePanelVisible(@"7s"); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                gForceShow = YES;
+                L(@"[实验] 开始持续强制显示面板并打开绘制门槛");
+            });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ placeIconTopRight(@"6s"); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
