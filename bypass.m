@@ -147,23 +147,6 @@ static BOOL looksLikeObject(id o) {
     return p > 0x100000000ULL && p < 0x00007FFFFFFFFFFFULL;
 }
 
-// 判断地址所在页当前是否已映射且可读（防止对象被释放后继续解引用导致崩溃）
-static BOOL addrReadable(uintptr_t addr) {
-    if (addr < 0x1000) return NO;
-    mach_vm_address_t a = (mach_vm_address_t)addr;
-    mach_vm_size_t sz = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz,
-                                      VM_REGION_BASIC_INFO_64,
-                                      (vm_region_info_t)&info, &cnt, &obj);
-    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-    if (kr != KERN_SUCCESS) return NO;
-    if (addr < a || addr >= a + sz) return NO;
-    return (info.protection & VM_PROT_READ) != 0;
-}
-
 // ---------------------------------------------------------------- 描述对象
 
 static NSString *descObj(id o) {
@@ -515,24 +498,16 @@ static void diagSetHidden(id self, SEL _cmd, BOOL hidden) {
 
 static void probeSwitch(NSString *name, uintptr_t p) {
     if (!p) { L(@"开关[%@]: 对象不存在", name); return; }
-    if (!addrReadable(p)) { L(@"开关[%@]: 宿主=%p 已不可读", name, (void *)p); return; }
     id o = (__bridge id)(void *)p;
     SEL s = NSSelectorFromString(@"_0xE4C8719B");
     if (![o respondsToSelector:s]) { L(@"开关[%@]: 没有读取方法", name); return; }
     id sw = ((id (*)(id, SEL))objc_msgSend)(o, s);
     if (!sw) { L(@"开关[%@]: 值为 nil", name); return; }
-    uintptr_t sp = (uintptr_t)(__bridge void *)sw;
-    if (!looksLikeObject(sw)) { L(@"开关[%@]: 值=%p(非对象)", name, (void *)sp); return; }
-    if (!addrReadable(sp)) {
-        L(@"开关[%@]: 值=%p 但所在内存已不可读（对象可能已释放）", name, (void *)sp);
-        return;
-    }
-    Class c = Nil;
-    @try { c = object_getClass(sw); } @catch (NSException *e) { c = Nil; }
-    uint8_t b = 0;
-    if (c && addrReadable((uintptr_t)c)) b = *(uint8_t *)(void *)sp;
-    L(@"开关[%@]: 对象=%p 类=%s 首字节=%u", name, (void *)sp,
-      (c && addrReadable((uintptr_t)c)) ? class_getName(c) : "?", (unsigned)b);
+    if (!looksLikeObject(sw)) { L(@"开关[%@]: 值=%p(非对象)", name, (__bridge void *)sw); return; }
+    Class c = object_getClass(sw);
+    uint8_t b = *(uint8_t *)(__bridge void *)sw;
+    L(@"开关[%@]: 对象=%p 类=%s 首字节=%u", name, (__bridge void *)sw,
+      c ? class_getName(c) : "?", (unsigned)b);
 }
 
 static void forceSwitchOn(NSString *name, uintptr_t p) {
@@ -759,9 +734,8 @@ static void qxtdiag_init(void) {
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                L(@"指针复查(10s): 面板=%p 图标=%p",
-                  (void *)G(0x18581D8), (void *)G(0x18581E0));
-                probeSwitch(@"面板(10s)", G(0x18581D8));
+                L(@"指针复查(10s): 面板=%p 图标=%p 窗口=%p",
+                  (void *)G(0x18581D8), (void *)G(0x18581E0), (void *)G(0x1852128));
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ placeIconTopRight(@"6s"); });
