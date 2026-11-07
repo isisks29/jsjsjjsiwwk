@@ -149,11 +149,17 @@ static void dumpView(UIView *v, int depth, int *budget) {
     (*budget)--;
     NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2)
                                       withString:@" " startingAtIndex:0];
-    L(@"%@%@ f=%@ h=%d a=%.2f tag=%ld win=%@ sup=%@",
+    NSString *extra = @"";
+    if ([v isKindOfClass:[UIImageView class]]) {
+        UIImage *im = ((UIImageView *)v).image;
+        extra = [NSString stringWithFormat:@" img=%@",
+                 im ? NSStringFromCGSize(im.size) : @"nil"];
+    }
+    L(@"%@%@ f=%@ h=%d a=%.2f tag=%ld win=%@ sup=%@%@",
       pad, NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
       (int)v.hidden, v.alpha, (long)v.tag,
       v.window ? NSStringFromClass([v.window class]) : @"nil",
-      v.superview ? NSStringFromClass([v.superview class]) : @"nil");
+      v.superview ? NSStringFromClass([v.superview class]) : @"nil", extra);
     if (depth >= 8) return;
     for (UIView *s in v.subviews) dumpView(s, depth + 1, budget);
 }
@@ -272,6 +278,32 @@ static void placeIconTopRight(NSString *why) {
       host ? NSStringFromClass([host class]) : @"nil");
 }
 
+static void logPanelState(NSString *tag) {
+    uintptr_t p = G(0x18581D8);
+    if (!p) { L(@"面板[%@]: 不存在", tag); return; }
+    id o = (__bridge id)(void *)p;
+    if (![o isKindOfClass:[UIView class]]) { L(@"面板[%@]: 不是视图", tag); return; }
+    UIView *v = (UIView *)o;
+    L(@"面板[%@]: hidden=%d alpha=%.2f 窗口=%@ 开关F34=%u",
+      tag, (int)v.hidden, v.alpha,
+      v.window ? NSStringFromClass([v.window class]) : @"nil",
+      (unsigned)GB(0x1851F34));
+}
+
+static void autoClickIcon(void) {
+    uintptr_t p = G(0x18581E0);
+    if (!p) { L(@"自动点击: 图标不存在"); return; }
+    id o = (__bridge id)(void *)p;
+    if (![o isKindOfClass:[UIView class]]) { L(@"自动点击: 不是视图"); return; }
+    SEL s = NSSelectorFromString(@"iconOnClick");
+    if (![o respondsToSelector:s]) { L(@"自动点击: 没有 iconOnClick"); return; }
+    logPanelState(@"点击前");
+    L(@"自动点击: 调用 iconOnClick ...");
+    ((void (*)(id, SEL))objc_msgSend)(o, s);
+    L(@"自动点击: 调用完成");
+    logPanelState(@"点击后");
+}
+
 // ---------------------------------------------------------------- 快照
 
 static void snap(NSString *tag) {
@@ -285,10 +317,9 @@ static void snap(NSString *tag) {
         L(@"  祖先链: %@", parentChain((__bridge id)(void *)G(0x18581E0)));
         L(@"全局 view(0x18581D8)=%@",      descObj((__bridge id)(void *)G(0x18581D8)));
         L(@"  祖先链: %@", parentChain((__bridge id)(void *)G(0x18581D8)));
-        L(@"对象 0x1851CA0=%@", descObj((__bridge id)(void *)G(0x1851CA0)));
-        L(@"对象 0x1851CA8=%@", descObj((__bridge id)(void *)G(0x1851CA8)));
-        L(@"对象 0x1851CB0=%@", descObj((__bridge id)(void *)G(0x1851CB0)));
-        L(@"对象 0x1852128=%@", descObj((__bridge id)(void *)G(0x1852128)));
+        L(@"指针 0x1851CA0=%p 0x1851CA8=%p 0x1851CB0=%p 0x1852128=%p",
+          (void *)G(0x1851CA0), (void *)G(0x1851CA8),
+          (void *)G(0x1851CB0), (void *)G(0x1852128));
         L(@"开关 0x1851CE0[0]=%u  0x1851F34=%u  0x1851CA0=%p  0x1851CA8=%p  0x1851CB0=%p",
           (unsigned)GB(0x1851CE0), (unsigned)GB(0x1851F34),
           (void *)G(0x1851CA0), (void *)G(0x1851CA8), (void *)G(0x1851CB0));
@@ -525,6 +556,8 @@ static void qxtdiag_init(void) {
                            dispatch_get_main_queue(), ^{ snap(@"3s"); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ placeIconTopRight(@"3.5s"); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ autoClickIcon(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ placeIconTopRight(@"6s"); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
