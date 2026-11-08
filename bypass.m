@@ -112,36 +112,6 @@ static int32_t GD(uintptr_t off) {
     if (!gBase) return 0;
     return *(int32_t *)(gBase + off);
 }
-static void SD(uintptr_t off, int32_t v) {
-    if (!gBase) return;
-    *(int32_t *)(gBase + off) = v;
-}
-
-static BOOL gForceShow = NO;
-
-static void patchInsn(uintptr_t off, uint32_t expect, uint32_t newInsn) {
-    if (!gBase) { L(@"改代码: base 为空"); return; }
-    uintptr_t addr = gBase + off;
-    uint32_t *p = (uint32_t *)addr;
-    uint32_t old = *p;
-    if (old == newInsn) { L(@"改代码[0x%lx]: 已是目标值", (unsigned long)off); return; }
-    if (old != expect) {
-        L(@"改代码[0x%lx]: 原值不符 old=0x%08x", (unsigned long)off, old);
-        return;
-    }
-    uintptr_t page = addr & ~(uintptr_t)0xFFF;
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x1000, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        L(@"改代码[0x%lx]: 无写权限 权限=%d，跳过", (unsigned long)off, (int)kr);
-        return;
-    }
-    *p = newInsn;
-    sys_icache_invalidate((void *)addr, 4);
-    L(@"改代码[0x%lx]: 0x%08x -> 0x%08x 权限=%d 读回=0x%08x",
-      (unsigned long)off, old, newInsn, (int)kr, *p);
-}
-
 static BOOL looksLikeObject(id o) {
     uintptr_t p = (uintptr_t)(__bridge void *)o;
     return p > 0x100000000ULL && p < 0x00007FFFFFFFFFFFULL;
@@ -209,6 +179,20 @@ static NSString *parentChain(id o) {
     UIView *v = (UIView *)o;
     for (int i = 0; i < 12 && v; i++) {
         [a addObject:NSStringFromClass([v class])];
+        v = v.superview;
+    }
+    return [a componentsJoinedByString:@" < "];
+}
+
+// 祖先链的详细状态：每一层都带上 hidden/alpha，用来判断「到底是被谁挡住/藏住」
+static NSString *chainDetail(id o) {
+    if (![o isKindOfClass:[UIView class]]) return @"(不是视图)";
+    NSMutableArray *a = [NSMutableArray array];
+    UIView *v = (UIView *)o;
+    for (int i = 0; i < 8 && v; i++) {
+        [a addObject:[NSString stringWithFormat:@"%@(h=%d,a=%.2f,f=%@)",
+                      NSStringFromClass([v class]), (int)v.hidden, v.alpha,
+                      NSStringFromCGRect(v.frame)]];
         v = v.superview;
     }
     return [a componentsJoinedByString:@" < "];
@@ -357,18 +341,6 @@ static void makeIconVisible(void) {
     L(@"图标配色: 已填入红色占位图，图标hidden=%d alpha=%.2f", (int)icon.hidden, icon.alpha);
 }
 
-static void forcePanelVisible(NSString *tag) {
-    uintptr_t p = G(0x18581D8);
-    if (!p) { L(@"强制显示[%@]: 面板不存在", tag); return; }
-    id o = (__bridge id)(void *)p;
-    if (![o isKindOfClass:[UIView class]]) { L(@"强制显示[%@]: 不是视图", tag); return; }
-    UIView *v = (UIView *)o;
-    L(@"强制显示[%@]: hidden %d -> 0", tag, (int)v.hidden);
-    v.hidden = NO;
-    v.alpha = 1.0;
-    logPanelState(tag);
-}
-
 // 静默把当前日志写进剪贴板（不弹窗）。用于每个阶段结束时，
 // 这样即使 App 崩在后面某一步，崩溃前的现场也已经留在剪贴板里。
 static void saveClip(void) {
@@ -389,10 +361,34 @@ static void snap(NSString *tag) {
         L(@"屏幕=%@ scale=%.1f", NSStringFromCGRect(UIScreen.mainScreen.bounds),
           (double)UIScreen.mainScreen.scale);
 
+        // 先确认「打补丁的那份」真的被加载了：读回几个补丁点的机器码。
+        if (gBase) {
+            uint32_t wAE4A0 = *(uint32_t *)(gBase + 0xAE4A0);
+            uint32_t wC9E954 = *(uint32_t *)(gBase + 0xC9E954);
+            uint32_t wA621A8 = *(uint32_t *)(gBase + 0xA621A8);
+            uintptr_t inv = *(uintptr_t *)(gBase + 0x15DCD08);
+            L(@"补丁校验: 隐藏点=0x%08X(期望52800002) 就绪点=0x%08X(期望52800020) 卡密框=0x%08X(期望D503201F) 启动块=%p(期望0xC9CA84)",
+              wAE4A0, wC9E954, wA621A8, (void *)inv);
+        }
+
         L(@"全局 container(0x18581E0)=%@", descObj((__bridge id)(void *)G(0x18581E0)));
         L(@"  祖先链: %@", parentChain((__bridge id)(void *)G(0x18581E0)));
+        L(@"  层层状态: %@", chainDetail((__bridge id)(void *)G(0x18581E0)));
         L(@"全局 view(0x18581D8)=%@",      descObj((__bridge id)(void *)G(0x18581D8)));
         L(@"  祖先链: %@", parentChain((__bridge id)(void *)G(0x18581D8)));
+        L(@"  层层状态: %@", chainDetail((__bridge id)(void *)G(0x18581D8)));
+        {
+            uintptr_t wp = G(0x1852128);
+            if (wp) {
+                id wo = (__bridge id)(void *)wp;
+                if ([wo isKindOfClass:[UIWindow class]]) {
+                    UIWindow *w = (UIWindow *)wo;
+                    L(@"悬浮窗口(0x1852128): level=%.1f h=%d a=%.2f f=%@",
+                      (double)w.windowLevel, (int)w.hidden, w.alpha,
+                      NSStringFromCGRect(w.frame));
+                }
+            }
+        }
         L(@"指针 0x1851CA0=%p 0x1851CA8=%p 0x1851CB0=%p 0x1852128=%p",
           (void *)G(0x1851CA0), (void *)G(0x1851CA8),
           (void *)G(0x1851CB0), (void *)G(0x1852128));
@@ -482,16 +478,9 @@ static void diagTouchE(id self, SEL _cmd, NSSet *touches, UIEvent *ev) {
 static IMP origSetHidden = NULL;
 
 static void diagSetHidden(id self, SEL _cmd, BOOL hidden) {
+    // 只记录，不改写。从后台/绘制线程改界面属性会让靶场当场崩溃。
     Class pc = objc_getClass("_0x1E6B7A93");
     BOOL isPanel = (pc && [self isKindOfClass:pc]);
-    if (isPanel && hidden && gForceShow) {
-        // 渲染循环每帧都会把面板藏起来，这里直接把「藏」改成「显示」。
-        static int swallowed = 0;
-        swallowed++;
-        if (swallowed <= 3) L(@"[拦截] 面板隐藏请求被改成显示(第%d次)", swallowed);
-        if (origSetHidden) ((void (*)(id, SEL, BOOL))origSetHidden)(self, _cmd, NO);
-        return;
-    }
     if (isPanel && hidden) {
         static int cnt = 0;
         cnt++;
@@ -506,20 +495,8 @@ static void diagSetHidden(id self, SEL _cmd, BOOL hidden) {
 static void diagDraw(id self, SEL _cmd, id view) {
     int n = __sync_add_and_fetch(&gDrawCount, 1);
     if (n == 1 || (n % 120) == 0) L(@"[drawInMTKView#%d] %@", n, NSStringFromClass([self class]));
-    if (gForceShow) SD(0x185ACB8, -1);
+    // 只记录，不在此处改任何视图属性（这里不是主线程）。
     if (origDraw) ((void (*)(id, SEL, id))origDraw)(self, _cmd, view);
-    if (gForceShow && [self isKindOfClass:[UIView class]]) {
-        UIView *v = (UIView *)self;
-        if (v.hidden || v.alpha < 0.99) {
-            static int fixedCount = 0;
-            fixedCount++;
-            if (fixedCount <= 3) {
-                L(@"[实验] 绘制后恢复显示(第%d次)", fixedCount);
-            }
-            v.hidden = NO;
-            v.alpha = 1.0;
-        }
-    }
 }
 
 static void installHooks(void) {
@@ -602,25 +579,6 @@ static void watchTick(void) {
     if (w2128 != lw2128) { L(@"[变化] win(0x1852128): %p -> %p", (void *)lw2128, (void *)w2128); lw2128 = w2128; }
     if (wc != lwin) { L(@"[变化] 窗口数: %d -> %d", lwin, wc); lwin = wc; }
 
-    if (gForceShow) {
-        int32_t gate = GD(0x185ACB8);
-        if (gate != -1) {
-            SD(0x185ACB8, -1);
-            L(@"[实验] 绘制门槛 0x185ACB8: %d -> -1", gate);
-        }
-        uintptr_t pv = G(0x18581D8);
-        if (pv) {
-            id po = (__bridge id)(void *)pv;
-            if ([po isKindOfClass:[UIView class]]) {
-                UIView *v = (UIView *)po;
-                if (v.hidden || v.alpha < 0.99) {
-                    L(@"[实验] 面板被隐藏(hidden=%d alpha=%.2f)，已重新显示", (int)v.hidden, v.alpha);
-                    v.hidden = NO;
-                    v.alpha = 1.0;
-                }
-            }
-        }
-    }
 }
 
 static void scheduleWatch(void) {
@@ -703,23 +661,13 @@ static void qxtdiag_init(void) {
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                L(@"[实验] 修改两处面板显示逻辑");
-                patchInsn(0xAE4A0, 0x52800022, 0x52800002);
-                patchInsn(0xCD35C0, 0x54002B41, 0xD503201F);
+                L(@"6.5s: 只观察，不改靶场代码");
                 saveClip();
             });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ forcePanelVisible(@"7s"); saveClip(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 L(@"指针(4.5s): 图标=%p 面板=%p 窗口=%p",
                   (void *)G(0x18581E0), (void *)G(0x18581D8), (void *)G(0x1852128));
-                saveClip();
-            });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.2 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                gForceShow = YES;
-                L(@"[实验] 开始拦截面板隐藏并打开绘制门槛");
                 saveClip();
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
