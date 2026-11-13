@@ -1,37 +1,30 @@
 // aqaw_runtime_patch.m —— aqaw 卡密弹窗接管 + 让解密密钥保持“已激活”（注入用）
 //
-// 为什么不再改文件、也不在内存里改代码：
-//   iOS 18 对代码页有签名校验。只要某个代码页的指令被改过（替换文件后没有
-//   重新签名，或者运行时用 vm_protect 改写代码页），这个页就会变成不可执行，
-//   App 一旦执行到这一页就闪退（崩溃日志里是 CODESIGNING / Invalid Page /
-//   KERN_PROTECTION_FAILURE）。上一版运行时补丁正是踩了这个坑。
+// 这一版的原则是“能不调用就不调用、能不碰就不碰”：
+//   * 不修改任何代码页（iOS 18 会因代码页签名失效直接闪退）；
+//   * 不调用 aqaw 里的任何函数（上一版会调用它的密钥安装函数，可能导致
+//     和 App 自身初始化竞争而闪退）；
+//   * 只做两件事：
+//       1. 用 Objective-C 运行时把卡密类里“只负责弹窗”的三个方法换成空函数；
+//       2. 在 App 自己把解密密钥装好之后，记下这组值，之后每 50 毫秒比对
+//          一次，一旦卡密失败流程把它改乱就写回（数据页，不涉及签名）。
 //
-//   本文件完全不碰任何代码页，只做三件事：
-//     1. 用 Objective-C 运行时把卡密类里“只负责弹窗”的三个方法换成空函数，
-//        弹窗就不会再出现（方法表在数据段，不触发代码签名校验）；
-//     2. 调用 aqaw 自带的密钥安装函数 0x814F44，把设备号推导出的正确解密
-//        密钥装回去，相当于“已激活”的状态；
-//     3. 每 0.1 秒检查一次那组密钥，一旦被卡密失败流程改乱，立刻恢复，
-//        并写日志。
-//
-// 使用前提：App 里的 aqaw.dylib 必须是【原版】。如果之前替换成了打过补丁的
-//   文件，请先换回原版，否则那个被改过的代码页仍然会闪退。
+// 使用前提：App 里的 aqaw.dylib 必须是【原版】。
 //
 // 编译（Theos）：
 //       TARGET = iphone:clang:latest:14.0
 //       ARCHS = arm64 arm64e
 //       aqaw_runtime_patch_FILES = aqaw_runtime_patch.m
-//       aqaw_runtime_patch_FRAMEWORKS = UIKit Foundation
+//       aqaw_runtime_patch_FRAMEWORKS = Foundation
 //
 // 日志：App 的 Documents 目录/aqaw_hook.log（第一行打印完整路径），同时 NSLog。
 //
 // 判读：
 //   「钩子: … 已接管」= 弹窗入口已经失效；
-//   「密钥: 快照 …」= 已装回正确密钥；
-//   「密钥: 被改乱，已恢复」= 卡密失败流程动过密钥，已被秒级恢复。
+//   「密钥: 已记录启动密钥」= 拿到了正确密钥；
+//   「密钥: 被失败流程改乱，已恢复」= 失败流程动过密钥，被我们按 50ms 恢复。
 
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <stdint.h>
@@ -39,28 +32,32 @@
 #import <string.h>
 
 // ---------------- 关键地址（文件偏移 = 虚拟地址） ----------------
-static const uint64_t OFF_INSTALL = 0x814F44;   // 由设备号推导并写入解密密钥
-static const uint64_t OFF_K48     = 0x1644048;  // 8 字节密钥
-static const uint64_t OFF_K50     = 0x1644050;  // 4 字节密钥
-static const uint64_t OFF_K54     = 0x1644054;  // 4 字节密钥
-static const uint64_t OFF_K58     = 0x1644058;  // 4 字节密钥
+static const uint64_t OFF_K48 = 0x1644048;  // 8 字节密钥
+static const uint64_t OFF_K50 = 0x1644050;  // 4 字节密钥（失败流程会把它清零）
+static const uint64_t OFF_K54 = 0x1644054;  // 4 字节密钥
+static const uint64_t OFF_K58 = 0x1644058;  // 4 字节密钥
 
-typedef void (*AqawInstallFn)(void);
+typedef struct {
+    uint64_t k48;
+    uint32_t k50, k54, k58;
+} KeyState;
 
 static intptr_t g_slide = 0;
 static BOOL g_found = NO;
 static BOOL g_hooked = NO;
 static BOOL g_snap = NO;
+static BOOL g_haveFirst = NO;
+static KeyState g_good;      // 已确认的正确密钥
+static KeyState g_first;     // 最早读到的非零密钥（兜底）
+static KeyState g_cand;      // 候选密钥
+static int g_candCount = 0;
 static int g_tick = 0;
 static int g_restores = 0;
-static uint64_t g_k48 = 0;
-static uint32_t g_k50 = 0, g_k54 = 0, g_k58 = 0;
 
 static NSMutableString *g_log = nil;
 static NSString *g_logPath = nil;
 static dispatch_queue_t g_q = nil;
 static dispatch_source_t g_timer = nil;
-static NSString *g_lastAlert = nil;
 
 static void plog(NSString *fmt, ...) {
     va_list ap;
@@ -99,21 +96,29 @@ static BOOL locate_image(void) {
 }
 
 // ---------------- 读取 / 写入密钥（数据页，安全） ----------------
-static uint64_t rd64(uint64_t off) {
-    uint64_t v = 0;
-    memcpy(&v, (const void *)(g_slide + (intptr_t)off), sizeof(v));
-    return v;
+static KeyState read_keys(void) {
+    KeyState s = {0, 0, 0, 0};
+    memcpy(&s.k48, (const void *)(g_slide + (intptr_t)OFF_K48), sizeof(uint64_t));
+    memcpy(&s.k50, (const void *)(g_slide + (intptr_t)OFF_K50), sizeof(uint32_t));
+    memcpy(&s.k54, (const void *)(g_slide + (intptr_t)OFF_K54), sizeof(uint32_t));
+    memcpy(&s.k58, (const void *)(g_slide + (intptr_t)OFF_K58), sizeof(uint32_t));
+    return s;
 }
-static uint32_t rd32(uint64_t off) {
-    uint32_t v = 0;
-    memcpy(&v, (const void *)(g_slide + (intptr_t)off), sizeof(v));
-    return v;
+
+static void write_keys(KeyState s) {
+    memcpy((void *)(g_slide + (intptr_t)OFF_K48), &s.k48, sizeof(uint64_t));
+    memcpy((void *)(g_slide + (intptr_t)OFF_K50), &s.k50, sizeof(uint32_t));
+    memcpy((void *)(g_slide + (intptr_t)OFF_K54), &s.k54, sizeof(uint32_t));
+    memcpy((void *)(g_slide + (intptr_t)OFF_K58), &s.k58, sizeof(uint32_t));
 }
-static void wr64(uint64_t off, uint64_t v) {
-    memcpy((void *)(g_slide + (intptr_t)off), &v, sizeof(v));
+
+static BOOL key_equal(KeyState a, KeyState b) {
+    return a.k48 == b.k48 && a.k50 == b.k50 && a.k54 == b.k54 && a.k58 == b.k58;
 }
-static void wr32(uint64_t off, uint32_t v) {
-    memcpy((void *)(g_slide + (intptr_t)off), &v, sizeof(v));
+
+static NSString *key_desc(KeyState s) {
+    return [NSString stringWithFormat:@"%016llX/%08X/%08X/%08X",
+            (unsigned long long)s.k48, s.k50, s.k54, s.k58];
 }
 
 // ---------------- 弹窗方法接管 ----------------
@@ -143,137 +148,102 @@ static Class find_license_class(void) {
 
 static BOOL hook_once(void) {
     Class cls = find_license_class();
-    if (!cls) return NO;
+    if (!cls) {
+        if ((g_tick % 100) == 0) {
+            plog(@"钩子: 还没找到卡密类，继续等待");
+            flush_log();
+        }
+        return NO;
+    }
 
-    int ok = 0;
     const char *sels[] = {
         "va2429730c25654",
         "v59341b48b7a63c:",
         "v470d683f8c0e8f:endTime:",
     };
     IMP imps[] = { (IMP)aq_noop0, (IMP)aq_noop1, (IMP)aq_noop2 };
+    int ok = 0;
     for (size_t i = 0; i < sizeof(sels) / sizeof(sels[0]); i++) {
         SEL sel = sel_registerName(sels[i]);
         Method m = class_getInstanceMethod(cls, sel);
         if (!m) continue;
-        IMP old = method_setImplementation(m, imps[i]);
-        plog(@"钩子: %s %@ (原实现 %p)", sels[i],
-             old ? @"已接管" : @"设置完成", (void *)old);
+        method_setImplementation(m, imps[i]);
         ok += 1;
     }
     if (ok > 0) {
-        g_hooked = (ok == 3);
-        plog(@"钩子: 共接管 %d/3 个弹窗方法（类 %s）", ok, class_getName(cls));
+        g_hooked = YES;
+        plog(@"钩子: 接管 %d/3 个弹窗方法（类 %s）", ok, class_getName(cls));
         flush_log();
         return YES;
     }
     return NO;
 }
 
-// ---------------- 密钥快照与恢复 ----------------
-static void take_snapshot(const char *why) {
-    g_k48 = rd64(OFF_K48);
-    g_k50 = rd32(OFF_K50);
-    g_k54 = rd32(OFF_K54);
-    g_k58 = rd32(OFF_K58);
-    g_snap = YES;
-    plog(@"[密钥] 快照(%s) 4048=%016llX 4050=%08X 4054=%08X 4058=%08X",
-         why, (unsigned long long)g_k48, g_k50, g_k54, g_k58);
-    flush_log();
-}
-
-static void install_good_keys(const char *why) {
-    AqawInstallFn fn = (AqawInstallFn)(g_slide + (intptr_t)OFF_INSTALL);
-    if (fn) fn();
-    take_snapshot(why);
-}
-
-// 只读看一眼当前弹窗（主线程调用，全部 @try 包住）
-static void inspect_alert(void) {
-    @try {
-        UIApplication *app = [UIApplication sharedApplication];
-        if (!app) return;
-        UIWindow *w = app.keyWindow;
-        if (!w) return;
-        UIViewController *vc = w.rootViewController;
-        int depth = 0;
-        while (vc.presentedViewController && depth < 8) {
-            vc = vc.presentedViewController;
-            depth += 1;
-        }
-        if (![vc isKindOfClass:[UIAlertController class]]) return;
-        UIAlertController *a = (UIAlertController *)vc;
-        NSMutableArray *acts = [NSMutableArray array];
-        for (UIAlertAction *act in a.actions) {
-            if (act.title.length) [acts addObject:act.title];
-        }
-        NSMutableArray *fields = [NSMutableArray array];
-        for (UITextField *tf in a.textFields) {
-            [fields addObject:tf.text.length ? tf.text : @"(空)"];
-        }
-        NSString *sig = [NSString stringWithFormat:@"%@|%@|%@|%@",
-                         a.title ?: @"", a.message ?: @"",
-                         [acts componentsJoinedByString:@","],
-                         [fields componentsJoinedByString:@","]];
-        if ([sig isEqualToString:g_lastAlert]) return;
-        g_lastAlert = sig;
-        plog(@"弹窗: 标题=%@ 正文=%@ 按钮=[%@] 输入框=[%@]",
-             a.title ?: @"(无)", a.message ?: @"(无)",
-             [acts componentsJoinedByString:@" / "],
-             [fields componentsJoinedByString:@" / "]);
-        flush_log();
-    } @catch (NSException *e) {
-        plog(@"查看弹窗异常: %@", e.reason ?: @"未知");
-    }
-}
-
-// ---------------- 每 0.1 秒一次的巡检 ----------------
+// ---------------- 每 50 毫秒巡检 ----------------
 static void aq_tick(void) {
     g_tick += 1;
 
     if (!g_found && !locate_image()) return;
+    if (!g_hooked && (g_tick <= 5 || (g_tick % 10) == 0)) hook_once();
 
-    if (!g_hooked) hook_once();
+    KeyState cur = read_keys();
 
-    // 1.5 秒后（或镜像晚加载后）装一次正确密钥并记下快照
+    // 记录最早读到的非零密钥（正常安装一定是非零的）
+    if (!g_haveFirst && cur.k50 != 0) {
+        g_first = cur;
+        g_haveFirst = YES;
+        plog(@"[密钥] 首次读到启动密钥: %@", key_desc(cur));
+        flush_log();
+    }
+
     if (!g_snap) {
-        if (g_tick >= 15) install_good_keys("原版安装函数");
+        if (cur.k50 != 0) {
+            // 连续两次读到同一组非零值，认定启动安装已经完成
+            if (g_candCount > 0 && key_equal(cur, g_cand)) {
+                g_candCount += 1;
+            } else {
+                g_cand = cur;
+                g_candCount = 1;
+            }
+            if (g_candCount >= 2) {
+                g_good = cur;
+                g_snap = YES;
+                plog(@"[密钥] 已记录启动密钥: %@", key_desc(g_good));
+                flush_log();
+            }
+            return;
+        }
+        g_candCount = 0;
+        if (g_haveFirst && g_tick >= 20) {
+            // 1 秒时仍是被改乱状态：用最早读到的正确值兜底
+            g_good = g_first;
+            g_snap = YES;
+            plog(@"[密钥] 当前已被改乱，改用最早读到的正确值: %@", key_desc(g_good));
+            write_keys(g_good);
+            flush_log();
+        } else if ((g_tick % 100) == 0) {
+            plog(@"[密钥] 等待启动密钥就绪…");
+            flush_log();
+        }
         return;
     }
 
-    // 密钥被改乱就立刻写回
-    uint64_t c48 = rd64(OFF_K48);
-    uint32_t c50 = rd32(OFF_K50);
-    uint32_t c54 = rd32(OFF_K54);
-    uint32_t c58 = rd32(OFF_K58);
-    if (c48 != g_k48 || c50 != g_k50 || c54 != g_k54 || c58 != g_k58) {
-        wr64(OFF_K48, g_k48);
-        wr32(OFF_K50, g_k50);
-        wr32(OFF_K54, g_k54);
-        wr32(OFF_K58, g_k58);
+    if (key_equal(cur, g_good)) return;
+
+    if (cur.k50 == 0) {
+        // 失败流程的典型特征：4050 被清零，其它被随机化
+        write_keys(g_good);
         g_restores += 1;
-        if (g_restores <= 10 || (g_restores % 50) == 0) {
-            plog(@"[密钥] 被改乱，已恢复（第 %d 次）: %016llX/%08X/%08X/%08X -> %016llX/%08X/%08X/%08X",
-                 g_restores,
-                 (unsigned long long)c48, c50, c54, c58,
-                 (unsigned long long)g_k48, g_k50, g_k54, g_k58);
+        if (g_restores <= 10 || (g_restores % 20) == 0) {
+            plog(@"[密钥] 被失败流程改乱，已恢复（第 %d 次）: %@ -> %@",
+                 g_restores, key_desc(cur), key_desc(g_good));
             flush_log();
         }
-    }
-
-    // 前两分钟每 5 秒用原版安装函数重新校准一次快照
-    if (g_tick % 50 == 0 && g_tick <= 1200) {
-        uint64_t o48 = g_k48; uint32_t o50 = g_k50, o54 = g_k54, o58 = g_k58;
-        install_good_keys("周期校准");
-        if (o48 != g_k48 || o50 != g_k50 || o54 != g_k54 || o58 != g_k58) {
-            plog(@"[密钥] 快照已按原版安装函数校正");
-            flush_log();
-        }
-    }
-
-    // 前两分钟每 0.5 秒读一次弹窗（只读，主线程）
-    if (g_tick % 5 == 0 && g_tick <= 1200) {
-        dispatch_async(dispatch_get_main_queue(), ^{ inspect_alert(); });
+    } else {
+        // 非清零的变化，视为 App 自己重新安装了密钥，跟随更新
+        plog(@"[密钥] 跟随 App 的更新: %@ -> %@", key_desc(g_good), key_desc(cur));
+        g_good = cur;
+        flush_log();
     }
 }
 
@@ -291,13 +261,14 @@ static void aqaw_hook_start(void) {
     plog(@"日志文件: %@", g_logPath);
     flush_log();
 
+    // 所有运行时操作都留到定时器里做，构造函数只负责建日志和定时器
     g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
     if (!g_timer) return;
-    uint64_t interval = 100ull * NSEC_PER_MSEC;
+    uint64_t interval = 50ull * NSEC_PER_MSEC;
     dispatch_source_set_timer(g_timer,
                               dispatch_time(DISPATCH_TIME_NOW, interval),
                               interval,
-                              20ull * NSEC_PER_MSEC);
+                              10ull * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(g_timer, ^{ aq_tick(); });
     dispatch_resume(g_timer);
 }
