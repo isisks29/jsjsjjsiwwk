@@ -1,70 +1,77 @@
-// aqaw_probe.m —— aqaw.dylib 运行时只读诊断（作业用）
+// aqaw_runtime_patch.m —— aqaw 运行时内存补丁 + 弹窗记录（注入用）
 //
-// 目的：把「卡密校验到底改了哪些内存 / 面板有没有被创建」如实打出来。
-//       全程只读：不改内存、不改界面、不改变任何业务状态，
-//       因此不会出现「从后台线程改 UI 导致闪退」那类副作用。
+// 为什么还要这个版本：
+//   如果 App 里本来就自带一份 aqaw，或者注入工具是「新增一个 dylib」而不是
+//   「替换原文件」，那么改文件的方式不会生效，旧的那份仍然会弹卡密框。
+//   本文件作为独立 dylib 注入，在加载时直接改写内存里正在运行的 aqaw 代码，
+//   无论它是从哪个路径加载的都能打上补丁。
 //
-// 编译（Theos 示例）：
+// 它做两件事：
+//   1. 在内存里把下面 5 处改成直接返回（与文件补丁完全相同的机器码）；
+//   2. 之后 45 秒内每 0.35 秒看一次屏幕上的弹窗，把标题/正文/按钮/输入框
+//      写进日志（只读，不改界面）。
+//
+// 编译（Theos）：
 //       TARGET = iphone:clang:latest:14.0
 //       ARCHS = arm64 arm64e
-//       aqaw_probe_FILES = aqaw_probe.m
-//       aqaw_probe_FRAMEWORKS = UIKit Foundation
-//   也可以把本文件加进你自己的 dylib 工程，随注入包一起加载。
+//       aqaw_runtime_patch_FILES = aqaw_runtime_patch.m
+//       aqaw_runtime_patch_FRAMEWORKS = UIKit Foundation
 //
-// 输出位置（按优先级）：
-//       App Documents 目录/aqaw_probe.log
-//       NSTemporaryDirectory()/aqaw_probe.log
-//   同时用 NSLog 输出，Xcode / 系统控制台可直接查看。
-//   日志里的前几行会打印完整落盘路径。
+// 日志：App 的 Documents 目录/aqaw_patch.log（第一行会打印完整路径），
+//       同时 NSLog 输出。
 //
-// 关键地址（均为 aqaw.dylib 内部偏移，运行时要加镜像 slide）：
-//       0x7F8988   密钥流随机化函数（补丁 P1 目标）
-//       0x7EEC04   卡密输入弹窗构建函数（补丁 P2 目标）
-//       0x7F70E8   附属提示弹窗（补丁 P3 目标）
-//       0x1644048 / 0x1644050 / 0x1644054 / 0x1644058
-//                  字符串/逻辑解密用的密钥流全局
-//       0xA19EE0   面板创建前的密钥流一致性自检（返回 1 = 通过）
-//
-// 判读方法：
-//   * 未打补丁：启动几秒后 0x1644050 变 0（或四个值整体变动），
-//     说明卡密状态机走了「未授权」分支、把密钥流随机化/清零了。
-//   * 打过补丁：0x1644050 保持非零且不再变化；0x7F8988 的首 4 字节
-//     应为 c0 03 5f d6（ret）。
-//   * 日志中「判定: 已打补丁」即四处机器码全部符合预期。
+// 判读：
+//   「镜像命中 … slide=…」+「写入成功」= 补丁已在内存里生效；
+//   「判定: 已打补丁」= 回读确认；
+//   之后如果仍出现「弹窗:」行，说明还有别的弹窗来源，日志里的文字就是线索。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach/mach.h>
+#import <libkern/OSCacheControl.h>
 #import <stdint.h>
 #import <string.h>
+
+// ---------- 与文件补丁一致的 6 处改动 ----------
+typedef struct {
+    uint32_t off;
+    uint32_t oldv;
+    uint32_t newv;
+    const char *desc;
+} PatchSite;
+
+static const PatchSite kSites[] = {
+    {0x007F8988, 0xD100C3FF, 0xD65F03C0, "P1 禁用密钥流随机化"},
+    {0x007EEC04, 0xA9BA6FFC, 0xD2800000, "P2 卡密输入弹窗 -> mov x0,#0"},
+    {0x007EEC08, 0xA90167FA, 0xD65F03C0, "P2 紧随其后 ret"},
+    {0x007F70E8, 0xA9BA6FFC, 0xD65F03C0, "P3 附属提示弹窗"},
+    {0x007F4280, 0x6DB923E9, 0xD65F03C0, "P4 卡密提示信息方法"},
+    {0x007F1804, 0xA9BA6FFC, 0xD65F03C0, "P5 卡密到期信息方法"},
+};
 
 static intptr_t g_slide = 0;
 static BOOL g_found = NO;
 static NSMutableString *g_log = nil;
 static NSString *g_logPath = nil;
 static dispatch_queue_t g_q;
+static NSString *g_lastAlert = nil;
 
 static void plog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSLog(@"[aqaw-probe] %@", s);
+    NSLog(@"[aqaw-patch] %@", s);
     @synchronized (g_log) {
-        if (g_log) {
-            [g_log appendString:s];
-            [g_log appendString:@"\n"];
-        }
+        if (g_log) { [g_log appendString:s]; [g_log appendString:@"\n"]; }
     }
 }
 
 static void flush_log(void) {
     if (!g_log || !g_logPath) return;
     NSData *d;
-    @synchronized (g_log) {
-        d = [g_log dataUsingEncoding:NSUTF8StringEncoding];
-    }
+    @synchronized (g_log) { d = [g_log dataUsingEncoding:NSUTF8StringEncoding]; }
     [d writeToFile:g_logPath atomically:YES];
 }
 
@@ -74,183 +81,164 @@ static uint32_t rd32(uint64_t off) {
     return v;
 }
 
-static uint64_t rd64(uint64_t off) {
-    uint64_t v = 0;
-    memcpy(&v, (const void *)(g_slide + (intptr_t)off), sizeof(v));
-    return v;
-}
-
-// 找到 aqaw.dylib 在进程里的镜像并记录 slide
-static void locate_image(void) {
+static BOOL locate_image(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
-        if (strstr(name, "aqaw") || strstr(name, "AQaw") || strstr(name, "AQAR")) {
+        if (strstr(name, "aqaw") || strstr(name, "AQaw") ||
+            strstr(name, "AQAR") || strstr(name, "Aqaw")) {
             g_slide = _dyld_get_image_vmaddr_slide(i);
             g_found = YES;
-            plog(@"镜像命中: %s  index=%u  slide=0x%llX", name, i,
-                 (unsigned long long)g_slide);
-            return;
+            plog(@"镜像命中: %s  slide=0x%llX", name, (unsigned long long)g_slide);
+            return YES;
         }
     }
-    plog(@"未找到名为 aqaw 的镜像（共 %u 个镜像）", n);
-    for (uint32_t i = 0; i < n; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name) plog(@"  镜像[%u] %s", i, name);
+    return NO;
+}
+
+static BOOL patch_one(const PatchSite *s) {
+    uint64_t addr = (uint64_t)(g_slide + (intptr_t)s->off);
+    uint32_t cur = rd32(s->off);
+    if (cur == s->newv) {
+        plog(@"跳过（已是补丁后状态）0x%X %s", s->off, s->desc);
+        return YES;
     }
-}
-
-static void dump_keystream(NSString *tag) {
-    if (!g_found) return;
-    plog(@"[%@] 密钥流: 4048=0x%016llX  4050=0x%08X  4054=0x%08X  4058=0x%08X",
-         tag,
-         (unsigned long long)rd64(0x1644048),
-         rd32(0x1644050), rd32(0x1644054), rd32(0x1644058));
-}
-
-static void dump_patch_bytes(void) {
-    if (!g_found) return;
-    uint32_t p1  = rd32(0x7F8988);
-    uint32_t p2  = rd32(0x7EEC04);
-    uint32_t p2b = rd32(0x7EEC08);
-    uint32_t p3  = rd32(0x7F70E8);
-    plog(@"补丁点字节: 0x7F8988=%08X  0x7EEC04=%08X  0x7EEC08=%08X  0x7F70E8=%08X",
-         p1, p2, p2b, p3);
-    BOOL ok = (p1 == 0xD65F03C0 && p2 == 0xD2800000 &&
-               p2b == 0xD65F03C0 && p3 == 0xD65F03C0);
-    plog(@"判定: %@", ok ? @"已打补丁" : @"未打补丁（或版本不同）");
-    if (!ok) {
-        plog(@"期望:   0x7F8988=D65F03C0  0x7EEC04=D2800000  "
-             @"0x7EEC08=D65F03C0  0x7F70E8=D65F03C0");
+    if (cur != s->oldv) {
+        plog(@"跳过（原始字节不符）0x%X 实际=%08X 期望=%08X %s",
+             s->off, cur, s->oldv, s->desc);
+        return NO;
     }
-}
-
-// ---------------- 方法埋点：替换实现，只记录，再调用原实现 ----------------
-// 签名来自类的方法表，均已核对：
-//   -[_0x2F9C7E14 va2429730c25654]              v16@0:8      （无参，void）
-//   -[_0x2F9C7E14 v59341b48b7a63c:]             v24@0:8@16   （1 个 id）
-//   -[_0x2F9C7E14 v470d683f8c0e8f:endTime:]     v32@0:8@16@24（2 个 id）
-static IMP g_orig_a = NULL;
-static IMP g_orig_b = NULL;
-static IMP g_orig_c = NULL;
-
-static void hook_a(id self, SEL _cmd) {
-    plog(@"调用 -[_0x2F9C7E14 va2429730c25654]（读卡密 / 触发输入）");
-    if (g_orig_a) ((void (*)(id, SEL))g_orig_a)(self, _cmd);
-}
-
-static void hook_b(id self, SEL _cmd, id arg) {
-    plog(@"调用 -[_0x2F9C7E14 v59341b48b7a63c:] arg=%@", arg);
-    if (g_orig_b) ((void (*)(id, SEL, id))g_orig_b)(self, _cmd, arg);
-}
-
-static void hook_c(id self, SEL _cmd, id a, id b) {
-    plog(@"调用 -[_0x2F9C7E14 v470d683f8c0e8f:endTime:] a=%@ b=%@", a, b);
-    if (g_orig_c) ((void (*)(id, SEL, id, id))g_orig_c)(self, _cmd, a, b);
-}
-
-static BOOL hook_method(Class cls, const char *selName, IMP newImp, IMP *origOut) {
-    SEL sel = sel_registerName(selName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
-    *origOut = method_getImplementation(m);
-    method_setImplementation(m, newImp);
-    return YES;
-}
-
-static void install_hooks(void) {
-    Class c = objc_getClass("_0x2F9C7E14");
-    if (!c) {
-        plog(@"未找到卡密类 _0x2F9C7E14，跳过方法埋点");
-        return;
+    vm_address_t page = (vm_address_t)(addr & ~(uint64_t)(vm_page_size - 1));
+    vm_size_t span = (vm_size_t)((addr + 4 - page + vm_page_size - 1) & ~(uint64_t)(vm_page_size - 1));
+    kern_return_t kr = vm_protect(mach_task_self(), page, span, false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        plog(@"写入失败 0x%X vm_protect=%d", s->off, (int)kr);
+        return NO;
     }
-    BOOL a = hook_method(c, "va2429730c25654", (IMP)hook_a, &g_orig_a);
-    BOOL b = hook_method(c, "v59341b48b7a63c:", (IMP)hook_b, &g_orig_b);
-    BOOL d = hook_method(c, "v470d683f8c0e8f:endTime:", (IMP)hook_c, &g_orig_c);
-    plog(@"方法埋点: 读卡密=%@  单参=%@  双参=%@",
-         a ? @"成功" : @"缺失", b ? @"成功" : @"缺失", d ? @"成功" : @"缺失");
+    memcpy((void *)addr, &s->newv, sizeof(uint32_t));
+    sys_icache_invalidate((void *)addr, sizeof(uint32_t));
+    vm_protect(mach_task_self(), page, span, false,
+               VM_PROT_READ | VM_PROT_EXECUTE);
+    uint32_t after = rd32(s->off);
+    BOOL ok = (after == s->newv);
+    plog(@"写入%@ 0x%X %08X -> %08X %s",
+         ok ? @"成功" : @"失败", s->off, s->oldv, after, s->desc);
+    return ok;
 }
 
-// ---------------- 界面状态（只读，必须主线程） ----------------
-static void dump_ui_state(void) {
-    if (!g_found) return;
-    Class panelCls = objc_getClass("_0x1E6B7A93");
-    Class winCls   = objc_getClass("_0x8C2F4D71");
-    Class iconCls  = objc_getClass("_0xD4E9A3C7");
-    plog(@"类存在性: 面板=%@ 悬浮窗=%@ 图标=%@",
-         panelCls ? @"有" : @"无", winCls ? @"有" : @"无", iconCls ? @"有" : @"无");
+static void apply_patches(void) {
+    if (!g_found && !locate_image()) return;
+    int ok = 0;
+    for (size_t i = 0; i < sizeof(kSites) / sizeof(kSites[0]); i++) {
+        if (patch_one(&kSites[i])) ok += 1;
+    }
+    plog(@"补丁结果: %d/%zu 处生效", ok, sizeof(kSites) / sizeof(kSites[0]));
+    flush_log();
+}
 
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (winCls && [w isKindOfClass:winCls]) {
-            plog(@"发现悬浮窗: level=%.0f hidden=%d alpha=%.2f frame=%@ 子视图=%lu",
-                 w.windowLevel, (int)w.hidden, (double)w.alpha,
-                 NSStringFromCGRect(w.frame), (unsigned long)w.subviews.count);
-            for (UIView *v in w.subviews) {
-                plog(@"  子视图 %@ frame=%@ hidden=%d alpha=%.2f",
-                     NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
-                     (int)v.hidden, (double)v.alpha);
+static void dump_state(NSString *tag) {
+    if (!g_found) return;
+    uint32_t p1 = rd32(0x7F8988), p2 = rd32(0x7EEC04), p3 = rd32(0x7F70E8);
+    uint32_t p4 = rd32(0x7F4280), p5 = rd32(0x7F1804);
+    uint64_t k48 = 0; memcpy(&k48, (const void *)(g_slide + 0x1644048), 8);
+    uint32_t k50 = rd32(0x1644050), k54 = rd32(0x1644054), k58 = rd32(0x1644058);
+    plog(@"[%@] P1=%08X P2=%08X P3=%08X P4=%08X P5=%08X", tag, p1, p2, p3, p4, p5);
+    plog(@"[%@] 密钥流 4048=%016llX 4050=%08X 4054=%08X 4058=%08X",
+         tag, (unsigned long long)k48, k50, k54, k58);
+}
+
+// 只读检查当前弹窗（主线程）
+static void inspect_alerts(void) {
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) return;
+        NSArray *windows = [[app windows] copy];
+        UIViewController *top = nil;
+        for (UIWindow *w in windows) {
+            if (![w isKindOfClass:[UIWindow class]]) continue;
+            if (w.isKeyWindow) { top = w.rootViewController; break; }
+        }
+        if (!top) {
+            for (UIWindow *w in windows) {
+                if ([w isKindOfClass:[UIWindow class]] && w.rootViewController) {
+                    top = w.rootViewController; break;
+                }
             }
         }
-    }
-
-    UIWindow *kw = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (w.isKeyWindow) { kw = w; break; }
-    }
-    if (kw) {
-        plog(@"关键窗口: %@", NSStringFromClass([kw class]));
-        for (UIView *v in kw.subviews) {
-            if (panelCls && [v isKindOfClass:panelCls]) {
-                plog(@"  关键窗口内发现面板: frame=%@ hidden=%d alpha=%.2f 子视图=%lu",
-                     NSStringFromCGRect(v.frame), (int)v.hidden, (double)v.alpha,
-                     (unsigned long)v.subviews.count);
-            }
+        int depth = 0;
+        while (top.presentedViewController && depth < 8) {
+            top = top.presentedViewController; depth += 1;
         }
+        if (![top isKindOfClass:[UIAlertController class]]) return;
+
+        UIAlertController *a = (UIAlertController *)top;
+        NSMutableArray *acts = [NSMutableArray array];
+        for (UIAlertAction *act in a.actions) {
+            if (act.title.length) [acts addObject:act.title];
+        }
+        NSMutableArray *fields = [NSMutableArray array];
+        for (UITextField *tf in a.textFields) {
+            [fields addObject:tf.text.length ? tf.text : @"(空)"];
+        }
+        NSString *sig = [NSString stringWithFormat:@"%@|%@|%@|%@",
+                         a.title ?: @"", a.message ?: @"",
+                         [acts componentsJoinedByString:@","],
+                         [fields componentsJoinedByString:@","]];
+        if ([sig isEqualToString:g_lastAlert]) return;
+        g_lastAlert = sig;
+        plog(@"弹窗: 标题=%@ 正文=%@ 按钮=[%@] 输入框=[%@]",
+             a.title ?: @"(无)", a.message ?: @"(无)",
+             [acts componentsJoinedByString:@" / "],
+             [fields componentsJoinedByString:@" / "]);
+        flush_log();
+    } @catch (NSException *e) {
+        plog(@"检查弹窗异常: %@", e.reason ?: @"未知");
     }
 }
 
 __attribute__((constructor))
-static void aqaw_probe_start(void) {
-    g_q = dispatch_queue_create("aqaw.probe", DISPATCH_QUEUE_SERIAL);
+static void aqaw_patch_start(void) {
+    g_q = dispatch_queue_create("aqaw.patch", DISPATCH_QUEUE_SERIAL);
     g_log = [NSMutableString string];
-    [g_log appendString:@"========== aqaw 运行时诊断 ==========\n"];
+    [g_log appendString:@"========== aqaw 内存补丁 ==========\n"];
 
     NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                         NSUserDomainMask, YES);
-    if (dirs.count) {
-        g_logPath = [dirs[0] stringByAppendingPathComponent:@"aqaw_probe.log"];
-    } else {
-        g_logPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aqaw_probe.log"];
-    }
+    g_logPath = dirs.count
+        ? [dirs[0] stringByAppendingPathComponent:@"aqaw_patch.log"]
+        : [NSTemporaryDirectory() stringByAppendingPathComponent:@"aqaw_patch.log"];
     plog(@"日志文件: %@", g_logPath);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   g_q, ^{
-        locate_image();
-        dump_patch_bytes();
-        dump_keystream(@"1s");
-        install_hooks();
-        flush_log();
-    });
-
-    // 2s 起每秒采一次密钥流，共 29 次；纯读内存，不碰界面
-    for (int i = 2; i <= 30; i++) {
-        NSString *tag = [NSString stringWithFormat:@"%ds", i];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * NSEC_PER_SEC)),
+    // 找不到镜像就重试几次（覆盖 aqaw 比本 dylib 晚加载的情况）
+    for (int i = 0; i < 10; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * i * NSEC_PER_SEC)),
                        g_q, ^{
-            if (!g_found) return;
-            dump_keystream(tag);
+            if (g_found) return;
+            apply_patches();
+            if (g_found) dump_state(@"写入后");
+        });
+    }
+
+    // 密钥流采样：确认 P1 生效后不再被随机化
+    int secs[] = {2, 5, 10, 20, 35};
+    for (int i = 0; i < 5; i++) {
+        int s = secs[i];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(s * NSEC_PER_SEC)),
+                       g_q, ^{
+            NSString *tag = [NSString stringWithFormat:@"%ds", s];
+            dump_state(tag);
             flush_log();
         });
     }
 
-    // 界面状态只在主线程查，且只读
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ dump_ui_state(); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ dump_ui_state(); flush_log(); });
+    // 弹窗观察：0.35 秒一次，约 45 秒，只读
+    for (int i = 0; i < 130; i++) {
+        double delay = 0.35 * i;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ inspect_alerts(); });
+    }
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(32.0 * NSEC_PER_SEC)),
-                   g_q, ^{ plog(@"诊断结束。"); flush_log(); });
+    flush_log();
 }
