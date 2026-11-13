@@ -1,84 +1,87 @@
-// aqaw_runtime_patch.m —— aqaw 卡密弹窗接管 + 让解密密钥保持“已激活”（注入用）
+// aqaw_probe.m —— aqaw 只读诊断弹窗（注入用）
 //
-// 这一版的原则是“能不调用就不调用、能不碰就不碰”：
-//   * 不修改任何代码页（iOS 18 会因代码页签名失效直接闪退）；
-//   * 不调用 aqaw 里的任何函数（上一版会调用它的密钥安装函数，可能导致
-//     和 App 自身初始化竞争而闪退）；
-//   * 只做两件事：
-//       1. 用 Objective-C 运行时把卡密类里“只负责弹窗”的三个方法换成空函数；
-//       2. 在 App 自己把解密密钥装好之后，记下这组值，之后每 50 毫秒比对
-//          一次，一旦卡密失败流程把它改乱就写回（数据页，不涉及签名）。
+// 目标：进 App 后自动弹出一个窗口显示诊断信息，并自动复制到剪贴板，
+//       不需要再去 App 的文稿目录里找日志。
 //
-// 使用前提：App 里的 aqaw.dylib 必须是【原版】。
+// 这一版是完全只读的：
+//   * 不修改任何代码页；
+//   * 不调用原文件里的任何函数；
+//   * 不修改解密密钥；
+//   * 只读取镜像地址、三个弹窗方法的当前实现、密钥值、以及屏幕上的弹窗文字。
 //
 // 编译（Theos）：
 //       TARGET = iphone:clang:latest:14.0
 //       ARCHS = arm64 arm64e
-//       aqaw_runtime_patch_FILES = aqaw_runtime_patch.m
-//       aqaw_runtime_patch_FRAMEWORKS = Foundation
+//       aqaw_probe_FILES = aqaw_probe.m
+//       aqaw_probe_FRAMEWORKS = UIKit Foundation
 //
-// 日志：App 的 Documents 目录/aqaw_hook.log（第一行打印完整路径），同时 NSLog。
+// 使用：注入后正常打开 App。约 1.5 秒后会弹出一个「aqaw 诊断信息」窗口，
+//       内容同时已经复制到剪贴板，直接粘贴到聊天窗口发给我即可。
+//       如果 App 中途闪退，剪贴板里仍然是闪退前最后的诊断信息。
 //
-// 判读：
-//   「钩子: … 已接管」= 弹窗入口已经失效；
-//   「密钥: 已记录启动密钥」= 拿到了正确密钥；
-//   「密钥: 被失败流程改乱，已恢复」= 失败流程动过密钥，被我们按 50ms 恢复。
+// 说明：诊断窗口是独立的一个置顶窗口，不会被 App 自己的弹窗盖住。
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <stdint.h>
-#import <stdlib.h>
 #import <string.h>
 
-// ---------------- 关键地址（文件偏移 = 虚拟地址） ----------------
-static const uint64_t OFF_K48 = 0x1644048;  // 8 字节密钥
-static const uint64_t OFF_K50 = 0x1644050;  // 4 字节密钥（失败流程会把它清零）
-static const uint64_t OFF_K54 = 0x1644054;  // 4 字节密钥
-static const uint64_t OFF_K58 = 0x1644058;  // 4 字节密钥
-
-typedef struct {
-    uint64_t k48;
-    uint32_t k50, k54, k58;
-} KeyState;
-
+static NSTimeInterval g_start = 0;
+static NSMutableString *g_text = nil;
+static NSString *g_lastClip = nil;
 static intptr_t g_slide = 0;
 static BOOL g_found = NO;
-static BOOL g_hooked = NO;
-static BOOL g_snap = NO;
-static BOOL g_haveFirst = NO;
-static KeyState g_good;      // 已确认的正确密钥
-static KeyState g_first;     // 最早读到的非零密钥（兜底）
-static KeyState g_cand;      // 候选密钥
-static int g_candCount = 0;
-static int g_tick = 0;
-static int g_restores = 0;
-
-static NSMutableString *g_log = nil;
-static NSString *g_logPath = nil;
+static BOOL g_impsLogged = NO;
+static BOOL g_presenting = NO;
+static BOOL g_shown = NO;
+static UIWindow *g_win = nil;
+static UIWindow *g_prevKey = nil;
 static dispatch_queue_t g_q = nil;
 static dispatch_source_t g_timer = nil;
+static NSString *g_lastAlert = nil;
+static int g_tick = 0;
+static uint64_t g_k48 = 0;
+static uint32_t g_k50 = 0, g_k54 = 0, g_k58 = 0;
+static BOOL g_haveKeys = NO;
 
-static void plog(NSString *fmt, ...) {
+static double aq_now(void) {
+    return [NSProcessInfo processInfo].systemUptime - g_start;
+}
+
+static void aq_add(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSLog(@"[aqaw-hook] %@", s);
-    @synchronized (g_log) {
-        if (g_log) { [g_log appendString:s]; [g_log appendString:@"\n"]; }
+    NSLog(@"[aqaw-diag] %@", s);
+    @synchronized (g_text) {
+        if (g_text) [g_text appendFormat:@"[%.2fs] %@\n", aq_now(), s];
     }
 }
 
-static void flush_log(void) {
-    if (!g_log || !g_logPath) return;
-    NSData *d;
-    @synchronized (g_log) { d = [g_log dataUsingEncoding:NSUTF8StringEncoding]; }
-    [d writeToFile:g_logPath atomically:YES];
+static NSString *aq_snapshot(void) {
+    NSString *s;
+    @synchronized (g_text) { s = g_text ? [g_text copy] : @""; }
+    return s;
 }
 
-// ---------------- 定位 aqaw 镜像 ----------------
-static BOOL locate_image(void) {
+// 把完整诊断文本写进剪贴板（主线程操作）
+static void aq_copy(void) {
+    NSString *s = aq_snapshot();
+    if (!s.length) return;
+    if ([s isEqualToString:g_lastClip]) return;
+    g_lastClip = [s copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            [UIPasteboard generalPasteboard].string = aq_snapshot();
+        } @catch (NSException *e) {
+        }
+    });
+}
+
+static BOOL aq_locate(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
@@ -87,188 +90,218 @@ static BOOL locate_image(void) {
             strstr(name, "Aqaw") || strstr(name, "AQAR")) {
             g_slide = _dyld_get_image_vmaddr_slide(i);
             g_found = YES;
-            plog(@"镜像: %s  slide=0x%llX", name, (unsigned long long)g_slide);
-            flush_log();
+            aq_add(@"找到镜像 %s", name);
+            aq_add(@"镜像基址偏移 slide=0x%llX", (unsigned long long)g_slide);
             return YES;
         }
     }
     return NO;
 }
 
-// ---------------- 读取 / 写入密钥（数据页，安全） ----------------
-static KeyState read_keys(void) {
-    KeyState s = {0, 0, 0, 0};
-    memcpy(&s.k48, (const void *)(g_slide + (intptr_t)OFF_K48), sizeof(uint64_t));
-    memcpy(&s.k50, (const void *)(g_slide + (intptr_t)OFF_K50), sizeof(uint32_t));
-    memcpy(&s.k54, (const void *)(g_slide + (intptr_t)OFF_K54), sizeof(uint32_t));
-    memcpy(&s.k58, (const void *)(g_slide + (intptr_t)OFF_K58), sizeof(uint32_t));
-    return s;
-}
-
-static void write_keys(KeyState s) {
-    memcpy((void *)(g_slide + (intptr_t)OFF_K48), &s.k48, sizeof(uint64_t));
-    memcpy((void *)(g_slide + (intptr_t)OFF_K50), &s.k50, sizeof(uint32_t));
-    memcpy((void *)(g_slide + (intptr_t)OFF_K54), &s.k54, sizeof(uint32_t));
-    memcpy((void *)(g_slide + (intptr_t)OFF_K58), &s.k58, sizeof(uint32_t));
-}
-
-static BOOL key_equal(KeyState a, KeyState b) {
-    return a.k48 == b.k48 && a.k50 == b.k50 && a.k54 == b.k54 && a.k58 == b.k58;
-}
-
-static NSString *key_desc(KeyState s) {
-    return [NSString stringWithFormat:@"%016llX/%08X/%08X/%08X",
-            (unsigned long long)s.k48, s.k50, s.k54, s.k58];
-}
-
-// ---------------- 弹窗方法接管 ----------------
-static void aq_noop0(id self, SEL _cmd) {}
-static void aq_noop1(id self, SEL _cmd, id a) {}
-static void aq_noop2(id self, SEL _cmd, id a, id b) {}
-
-static Class find_license_class(void) {
-    Class c = objc_getClass("_0x2F9C7E14");
-    if (c) return c;
-    c = objc_getClass("0x2F9C7E14");
-    if (c) return c;
-
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return Nil;
-    Class *list = (Class *)malloc(sizeof(Class) * count);
-    if (!list) return Nil;
-    count = objc_getClassList(list, count);
-    Class hit = Nil;
-    for (int i = 0; i < count; i++) {
-        const char *n = class_getName(list[i]);
-        if (n && strstr(n, "0x2F9C7E14")) { hit = list[i]; break; }
-    }
-    free(list);
-    return hit;
-}
-
-static BOOL hook_once(void) {
-    Class cls = find_license_class();
+// 读取三个弹窗方法当前的实现地址（只读）
+static void aq_log_imps(void) {
+    Class cls = objc_getClass("_0x2F9C7E14");
     if (!cls) {
-        if ((g_tick % 100) == 0) {
-            plog(@"钩子: 还没找到卡密类，继续等待");
-            flush_log();
-        }
-        return NO;
+        aq_add(@"卡密类还没有注册");
+        return;
     }
-
-    const char *sels[] = {
+    aq_add(@"卡密类已注册: %s", class_getName(cls));
+    const char *sels[3] = {
         "va2429730c25654",
         "v59341b48b7a63c:",
         "v470d683f8c0e8f:endTime:",
     };
-    IMP imps[] = { (IMP)aq_noop0, (IMP)aq_noop1, (IMP)aq_noop2 };
-    int ok = 0;
-    for (size_t i = 0; i < sizeof(sels) / sizeof(sels[0]); i++) {
+    uint64_t exps[3] = { 0x7F6A20, 0x7F4280, 0x7F1804 };
+    for (int i = 0; i < 3; i++) {
         SEL sel = sel_registerName(sels[i]);
         Method m = class_getInstanceMethod(cls, sel);
-        if (!m) continue;
-        method_setImplementation(m, imps[i]);
-        ok += 1;
+        if (!m) {
+            aq_add(@"方法 %s 不存在", sels[i]);
+            continue;
+        }
+        uintptr_t imp = (uintptr_t)method_getImplementation(m);
+        unsigned long off = (unsigned long)(imp - (uintptr_t)g_slide);
+        aq_add(@"方法 %s 当前实现=0x%lX 期望=0x%llX %@",
+               sels[i], off, (unsigned long long)exps[i],
+               (off == exps[i]) ? @"一致" : @"不一致");
     }
-    if (ok > 0) {
-        g_hooked = YES;
-        plog(@"钩子: 接管 %d/3 个弹窗方法（类 %s）", ok, class_getName(cls));
-        flush_log();
-        return YES;
-    }
-    return NO;
+    g_impsLogged = YES;
+    aq_copy();
 }
 
-// ---------------- 每 50 毫秒巡检 ----------------
-static void aq_tick(void) {
-    g_tick += 1;
+static void aq_log_keys(void) {
+    if (!g_found) return;
+    uint64_t a = 0;
+    uint32_t b = 0, c = 0, d = 0;
+    memcpy(&a, (const void *)(g_slide + 0x1644048), 8);
+    memcpy(&b, (const void *)(g_slide + 0x1644050), 4);
+    memcpy(&c, (const void *)(g_slide + 0x1644054), 4);
+    memcpy(&d, (const void *)(g_slide + 0x1644058), 4);
+    if (g_haveKeys && a == g_k48 && b == g_k50 && c == g_k54 && d == g_k58) return;
+    aq_add(@"解密密钥 4048=%016llX 4050=%08X 4054=%08X 4058=%08X",
+           (unsigned long long)a, b, c, d);
+    g_k48 = a; g_k50 = b; g_k54 = c; g_k58 = d;
+    g_haveKeys = YES;
+    aq_copy();
+}
 
-    if (!g_found && !locate_image()) return;
-    if (!g_hooked && (g_tick <= 5 || (g_tick % 10) == 0)) hook_once();
-
-    KeyState cur = read_keys();
-
-    // 记录最早读到的非零密钥（正常安装一定是非零的）
-    if (!g_haveFirst && cur.k50 != 0) {
-        g_first = cur;
-        g_haveFirst = YES;
-        plog(@"[密钥] 首次读到启动密钥: %@", key_desc(cur));
-        flush_log();
-    }
-
-    if (!g_snap) {
-        if (cur.k50 != 0) {
-            // 连续两次读到同一组非零值，认定启动安装已经完成
-            if (g_candCount > 0 && key_equal(cur, g_cand)) {
-                g_candCount += 1;
-            } else {
-                g_cand = cur;
-                g_candCount = 1;
+// 只读看一眼 App 自己弹出来的窗口（跳过我们自己的诊断窗口）
+static void aq_check_app_alert(void) {
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) return;
+        NSArray *wins = [[app windows] copy];
+        for (UIWindow *w in wins) {
+            if (![w isKindOfClass:[UIWindow class]]) continue;
+            if (g_win && w == g_win) continue;
+            UIViewController *vc = w.rootViewController;
+            int depth = 0;
+            while (vc.presentedViewController && depth < 6) {
+                vc = vc.presentedViewController;
+                depth += 1;
             }
-            if (g_candCount >= 2) {
-                g_good = cur;
-                g_snap = YES;
-                plog(@"[密钥] 已记录启动密钥: %@", key_desc(g_good));
-                flush_log();
+            if (![vc isKindOfClass:[UIAlertController class]]) continue;
+            UIAlertController *a = (UIAlertController *)vc;
+            NSString *sig = [NSString stringWithFormat:@"%@|%@|%lu",
+                             a.title ?: @"", a.message ?: @"",
+                             (unsigned long)a.textFields.count];
+            if ([sig isEqualToString:g_lastAlert]) return;
+            g_lastAlert = [sig copy];
+            NSMutableString *fields = [NSMutableString string];
+            for (UITextField *tf in a.textFields) {
+                [fields appendFormat:@"[%@] ", tf.text ?: @""];
             }
+            aq_add(@"App 弹窗 标题=%@ 正文=%@ 输入框数=%lu %@",
+                   a.title ?: @"(无)", a.message ?: @"(无)",
+                   (unsigned long)a.textFields.count, fields);
+            aq_copy();
             return;
         }
-        g_candCount = 0;
-        if (g_haveFirst && g_tick >= 20) {
-            // 1 秒时仍是被改乱状态：用最早读到的正确值兜底
-            g_good = g_first;
-            g_snap = YES;
-            plog(@"[密钥] 当前已被改乱，改用最早读到的正确值: %@", key_desc(g_good));
-            write_keys(g_good);
-            flush_log();
-        } else if ((g_tick % 100) == 0) {
-            plog(@"[密钥] 等待启动密钥就绪…");
-            flush_log();
-        }
-        return;
+    } @catch (NSException *e) {
     }
+}
 
-    if (key_equal(cur, g_good)) return;
+// 创建置顶窗口并展示诊断信息（主线程）
+static void aq_show(void) {
+    if (g_shown || g_presenting) return;
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) return;
+        UIViewController *host = nil;
 
-    if (cur.k50 == 0) {
-        // 失败流程的典型特征：4050 被清零，其它被随机化
-        write_keys(g_good);
-        g_restores += 1;
-        if (g_restores <= 10 || (g_restores % 20) == 0) {
-            plog(@"[密钥] 被失败流程改乱，已恢复（第 %d 次）: %@ -> %@",
-                 g_restores, key_desc(cur), key_desc(g_good));
-            flush_log();
+        UIWindowScene *scene = nil;
+        for (UIScene *s in app.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            if (s.activationState == UISceneActivationStateForegroundActive) {
+                scene = (UIWindowScene *)s;
+                break;
+            }
         }
-    } else {
-        // 非清零的变化，视为 App 自己重新安装了密钥，跟随更新
-        plog(@"[密钥] 跟随 App 的更新: %@ -> %@", key_desc(g_good), key_desc(cur));
-        g_good = cur;
-        flush_log();
+        if (!scene) {
+            for (UIScene *s in app.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) {
+                    scene = (UIWindowScene *)s;
+                    break;
+                }
+            }
+        }
+
+        if (scene) {
+            if (!g_win) {
+                g_prevKey = app.keyWindow;
+                g_win = [[UIWindow alloc] initWithWindowScene:scene];
+                g_win.windowLevel = UIWindowLevelAlert + 10;
+                UIViewController *root = [[UIViewController alloc] init];
+                root.view.backgroundColor = [UIColor clearColor];
+                g_win.rootViewController = root;
+                [g_win makeKeyAndVisible];
+            }
+            host = g_win.rootViewController;
+        } else {
+            UIWindow *w = app.keyWindow;
+            if (!w || !w.rootViewController) return;
+            host = w.rootViewController;
+            int depth = 0;
+            while (host.presentedViewController && depth < 6) {
+                host = host.presentedViewController;
+                depth += 1;
+            }
+        }
+        if (!host) return;
+
+        NSString *msg = aq_snapshot();
+        if (msg.length > 1100) {
+            msg = [[msg substringToIndex:1100] stringByAppendingString:
+                   @"\n…（内容太长已截断，完整版已复制到剪贴板）"];
+        }
+
+        UIAlertController *a =
+            [UIAlertController alertControllerWithTitle:@"aqaw 诊断信息"
+                                                message:msg
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"复制并关闭"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            g_lastClip = nil;
+            aq_copy();
+            @try {
+                if (g_prevKey) [g_prevKey makeKeyWindow];
+                g_win.hidden = YES;
+            } @catch (NSException *e) {
+            }
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"关闭"
+                                              style:UIAlertActionStyleCancel
+                                            handler:^(UIAlertAction *act) {
+            @try {
+                if (g_prevKey) [g_prevKey makeKeyWindow];
+                g_win.hidden = YES;
+            } @catch (NSException *e) {
+            }
+        }]];
+
+        g_presenting = YES;
+        [host presentViewController:a animated:YES completion:^{
+            g_presenting = NO;
+            g_shown = YES;
+            g_lastClip = nil;
+            aq_copy();   // 自动复制完整内容
+        }];
+    } @catch (NSException *e) {
+        g_presenting = NO;
+        aq_add(@"诊断窗展示失败: %@", e.reason ?: @"未知");
     }
+}
+
+static void aq_tick(void) {
+    g_tick += 1;
+    if (!g_found) aq_locate();
+    if (g_found && !g_impsLogged) aq_log_imps();
+    if (g_found) aq_log_keys();
+
+    if ((g_tick % 5) == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{ aq_check_app_alert(); });
+    }
+    if ((g_tick % 3) == 0 && !g_shown && !g_presenting && aq_now() >= 0.3) {
+        dispatch_async(dispatch_get_main_queue(), ^{ aq_show(); });
+    }
+    if (g_tick <= 5 || (g_tick % 20) == 0) aq_copy();
 }
 
 __attribute__((constructor))
-static void aqaw_hook_start(void) {
-    g_q = dispatch_queue_create("aqaw.hook", DISPATCH_QUEUE_SERIAL);
-    g_log = [NSMutableString string];
-    [g_log appendString:@"========== aqaw 注入版补丁（不修改原文件） ==========\n"];
+static void aqaw_probe_start(void) {
+    g_start = [NSProcessInfo processInfo].systemUptime;
+    g_text = [NSMutableString string];
+    [g_text appendString:@"===== aqaw 诊断 =====\n"];
+    aq_add(@"诊断代码已加载");
 
-    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                        NSUserDomainMask, YES);
-    g_logPath = dirs.count
-        ? [dirs[0] stringByAppendingPathComponent:@"aqaw_hook.log"]
-        : [NSTemporaryDirectory() stringByAppendingPathComponent:@"aqaw_hook.log"];
-    plog(@"日志文件: %@", g_logPath);
-    flush_log();
-
-    // 所有运行时操作都留到定时器里做，构造函数只负责建日志和定时器
+    g_q = dispatch_queue_create("aqaw.probe", DISPATCH_QUEUE_SERIAL);
     g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
     if (!g_timer) return;
-    uint64_t interval = 50ull * NSEC_PER_MSEC;
     dispatch_source_set_timer(g_timer,
-                              dispatch_time(DISPATCH_TIME_NOW, interval),
-                              interval,
-                              10ull * NSEC_PER_MSEC);
+                              dispatch_time(DISPATCH_TIME_NOW, 100ull * NSEC_PER_MSEC),
+                              100ull * NSEC_PER_MSEC,
+                              20ull * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(g_timer, ^{ aq_tick(); });
     dispatch_resume(g_timer);
 }
