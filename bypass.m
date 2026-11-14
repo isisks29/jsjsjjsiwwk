@@ -20,11 +20,12 @@
 //      原版把激活结果存在哪里；
 //   6. 记录原版卡密通道的连接地址和收发内容（原版用自带套接字，不走系统网络
 //      组件；只记录，不改请求也不改返回），用来判断校验连的是谁、返回的格式；
-//   7. 原版检查完后，在「要不要创建面板」这一处做一次二选一。本版把这一条
-//      选择指令在内存里固定成「创建面板」这一支（4 个字节，磁盘文件一个字节
-//      不动）。上一版也改了这里，但写完把代码页恢复成「可读+可写+可执行」——
-//      arm64 不允许这样做，恢复失败后那一页失去执行权限，进程当场闪退。
-//      这一次改为写完立即恢复「可读+可执行」，并检查每一步结果。
+//   7. 面板放行改为「只改数据，不碰代码」。原版在创建面板前会拿数据段里的
+//      卡密缓存（0x1639298 起 0x90 字节）和只读常量段里的预期值（0x130433C 起
+//      32 个字）逐字比对，32 个字全等才创建面板；没有真卡密时缓存会被清掉，
+//      比对必然失败。上一版去改那条分支指令，写完恢复执行权限时系统两次都拒绝
+//      （日志里的 2/2），那一页失去执行权限、进程当场闪退。这一版一个代码字节
+//      都不碰，只在缓存被清掉之后把出厂内容写回可写数据段，让比对重新相等。
 //   8. 看到校验结果后约 2.5 秒，用原版自己的激活状态写入方法写入一份测试状态，
 //      看面板会不会因此放行；出现成功提示时自动点「确定」并把卡密输入框收起，
 //      失败提示 4 秒后自动收起，避免挡住面板；
@@ -44,7 +45,7 @@
 //
 // 仍然不做的事：
 //   * 不修改磁盘上的任何文件；
-//   * 只改内存里的一条分支选择指令（就是上面第 7 条那处），其它机器码不动；
+//   * 不改任何一条机器码（上面第 7 条只写可写数据段里的缓存内容）；
 //   * 不主动调用面板初始化 / 挂载函数（它们依赖启动时的现场，空手调用会崩）；
 //   * 不替换原版自己的任何方法；
 //   * 不碰卡密以外的界面。
@@ -1038,48 +1039,82 @@ static BOOL aq_install_hooks(void) {
     return YES;
 }
 
-// ---- 面板放行：只改一条分支选择指令（内存里，谨慎恢复执行权限） -------------
-// 原版检查完后，在「要不要创建面板」这一处做一次二选一。
-// 这里把它固定成「创建面板」这一支。
-// 关键：arm64 不允许代码页同时可写可执行，所以写完后必须恢复成「可读+可执行」，
-// 绝不能留在可写状态，否则那一页的下一条指令就会把进程打崩（上一版就栽在这）。
-static BOOL g_panelBranchForced = NO;
+// ---- 面板放行：把卡密缓存按出厂内容写回（纯数据，不碰任何代码） --------------
+// 反汇编结论（均为实际指令）：
+//   * 0xA110F8：把内部标记从 x26 复制到栈上的位置，供最后的判断读取；
+//   * 0xA10D80：ldr w8,[x8]; subs wzr,w8,#0 → 标记为 0 就走「创建面板」；
+//   * 0xA105DC：标记被置 1 的唯一点，由 0xA11164 的比对失败分支跳过来；
+//   * 0xA11164：把缓存里的一个字（0x1639298+0x10+i*4）与预期值
+//                （0x130433C+i*4）比较，相等走成功，不等走上面的置 1。
+// 也就是说：面板不出现，唯一原因是这段数据比对没通过。
+// 缓存区在 __DATA（可写），预期值在 __TEXT/__ckimm（只读）。
+// 没有真卡密时原版会把缓存清掉，比对必然失败；这里只把出厂的 0x90 字节写回
+// 可写数据段，一行机器码都不动，也就不会再触发上一版的代码页权限问题。
+static const uint32_t kAqCkBlob[36] = {
+    0x434A4B43u, 0x00000001u, 0x00000001u, 0x00000020u,  // 头：标识、版本、字数 32
+    0x82DEFD09u, 0x8BE5C0ADu, 0x457E9383u, 0xDE9C8092u,
+    0xA32FA94Bu, 0x2DEB9FC9u, 0x6EB58511u, 0x64558161u,
+    0x19B44876u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0xEFD60FD0u, 0x53FCF9A4u,
+    0xA57D7FBAu, 0xB5136A38u, 0x21D75ED5u, 0x571449F1u,
+    0x9242E5D9u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x1C203114u, 0x01032208u
+};
 
-static BOOL aq_patch_word(uintptr_t off, uint32_t want, const char *tag) {
-    if (!g_found) return NO;
-    uintptr_t addr = (uintptr_t)(g_slide + off);
-    uint32_t cur = 0;
-    memcpy(&cur, (const void *)addr, sizeof(cur));
-    if (cur == want) {
-        aq_add(@"%s 已经是放行状态", tag);
-        return YES;
-    }
-    uintptr_t page = addr & ~(uintptr_t)0x3FFF;
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        aq_add(@"%s 放行失败: 页面不可写 (%d)，保持原样", tag, (int)kr);
-        return NO;
-    }
-    memcpy((void *)addr, &want, sizeof(want));
-    sys_icache_invalidate((void *)addr, sizeof(want));
-    kern_return_t kr2 = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
-                                   VM_PROT_READ | VM_PROT_EXECUTE);
-    if (kr2 != KERN_SUCCESS) {
-        kern_return_t kr3 = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
-                                       VM_PROT_READ | VM_PROT_EXECUTE);
-        aq_add(@"%s 放行后恢复执行权限失败 (%d/%d)，原值 %08X", tag, (int)kr2, (int)kr3, cur);
-        return NO;
-    }
-    aq_add(@"%s 已放行（原值 %08X，仅内存）", tag, cur);
-    return YES;
-}
+static BOOL g_ckFirstCheck = NO;
+static BOOL g_ckRestored = NO;
+static BOOL g_ckHaveSeen = NO;
+static BOOL g_ckWindowClosed = NO;
+static int  g_ckWriteCount = 0;
+static uint32_t g_ckLastSeen[36] = {0};
 
-static void aq_force_panel_branch(void) {
-    if (!g_found || g_panelBranchForced) return;
-    g_panelBranchForced = YES;
-    aq_patch_word(0xA10D94, 0x2A0803FC, "面板创建分支");
-    aq_copy();
+static void aq_repair_keycache(void) {
+    if (!g_found) return;
+    uintptr_t blobAddr = (uintptr_t)(g_slide + 0x1639298);
+    uint32_t cur[36];
+    memcpy(cur, (const void *)blobAddr, sizeof(cur));
+
+    int diff = 0;
+    int firstDiff = 0;
+    for (int i = 0; i < 36; i++) {
+        if (cur[i] != kAqCkBlob[i]) {
+            if (diff == 0) firstDiff = i;
+            diff++;
+        }
+    }
+
+    if (!g_ckFirstCheck) {
+        g_ckFirstCheck = YES;
+        if (diff == 0) {
+            aq_add(@"卡密缓存与预期值一致（36 个字全部相同）");
+        } else {
+            aq_add(@"卡密缓存与预期值不同：%d/36 个字不一致，首个不同在第 %d 个字（当前 %08X，预期 %08X）",
+                   diff, firstDiff, cur[firstDiff], kAqCkBlob[firstDiff]);
+        }
+    }
+
+    if (diff == 0) {
+        memcpy(g_ckLastSeen, cur, sizeof(cur));
+        g_ckHaveSeen = YES;
+        return;
+    }
+
+    if (!g_ckHaveSeen || memcmp(g_ckLastSeen, cur, sizeof(cur)) != 0) {
+        g_ckHaveSeen = YES;
+        memcpy(g_ckLastSeen, cur, sizeof(cur));
+        aq_add(@"卡密缓存内容有变化（%d/36 处不同），前四字 %08X %08X %08X %08X",
+               diff, cur[0], cur[1], cur[2], cur[3]);
+    }
+
+    // 只写可写数据段；不经过 vm_protect，也不碰代码页。
+    memcpy((void *)blobAddr, kAqCkBlob, sizeof(kAqCkBlob));
+    g_ckWriteCount++;
+    if (!g_ckRestored) {
+        g_ckRestored = YES;
+        aq_add(@"已按出厂内容写回卡密缓存（纯数据写入，代码一个字节没动）");
+        aq_copy();
+    }
 }
 
 // ---- 只读观察：网络请求 / 钥匙串 / 卡密处理 -------------------------------
@@ -1641,9 +1676,15 @@ static void aq_tick(void) {
     if (g_found && !g_hookInstalled && g_hookTries < 3 && aq_now() >= 0.5) {
         aq_install_hooks();
     }
-    // 在原版开局检查（约 3.5 秒）之前，把两处二选一固定成「通过 / 创建面板」。
-    if (g_found && !g_panelBranchForced && aq_now() >= 0.3) {
-        aq_force_panel_branch();
+    // 原版开局检查（实测 1.3~3.5 秒之间）会读这块缓存。检查开始前先写回出厂内容，
+    // 之后每 0.1 秒确认一次：原版中途把它清掉就立刻补回去。全程只写数据段。
+    if (g_found && aq_now() >= 0.30 && aq_now() <= 8.0) {
+        aq_repair_keycache();
+    }
+    if (g_found && !g_ckWindowClosed && aq_now() > 8.0) {
+        g_ckWindowClosed = YES;
+        aq_add(@"卡密缓存写回结束，共写入 %d 次", g_ckWriteCount);
+        aq_copy();
     }
     // 0.6 秒起装上网络观察：校验请求一发出就能把地址和返回内容记下来。
     if (!g_netInstalled && g_netTries < 2 && aq_now() >= 0.6) {
