@@ -55,6 +55,7 @@ static int g_tick = 0;
 static BOOL g_installTried = NO;
 static BOOL g_installDone = NO;
 static BOOL g_uiDumped = NO;
+static BOOL g_menuTried = NO;
 
 static KeyState g_good = {0, 0, 0, 0};
 static KeyState g_cand = {0, 0, 0, 0};
@@ -249,6 +250,27 @@ static void aq_install_keys(void) {
     });
 }
 
+// 密钥装好后，主动执行一次原版面板初始化（无参数，原版启动时自己也会调它）
+static void aq_try_menu(void) {
+    if (g_menuTried || !g_found) return;
+    g_menuTried = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        aq_add(@"准备初始化面板（调用原版面板函数）");
+        @try {
+            [UIPasteboard generalPasteboard].string = aq_snapshot();
+        } @catch (NSException *e) {
+        }
+        @try {
+            void (*fn)(void) = (void (*)(void))(g_slide + 0xA118FC);
+            fn();
+            aq_add(@"面板函数已返回");
+        } @catch (NSException *e) {
+            aq_add(@"面板函数异常: %@", e.reason ?: @"未知");
+        }
+        aq_copy();
+    });
+}
+
 static NSArray<UIWindow *> *aq_all_windows(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return @[];
@@ -405,6 +427,7 @@ static void aq_tick(void) {
     if (!g_found) aq_locate();
     if (g_found && !g_impsLogged) aq_log_imps();
     if (g_found && !g_installTried && aq_now() >= 1.0) aq_install_keys();
+    if (g_found && g_installDone && !g_menuTried && aq_now() >= 4.0) aq_try_menu();
 
     if (g_found) {
         KeyState cur = aq_read_keys();
