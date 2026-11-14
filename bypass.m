@@ -6,7 +6,7 @@
 //   因此这里一个字节都不改 aqaw，只在运行时替它把「设备密钥」装好。
 //
 // 这一版做什么：
-//   1. 只在内存里把「面板总门」（0xA112C8，返回 1 表示放行）改成直接返回 1，
+//   1. 只在内存里改「要不要显示面板」那两个判断点，固定选择「显示」，
 //      不修改磁盘文件，也不改任何激活状态；
 //   2. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
 //      一旦出现就取消隐藏、并把信息窗收起，确保能看见；
@@ -293,7 +293,7 @@ static NSArray<UIWindow *> *aq_all_windows(void) {
 // ---- 校验链探测 ----------------------------------------------------------
 // 全部只读 + 调用原版自带函数，不改任何代码。
 // 依次确认：密钥自检 → 许可证对象是否存在/是否稳定 → 结构是否"已封存"
-//           → 面板总门是否放行。
+//           → 面板相关标志当前取值。
 // 每一步之后都刷新剪贴板：如果中途闪退，剪贴板里留下最后一步，便于定位。
 
 static uint64_t aq_rd64(void *p, size_t off) {
@@ -309,31 +309,46 @@ static uint32_t aq_rd32(void *p, size_t off) {
 }
 
 
-// 把面板总门（0xA112C8，返回值 1=放行）在内存里改成「直接返回 1」。
-// 为什么不再伪造激活状态：实测原版会带着这份状态进入自身的加密校验，
-// 校验不通过就直接执行终止指令（闪退）。只在内存里改这一处判定，
-// 状态本身保持原样（未激活），后续校验仍走正常分支，就不会再被终止。
+// 只改「要不要把面板显示出来」这两个判断点，别的一概不动：
+//   点一：选了「显示面板」之后，原版还会再问一次状态，这里固定选「继续构建」；
+//   点二：原版会看一个状态字（未激活时是 1）决定跳过面板，这里固定选「构建面板」。
+// 改动只发生在内存里的这两条指令，激活状态、许可证数据、密钥全部保持原样。
 static BOOL aq_patch_gate(void) {
     if (!g_found) return NO;
     g_gatePatchTries += 1;
-    uintptr_t addr = (uintptr_t)(g_slide + 0xA112C8);
-    uintptr_t page = addr & ~(uintptr_t)0x3FFF;
+    struct { uintptr_t off; uint32_t from; uint32_t to; } fix[2] = {
+        { 0xA107D4, 0x1A97014Au, 0xD503201Fu },   // 固定选择「准备显示面板」
+        { 0xA10BD8, 0x1A89011Cu, 0x2A0903FCu },   // 固定选择「构建面板」
+    };
+    uintptr_t page = (uintptr_t)(g_slide + fix[0].off) & ~(uintptr_t)0x3FFF;
     kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
-        aq_add(@"门函数改写失败: 内存不可写 (%d)", (int)kr);
+        aq_add(@"面板判定改写失败: 内存不可写 (%d)", (int)kr);
         aq_copy();
         return NO;
     }
-    uint32_t code[2] = { 0x52800020u, 0xD65F03C0u };   // mov w0,#1 ; ret
-    memcpy((void *)addr, code, sizeof(code));
-    sys_icache_invalidate((void *)addr, sizeof(code));
+    BOOL ok = YES;
+    for (int i = 0; i < 2; i++) {
+        uintptr_t a = (uintptr_t)(g_slide + fix[i].off);
+        uint32_t cur = 0;
+        memcpy(&cur, (const void *)a, 4);
+        if (cur != fix[i].from) {
+            aq_add(@"面板判定改写跳过: 位置%c 原指令不匹配 (%08X)", 'A' + i, cur);
+            ok = NO;
+            continue;
+        }
+        memcpy((void *)a, &fix[i].to, 4);
+        sys_icache_invalidate((void *)a, 4);
+    }
     vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
                VM_PROT_READ | VM_PROT_EXECUTE);
-    g_gatePatched = YES;
-    aq_add(@"门函数已在内存中改为直接通过");
+    if (ok) {
+        g_gatePatched = YES;
+        aq_add(@"面板判定已在内存中改为「显示面板」");
+    }
     aq_copy();
-    return YES;
+    return ok;
 }
 
 static void aq_probe_gate(NSString *tag) {
@@ -601,8 +616,8 @@ static void aq_tick(void) {
     g_tick += 1;
     if (!g_found) aq_locate();
     if (g_found && !g_impsLogged) aq_log_imps();
-    // 在 App 自己做面板判定之前，把总门在内存里改成「直接通过」。
-    // 只改这一处判定，改动前后的激活状态都保持原样。
+    // 在 App 自己做面板判定之前，把「要不要显示面板」的两个判断点固定成「显示」。
+    // 激活状态、密钥、许可证数据都不动。
     if (g_found && !g_gatePatched && g_gatePatchTries < 3 && aq_now() >= 0.15) {
         aq_patch_gate();
     }
