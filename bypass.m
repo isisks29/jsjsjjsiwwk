@@ -1146,21 +1146,22 @@ static UIWindowScene *aq_front_scene(void) {
 
 // 把一个视图树按 类名/位置/可见性 逐层记下来，用来判断「看不到」到底是没建、
 // 建了但没图、还是尺寸/透明度被清成了 0。
-static void aq_dump_view_tree(id v, NSString *indent, int depth) {
+static void aq_dump_view_tree(id obj, NSString *indent, int depth) {
+    UIView *v = (UIView *)obj;
     if (!v || depth > 4) return;
     @try {
-        CGRect f = [v frame];
+        CGRect f = v.frame;
         NSMutableString *extra = [NSMutableString string];
         if ([v isKindOfClass:[UIImageView class]]) {
-            UIImage *img = [(UIImageView *)v image];
+            UIImage *img = ((UIImageView *)v).image;
             [extra appendFormat:@" 图片=%@ 图尺寸=%.0fx%.0f", img ? @"有" : @"无",
                                img ? img.size.width : 0, img ? img.size.height : 0];
         }
         aq_add(@"%@%@ frame=(%.0f,%.0f,%.0f,%.0f) 隐藏=%d 透明度=%.2f 子视图=%lu%@",
                indent, NSStringFromClass([v class]),
                f.origin.x, f.origin.y, f.size.width, f.size.height,
-               (int)[v hidden], [v alpha], (unsigned long)[[v subviews] count], extra);
-        for (id s in [v subviews]) {
+               (int)v.isHidden, v.alpha, (unsigned long)v.subviews.count, extra);
+        for (UIView *s in v.subviews) {
             aq_dump_view_tree(s, [indent stringByAppendingString:@"  "], depth + 1);
         }
     } @catch (NSException *e) {
@@ -1314,10 +1315,11 @@ static void aq_build_ball_main(void) {
         } @catch (NSException *e) {
         }
         if (!icon) {
-            ball.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.85];
-            ball.layer.cornerRadius = side / 2.0;
-            ball.layer.borderWidth = 2.0;
-            ball.layer.borderColor = [UIColor colorWithRed:0.35 green:0.9 blue:0.62 alpha:1.0].CGColor;
+            UIView *ballView = (UIView *)ball;
+            ballView.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.85];
+            ballView.layer.cornerRadius = side / 2.0;
+            ballView.layer.borderWidth = 2.0;
+            ballView.layer.borderColor = [UIColor colorWithRed:0.35 green:0.9 blue:0.62 alpha:1.0].CGColor;
             aq_add(@"[悬浮球] 内置图标为空，已补可见圆底");
         }
 
@@ -2192,9 +2194,10 @@ static void aq_tick(void) {
         aq_ballDiag2 = YES;
         aq_dump_windows(@"28秒悬浮球复查");
         if (aq_ballView) {
+            UIView *bv = (UIView *)aq_ballView;
             aq_add(@"[悬浮球] 28 秒复查 隐藏=%d 透明度=%.2f 父视图=%@",
-                   (int)[aq_ballView hidden], [aq_ballView alpha],
-                   [aq_ballView superview] ? NSStringFromClass([[aq_ballView superview] class]) : @"无");
+                   (int)bv.isHidden, bv.alpha,
+                   bv.superview ? NSStringFromClass([bv.superview class]) : @"无");
         }
         aq_copy();
     }
