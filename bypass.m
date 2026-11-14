@@ -56,6 +56,9 @@ static BOOL g_installTried = NO;
 static BOOL g_installDone = NO;
 static BOOL g_uiDumped = NO;
 static BOOL g_menuTried = NO;
+static BOOL g_attachTried = NO;
+static BOOL g_check12 = NO;
+static BOOL g_check20 = NO;
 
 static KeyState g_good = {0, 0, 0, 0};
 static KeyState g_cand = {0, 0, 0, 0};
@@ -302,6 +305,27 @@ static void aq_try_menu(void) {
     });
 }
 
+// 窗口就绪后，执行原版的「把悬浮球挂到窗口」动作
+static void aq_try_attach(void) {
+    if (g_attachTried || !g_found) return;
+    g_attachTried = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        aq_add(@"准备把面板挂到窗口（调用原版挂载函数）");
+        @try {
+            [UIPasteboard generalPasteboard].string = aq_snapshot();
+        } @catch (NSException *e) {
+        }
+        @try {
+            void (*fn)(void) = (void (*)(void))(g_slide + 0x976DF0);
+            fn();
+            aq_add(@"挂载函数已返回");
+        } @catch (NSException *e) {
+            aq_add(@"挂载函数异常: %@", e.reason ?: @"未知");
+        }
+        aq_copy();
+    });
+}
+
 // 取所有窗口：场景里的窗口 + 应用自己的窗口列表，两路合并去重。
 // 有些独立创建的窗口不进场景列表，只看场景会漏掉。
 static NSArray<UIWindow *> *aq_all_windows(void) {
@@ -383,6 +407,32 @@ static void aq_dump_ui(void) {
     } @catch (NSException *e) {
         aq_add(@"界面快照失败: %@", e.reason ?: @"未知");
     }
+}
+
+// 轻量复查：只数面板组件数量，不打印整棵视图树
+static int aq_find_panel(UIView *v, int depth) {
+    if (!v || depth > 10) return 0;
+    int n = 0;
+    NSString *cn = NSStringFromClass([v class]);
+    if (cn && ([cn isEqualToString:@"_0x8C2F4D71"] ||
+               [cn isEqualToString:@"_0x1E6B7A93"] ||
+               [cn isEqualToString:@"_0xD4E9A3C7"])) {
+        n += 1;
+    }
+    for (UIView *s in v.subviews) {
+        n += aq_find_panel(s, depth + 1);
+    }
+    return n;
+}
+
+static void aq_check_panel(NSString *tag) {
+    int n = 0;
+    for (UIWindow *w in aq_all_windows()) {
+        if (g_win && w == g_win) continue;
+        n += aq_find_panel(w, 0);
+    }
+    aq_add(@"%@面板复查: %d 个组件", tag, n);
+    aq_copy();
 }
 
 // 展示处理信息（独立置顶窗口）
@@ -493,6 +543,15 @@ static void aq_tick(void) {
     if (g_found && !g_impsLogged) aq_log_imps();
     if (g_found && !g_installTried && aq_now() >= 1.0) aq_install_keys();
     if (g_found && g_installDone && !g_menuTried && aq_now() >= 4.0) aq_try_menu();
+    if (g_found && g_installDone && !g_attachTried && aq_now() >= 5.0) aq_try_attach();
+    if (g_found && !g_check12 && aq_now() >= 12.0) {
+        g_check12 = YES;
+        dispatch_async(dispatch_get_main_queue(), ^{ aq_check_panel(@"12秒"); });
+    }
+    if (g_found && !g_check20 && aq_now() >= 20.0) {
+        g_check20 = YES;
+        dispatch_async(dispatch_get_main_queue(), ^{ aq_check_panel(@"20秒"); });
+    }
 
     if (g_found) {
         KeyState cur = aq_read_keys();
