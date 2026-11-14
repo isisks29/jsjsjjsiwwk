@@ -20,7 +20,10 @@
 //      先看面板能不能在弹窗还在时自己出现；同时每秒打一行心跳，
 //      万一闪退能看出最后停在哪一步；
 //   6. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
-//      用来告诉你走到了哪一步、面板有没有出现。
+//      用来告诉你走到了哪一步、面板有没有出现；
+//   7. 闪退现场自救：系统不给报告，就自己捕获崩溃信号和未捕获异常，
+//      把出错指令、来源地址和访问地址写进沙盒文件；下次启动时读出来放在
+//      记录最前面，并自动跳过状态字改写，保证这次能安静跑完弹出信息窗。
 //
 // 为什么不再伪造激活状态：
 //   实测只要把状态改成「已激活」，原版就会带着这份状态进入自身的加密校验，
@@ -52,6 +55,10 @@
 #import <stdint.h>
 #import <string.h>
 #import <stdlib.h>
+#import <signal.h>
+#import <unistd.h>
+#import <fcntl.h>
+#import <sys/ucontext.h>
 
 typedef struct {
     uint64_t k48;
@@ -96,11 +103,128 @@ static void *g_lastLicenseObj = (void *)0x1;
 static NSString *g_lastWinSig = nil;
 static BOOL g_baseLogged = NO;
 static BOOL g_panelClassChecked = NO;
+static BOOL g_prevCrash = NO;
 
 static NSString *aq_snapshot(void);
 static void aq_copy(void);
 static BOOL aq_install_hooks(void);
 static void aq_clear_panel_flag(void);
+static void aq_add(NSString *fmt, ...);
+
+// ---- 闪退现场记录 --------------------------------------------------------
+// 闪退时系统不给报告，那就自己记：把信号、出错指令地址和出错时访问的地址
+// 直接写进 App 沙盒里的一个文件。下次启动时把它读出来放进记录，随剪贴板一起给你。
+static char g_crash_path[512] = {0};
+
+// 不依赖任何运行库的十六进制输出，信号处理函数里只能用这种最朴素的写法。
+static int aq_hex_into(char *p, unsigned long long v) {
+    char tmp[16];
+    int n = 0, i;
+    if (v == 0) { p[0] = '0'; return 1; }
+    while (v && n < 16) { tmp[n++] = "0123456789ABCDEF"[v & 0xF]; v >>= 4; }
+    for (i = 0; i < n; i++) p[i] = tmp[n - 1 - i];
+    return n;
+}
+
+static char *aq_put(char *p, const char *s) {
+    size_t n = strlen(s);
+    memcpy(p, s, n);
+    return p + n;
+}
+
+static void aq_crash_handler(int sig, siginfo_t *info, void *uctx) {
+    char buf[384];
+    char *p = buf;
+    unsigned long long pc = 0, lr = 0, fault = (unsigned long long)(uintptr_t)info->si_addr;
+#if defined(__arm64__)
+    if (uctx) {
+        ucontext_t *u = (ucontext_t *)uctx;
+        pc = (unsigned long long)u->uc_mcontext->__ss.__pc;
+        lr = (unsigned long long)u->uc_mcontext->__ss.__lr;
+    }
+#endif
+    p = aq_put(p, "\n=== 上次闪退 ===\nsignal=");
+    p += aq_hex_into(p, (unsigned long long)sig);
+    p = aq_put(p, " pc=0x");
+    p += aq_hex_into(p, pc);
+    p = aq_put(p, " lr=0x");
+    p += aq_hex_into(p, lr);
+    p = aq_put(p, " fault=0x");
+    p += aq_hex_into(p, fault);
+    if (g_slide && pc >= (unsigned long long)g_slide &&
+        pc < (unsigned long long)g_slide + 0x13E0000ULL) {
+        p = aq_put(p, " 目标库内偏移=0x");
+        p += aq_hex_into(p, pc - (unsigned long long)g_slide);
+    } else {
+        p = aq_put(p, " 不在目标库内");
+    }
+    *p++ = '\n';
+    if (g_crash_path[0]) {
+        int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            ssize_t ignored = write(fd, buf, (size_t)(p - buf));
+            (void)ignored;
+            close(fd);
+        }
+    }
+    // 记完恢复系统默认处理，再把这个信号重新抛出去，保持原有崩溃行为。
+    signal(sig, SIG_DFL);
+    kill(getpid(), sig);
+    _exit(1);
+}
+
+static void aq_uncaught(NSException *e) {
+    NSString *s = [NSString stringWithFormat:
+                   @"\n=== 上次未捕获异常 ===\n%@: %@\n%@\n",
+                   e.name ?: @"?", e.reason ?: @"?",
+                   e.callStackSymbols ?: @[]];
+    @try {
+        if (!g_crash_path[0]) return;
+        NSString *path = [NSString stringWithUTF8String:g_crash_path];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [[NSData data] writeToFile:path atomically:NO];
+            fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        }
+        [fh seekToEndOfFile];
+        [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } @catch (NSException *x) {
+    }
+}
+
+// 启动时调用一次：算出记录文件位置、读上次的闪退记录、挂上信号与异常捕获。
+static void aq_install_crash_capture(void) {
+    @try {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(
+                             NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (dir.length) {
+            NSString *p = [dir stringByAppendingPathComponent:@"aqaw_crash.txt"];
+            if ([p lengthOfBytesUsingEncoding:NSUTF8StringEncoding] < sizeof(g_crash_path)) {
+                strncpy(g_crash_path, [p UTF8String], sizeof(g_crash_path) - 1);
+            }
+            NSString *prev = [NSString stringWithContentsOfFile:p
+                                                       encoding:NSUTF8StringEncoding
+                                                          error:nil];
+            if (prev.length) {
+                g_prevCrash = YES;
+                aq_add(@"上次运行留下的异常记录:%@", prev);
+                [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+                aq_add(@"检测到上次闪退：本轮不改任何状态字，保证能正常弹出信息窗");
+            }
+        }
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = aq_crash_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        int sigs[5] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT };
+        for (int i = 0; i < 5; i++) sigaction(sigs[i], &sa, NULL);
+        NSSetUncaughtExceptionHandler(&aq_uncaught);
+        aq_add(@"异常捕获已开启（闪退后重新打开会显示上次现场）");
+    } @catch (NSException *e) {
+    }
+}
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -842,7 +966,8 @@ static void aq_tick(void) {
         aq_install_hooks();
     }
     // 1.5 秒起，把未激活时用于跳过面板的那个状态字改回 0（只改数据）。
-    if (g_found && aq_now() >= 1.5) {
+    // 上次已经闪退过就不改，保证这一次能安静地走完并弹出信息窗。
+    if (g_found && !g_prevCrash && aq_now() >= 1.5) {
         aq_clear_panel_flag();
     }
     // 定位成功后先记下基址和版本，方便把记录和具体安装包对上。
@@ -877,7 +1002,8 @@ static void aq_tick(void) {
         memcpy(&b, (const void *)(g_slide + 0x163929C), 4);
         memcpy(&c, (const void *)(g_slide + 0x16392A0), 4);
         memcpy(&d, (const void *)(g_slide + 0x16392A4), 4);
-        aq_add(@"面板标志(1秒) %08X %08X %08X %08X", a, b, c, d);
+        aq_add(@"面板标志(1秒) %08X %08X %08X %08X%@", a, b, c, d,
+               g_prevCrash ? @"（上次闪退过，本轮不改状态字）" : @"");
         aq_copy();
     }
     // 校验链探测：2.6 秒一次（卡密流程刚走完），9 秒一次（弹窗关掉之后）。
@@ -937,6 +1063,7 @@ static void aqaw_fix_start(void) {
     g_text = [NSMutableString string];
     [g_text appendString:@"===== aqaw 处理记录 =====\n"];
     aq_add(@"处理代码已加载");
+    aq_install_crash_capture();
 
     g_q = dispatch_queue_create("aqaw.fix", DISPATCH_QUEUE_SERIAL);
     g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
