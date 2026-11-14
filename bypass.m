@@ -21,10 +21,13 @@
 //   6. 记录原版卡密通道的连接地址和收发内容（原版用自带套接字，不走系统网络
 //      组件；只记录，不改请求也不改返回），用来判断校验连的是谁、返回的格式；
 //   7. 看到校验结果后约 2.5 秒，用原版自己的激活状态写入方法写入一份测试状态，
-//      看面板会不会因此放行；结果弹窗 4 秒后自动收起，避免挡住面板；
-//   8. 卡密弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
-//   9. 大约 30 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板；
-//  10. 异常现场自救：捕获崩溃信号和未捕获异常，把出错指令、来源地址和访问
+//      看面板会不会因此放行；出现成功提示时自动点「确定」并把卡密输入框收起，
+//      失败提示 4 秒后自动收起，避免挡住面板；
+//   8. 记录原版校验算法实际参与计算的字节和结果（摘要与校验码），用来判断它
+//      到底在比对什么；
+//   9. 卡密弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
+//  10. 大约 30 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板；
+//  11. 异常现场自救：捕获崩溃信号和未捕获异常，把出错指令、来源地址和访问
 //      地址写进沙盒文件；再检测主线程是否被卡死（被系统看门狗杀掉时不会
 //      有任何信号，只能靠这条路记下来）。每次启动还会把上一次运行的日志
 //      尾巴读回来 —— 万一进程是被原版悄悄结束的，也能看到最后一步。
@@ -69,6 +72,7 @@
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#import <CommonCrypto/CommonDigest.h>
 
 typedef struct {
     uint64_t k48;
@@ -94,6 +98,12 @@ static BOOL g_uiDumped = NO;
 
 static BOOL g_gate25 = NO;
 static BOOL g_gate9 = NO;
+static BOOL g_gate12 = NO;
+static BOOL g_successTapped = NO;
+static double g_successSeen = 0;
+static int g_shaUpdateLogs = 0;
+static int g_shaFinalLogs = 0;
+static int g_crcLogs = 0;
 static BOOL g_haveKeys = NO;
 static KeyState g_lastKeys = {0, 0, 0, 0};
 static int g_keyLogCount = 0;
@@ -430,11 +440,43 @@ static void aq_handle_license_alert(void) {
                            a.title ?: @"(无)", a.message ?: @"(无)", acts2);
                     aq_copy();
                 }
-                // 新的结果弹窗：记下出现时间，稍后自动收起，免得挡住面板。
+                // 新的结果弹窗：记下出现时间。
                 if (a != g_resultAlert) {
                     g_resultAlert = a;
                     g_resultFirstSeen = aq_now();
                     g_resultClosed = NO;
+                    g_successSeen = 0;
+                }
+                BOOL successLike = ((a.title && [a.title containsString:@"成功"]) ||
+                                    (a.message && [a.message containsString:@"成功"]));
+                if (successLike) {
+                    if (g_successSeen == 0) g_successSeen = aq_now();
+                    // 成功提示上的「确定」才会让原版继续往下走，这里替用户点一下，
+                    // 而不是直接关掉弹窗（直接关会把后面的流程一起丢掉）。
+                    if (!g_successTapped && aq_now() - g_successSeen >= 1.2) {
+                        g_successTapped = YES;
+                        UIAlertAction *target = nil;
+                        for (UIAlertAction *ac in a.actions) {
+                            NSString *t = ac.title ?: @"";
+                            if ([t isEqualToString:@"确定"] || [t isEqualToString:@"好"] ||
+                                [t isEqualToString:@"知道了"]) {
+                                target = ac;
+                                break;
+                            }
+                        }
+                        if (!target && a.actions.count > 0) target = a.actions.firstObject;
+                        id handler = nil;
+                        @try { handler = [target valueForKey:@"handler"]; } @catch (NSException *e) {}
+                        if (handler) {
+                            aq_add(@"已自动点击成功提示的「%@」", target.title ?: @"?");
+                            ((void (^)(UIAlertAction *))handler)(target);
+                        } else {
+                            [a dismissViewControllerAnimated:NO completion:nil];
+                            aq_add(@"成功提示没有可触发的处理块，已关闭");
+                        }
+                        aq_copy();
+                    }
+                    continue;
                 }
                 if (!g_resultClosed && aq_now() - g_resultFirstSeen >= 4.0) {
                     g_resultClosed = YES;
@@ -495,6 +537,14 @@ static void aq_handle_license_alert(void) {
                 } else {
                     aq_add(@"没有找到验证按钮");
                 }
+                aq_copy();
+            }
+
+            // 成功提示已经确认过，卡密输入框就没用了，收起来别挡面板。
+            if (g_successTapped && g_alertDismissed < 1) {
+                [a dismissViewControllerAnimated:NO completion:nil];
+                g_alertDismissed += 1;
+                aq_add(@"激活成功已确认，关闭卡密输入框");
                 aq_copy();
             }
 
@@ -774,6 +824,63 @@ static int aq_my_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     return aq_real_connect ? aq_real_connect(fd, addr, len) : -1;
 }
 
+// ---- 校验算法观察：摘要与校验码（只记录参与计算的数据和结果） -----------------
+// 卡密校验是本地完成的，这里看它到底把哪些字节拿去算了摘要、算出的结果是多少，
+// 从而判断它是在比对什么。
+typedef int (*aq_sha_fn)(const void *, uint32_t, unsigned char *);
+typedef int (*aq_sha_update_fn)(void *, const void *, uint32_t);
+typedef int (*aq_sha_final_fn)(unsigned char *, void *);
+typedef unsigned long (*aq_crc32_fn)(unsigned long, const void *, unsigned int);
+static aq_sha_fn aq_real_sha = NULL;
+static aq_sha_update_fn aq_real_sha_update = NULL;
+static aq_sha_final_fn aq_real_sha_final = NULL;
+static aq_crc32_fn aq_real_crc32 = NULL;
+
+static int aq_my_sha(const void *data, uint32_t len, unsigned char *md) {
+    int r = aq_real_sha ? aq_real_sha(data, len, md) : 0;
+    if (data && len > 0 && md && g_shaFinalLogs < 25) {
+        g_shaFinalLogs += 1;
+        NSMutableString *h = [NSMutableString string];
+        for (int i = 0; i < 32; i++) [h appendFormat:@"%02X", md[i]];
+        aq_add(@"一次性摘要 %u 字节: %@ → %@", (unsigned)len,
+               aq_bytes_desc(data, (size_t)len), h);
+        aq_copy();
+    }
+    return r;
+}
+
+static int aq_my_sha_update(void *ctx, const void *data, uint32_t len) {
+    if (data && len > 0 && g_shaUpdateLogs < 25) {
+        g_shaUpdateLogs += 1;
+        aq_add(@"摘要输入 %u 字节: %@", (unsigned)len, aq_bytes_desc(data, (size_t)len));
+        aq_copy();
+    }
+    return aq_real_sha_update ? aq_real_sha_update(ctx, data, len) : 0;
+}
+
+static int aq_my_sha_final(unsigned char *md, void *ctx) {
+    int r = aq_real_sha_final ? aq_real_sha_final(md, ctx) : 0;
+    if (md && g_shaFinalLogs < 25) {
+        g_shaFinalLogs += 1;
+        NSMutableString *h = [NSMutableString string];
+        for (int i = 0; i < 32; i++) [h appendFormat:@"%02X", md[i]];
+        aq_add(@"摘要结果 %@", h);
+        aq_copy();
+    }
+    return r;
+}
+
+static unsigned long aq_my_crc32(unsigned long crc, const void *buf, unsigned int len) {
+    unsigned long r = aq_real_crc32 ? aq_real_crc32(crc, buf, len) : 0;
+    if (buf && len > 0 && g_crcLogs < 20) {
+        g_crcLogs += 1;
+        aq_add(@"校验码计算 %u 字节: %@ → %08lX", len,
+               aq_bytes_desc(buf, (size_t)len), r);
+        aq_copy();
+    }
+    return r;
+}
+
 static BOOL aq_install_hooks(void) {
     if (!g_found) return NO;
     g_hookTries += 1;
@@ -792,7 +899,11 @@ static BOOL aq_install_hooks(void) {
     aq_real_recv = (aq_recv_fn)dlsym(RTLD_DEFAULT, "recv");
     aq_real_recvfrom = (aq_recvfrom_fn)dlsym(RTLD_DEFAULT, "recvfrom");
     aq_real_connect = (aq_connect_fn)dlsym(RTLD_DEFAULT, "connect");
-    struct { uintptr_t slot; void *fn; } hook[12] = {
+    aq_real_sha = (aq_sha_fn)dlsym(RTLD_DEFAULT, "CC_SHA256");
+    aq_real_sha_update = (aq_sha_update_fn)dlsym(RTLD_DEFAULT, "CC_SHA256_Update");
+    aq_real_sha_final = (aq_sha_final_fn)dlsym(RTLD_DEFAULT, "CC_SHA256_Final");
+    aq_real_crc32 = (aq_crc32_fn)dlsym(RTLD_DEFAULT, "crc32");
+    struct { uintptr_t slot; void *fn; } hook[16] = {
         { 0x13E0628, (void *)&aq_my_async },
         { 0x13E0620, (void *)&aq_my_after },
         { 0x13E0570, (void *)&aq_my__exit },
@@ -805,8 +916,12 @@ static BOOL aq_install_hooks(void) {
         { 0x13E0A10, (void *)&aq_my_recv },
         { 0x13E0A18, (void *)&aq_my_recvfrom },
         { 0x13E05F0, (void *)&aq_my_connect },
+        { 0x13E0600, (void *)&aq_my_crc32 },
+        { 0x13E0230, (void *)&aq_my_sha_update },
+        { 0x13E0220, (void *)&aq_my_sha_final },
+        { 0x13E0218, (void *)&aq_my_sha },
     };
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 16; i++) {
         uintptr_t slot = (uintptr_t)(g_slide + hook[i].slot);
         uintptr_t page = slot & ~(uintptr_t)0x3FFF;
         kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
@@ -824,7 +939,7 @@ static BOOL aq_install_hooks(void) {
                    VM_PROT_READ | VM_PROT_WRITE);
     }
     g_hookInstalled = YES;
-    aq_add(@"调度、退出与卡密通道观察已安装（只记录，退出类调用会被拦下）");
+    aq_add(@"调度、退出、卡密通道与校验算法观察已安装（只记录，退出类调用会被拦下）");
     aq_copy();
     return YES;
 }
@@ -1476,6 +1591,11 @@ static void aq_tick(void) {
     if (g_found && !g_gate9 && aq_now() >= 9.0) {
         g_gate9 = YES;
         aq_probe_gate(@"9秒");
+    }
+    // 伪造激活之后再看一次状态，确认原版到底把什么写进了状态结构。
+    if (g_found && !g_gate12 && aq_now() >= 12.0) {
+        g_gate12 = YES;
+        aq_probe_gate(@"12秒");
     }
     // 面板定时复查：2 秒起每 0.5 秒一次，直到面板出现或超过 180 秒。
     if (g_found && !g_panelFound && aq_now() >= 2.0 && aq_now() < 180.0) {
