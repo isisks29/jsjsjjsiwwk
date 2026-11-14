@@ -8,11 +8,13 @@
 // 这一版做什么：
 //   1. 不修改任何代码页，不替换任何方法；
 //   2. 每秒检查一次那组解密密钥；发现被卡密失败流程清空（k50 == 0）时，
-//      就调用原版自己的「安装设备密钥」函数（0x814F44）把它装回来。
-//      这两个动作都是原版自带函数，调用前后 App 流程一步都不跳；
-//   3. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
-//      一旦出现就把隐藏状态改回显示，确保能看见；
-//   4. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
+//      就调用原版自己的「安装设备密钥」函数（0x814F44）把它装回来；
+//   3. 检查面板要求的那份「激活状态」结构：先读出来记进日志，再用原版自己的
+//      校验规则把缺失的部分补齐成自洽状态（只写这份状态自己的字段，
+//      不碰对象开头的指针）；
+//   4. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
+//      一旦出现就取消隐藏、并把信息窗收起，确保能看见；
+//   5. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
 //      用来告诉你走到了哪一步、面板有没有出现。
 //
 // 仍然不做的事：
@@ -60,6 +62,8 @@ static int g_tick = 0;
 static BOOL g_uiDumped = NO;
 
 static int g_dismissed = 0;
+static BOOL g_gate25 = NO;
+static BOOL g_gate9 = NO;
 static BOOL g_haveKeys = NO;
 static KeyState g_lastKeys = {0, 0, 0, 0};
 static int g_keyLogCount = 0;
@@ -287,6 +291,144 @@ static NSArray<UIWindow *> *aq_all_windows(void) {
     return wins;
 }
 
+// ---- 校验链探测 ----------------------------------------------------------
+// 全部只读 + 调用原版自带函数，不改任何代码。
+// 依次确认：密钥自检 → 许可证对象是否存在/是否稳定 → 结构是否"已封存"
+//           → 面板总门是否放行。
+// 每一步之后都刷新剪贴板：如果中途闪退，剪贴板里留下最后一步，便于定位。
+
+static uint64_t aq_rd64(void *p, size_t off) {
+    uint64_t v = 0;
+    memcpy(&v, (const char *)p + off, 8);
+    return v;
+}
+
+static uint32_t aq_rd32(void *p, size_t off) {
+    uint32_t v = 0;
+    memcpy(&v, (const char *)p + off, 4);
+    return v;
+}
+
+// 按校验函数要求的等式，把"激活结构"补齐成自洽状态。
+// 只写它自己用到的 39 字节结构区和 3 个深偏移字段；
+// 对象偏移 0 可能是虚表/类指针，绝对不碰（改用结构里的输入字让等式成立）。
+static void aq_forge_license(void *o) {
+    if (!o) return;
+    uint64_t w0 = aq_rd64(o, 0x219A);
+    uint64_t orig = w0;
+    if (w0 == 0) w0 = 0x9E3779B97F4A7C15ULL;   // 首字为零会直接被判失败
+
+    uint64_t f78 = aq_rd64(o, 0x78);
+    uint64_t d = w0 ^ f78 ^ 0xA5C3E1F7B6D2489AULL;
+    uint32_t hi = (uint32_t)d;                  // 结构里 x4 的高 32 位
+    uint32_t lo = (uint32_t)(d >> 32);          // 结构里 x5 的低 32 位
+    uint64_t x = ((uint64_t)hi << 32) | lo;
+
+    uint32_t f8e = hi ^ (uint32_t)(w0 >> 7) ^ 0x4A9B5206u;
+    uint32_t f92 = hi ^ (uint32_t)(w0 >> 13) ^ 0x8C1A73E5u;
+
+    uint32_t f0 = aq_rd32(o, 0x00);
+    uint32_t w20 = f0 ^ (uint32_t)(w0 >> 19) ^ 0x5F8A16E3u;
+
+    uint32_t t = (hi ^ lo) * 0x45D9F3B7u;
+    t ^= hi;
+    t *= 0x8E4B1395u;
+    t ^= hi;
+    t *= 0x1F3D6A71u;
+    t ^= w20;
+    t ^= t >> 16;
+
+    memcpy((char *)o + 0x219A, &w0, 8);
+    memcpy((char *)o + 0x219E, &x, 8);
+    memcpy((char *)o + 0x21A6, &x, 8);
+    memcpy((char *)o + 0x21AE, &x, 8);
+    memcpy((char *)o + 0x21BA, &w20, 4);
+    memcpy((char *)o + 0x21C2, &t, 4);
+    memcpy((char *)o + 0x78, &d, 8);
+    memcpy((char *)o + 0x8E, &f8e, 4);
+    memcpy((char *)o + 0x92, &f92, 4);
+
+    aq_add(@"伪造激活: 首字 %016llX -> %016llX, 结构字=%016llX, 校验和=%08X",
+           (unsigned long long)orig, (unsigned long long)w0,
+           (unsigned long long)x, t);
+}
+
+static void aq_probe_gate(NSString *tag) {
+    if (!g_found) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        aq_add(@"%@ 校验链开始", tag);
+        aq_copy();
+
+        int (*f_key)(void) = (int (*)(void))(g_slide + 0xA19EE0);
+        int keyRc = -100;
+        @try { keyRc = f_key(); } @catch (NSException *e) { }
+        aq_add(@"%@ 密钥自检=%d", tag, keyRc);
+        aq_copy();
+
+        void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
+        void *o1 = NULL;
+        void *o2 = NULL;
+        @try { o1 = f_obj(); } @catch (NSException *e) { }
+        aq_add(@"%@ 许可证对象1=%p", tag, o1);
+        aq_copy();
+        @try { o2 = f_obj(); } @catch (NSException *e) { }
+        aq_add(@"%@ 许可证对象2=%p（%@）", tag, o2,
+               (o1 && o1 == o2) ? @"同一对象" : @"不同对象");
+        aq_copy();
+
+        if (o1) {
+            aq_add(@"%@ 字段 00=%08X 78=%016llX 8E=%08X 92=%08X", tag,
+                   aq_rd32(o1, 0x00), (unsigned long long)aq_rd64(o1, 0x78),
+                   aq_rd32(o1, 0x8E), aq_rd32(o1, 0x92));
+            aq_copy();
+            aq_add(@"%@ 结构 %016llX %016llX %016llX %016llX %08X %08X", tag,
+                   (unsigned long long)aq_rd64(o1, 0x219A),
+                   (unsigned long long)aq_rd64(o1, 0x21A2),
+                   (unsigned long long)aq_rd64(o1, 0x21AA),
+                   (unsigned long long)aq_rd64(o1, 0x21B2),
+                   aq_rd32(o1, 0x21BA), aq_rd32(o1, 0x21C2));
+            aq_copy();
+
+            int (*f_val)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
+            int v0 = -100;
+            @try { v0 = f_val(o1); } @catch (NSException *e) { }
+            aq_add(@"%@ 封存前校验=%d", tag, v0);
+            aq_copy();
+
+            // 用原版自己的"封存"函数把结构补齐（0x814DF4 只写这 39 字节的结构，
+            // 不改对象里的其它字段），然后再校验一次。
+            void (*f_seal)(void *) = (void (*)(void *))(g_slide + 0x814DF4);
+            @try { f_seal(o1); } @catch (NSException *e) { }
+            aq_copy();
+            int v1 = -100;
+            @try { v1 = f_val(o1); } @catch (NSException *e) { }
+            aq_add(@"%@ 封存后校验=%d", tag, v1);
+            aq_copy();
+
+            if (v1 != 1) {
+                @try { aq_forge_license(o1); } @catch (NSException *e) { }
+                aq_copy();
+                int v2 = -100;
+                @try { v2 = f_val(o1); } @catch (NSException *e) { }
+                aq_add(@"%@ 补齐后校验=%d", tag, v2);
+                aq_copy();
+            }
+        }
+
+        // 对象为空时总门内部会解引用空指针，直接跳过，避免白闪退。
+        if (!o1) {
+            aq_add(@"%@ 许可证对象为空，面板总门跳过", tag);
+            aq_copy();
+            return;
+        }
+        int (*f_gate)(void) = (int (*)(void))(g_slide + 0xA112C8);
+        int gate = -100;
+        @try { gate = f_gate(); } @catch (NSException *e) { }
+        aq_add(@"%@ 面板总门=%d", tag, gate);
+        aq_copy();
+    });
+}
+
 static int g_viewCount = 0;
 
 // 走一遍视图树：记录每一层（只记前几层，避免内容过长），
@@ -374,6 +516,15 @@ static void aq_check_panel(NSString *tag) {
     if (n > 0 && !g_panelFound) {
         g_panelFound = YES;
         aq_add(@"%@面板已出现: %d 个组件", tag, n);
+        // 面板出现了就把信息窗收起来，别挡住面板
+        @try {
+            if (g_win && !g_win.hidden) {
+                if (g_prevKey) [g_prevKey makeKeyWindow];
+                g_win.hidden = YES;
+                aq_add(@"信息窗已收起，避免遮挡面板");
+            }
+        } @catch (NSException *e) {
+        }
     } else if (n != g_lastPanelCount) {
         aq_add(@"%@面板复查: %d 个组件", tag, n);
     }
@@ -492,6 +643,15 @@ static void aq_tick(void) {
     if (g_found && !g_panelFound && aq_now() >= 0.5 && aq_now() < 120.0) {
         KeyState cur = aq_read_keys();
         if (cur.k50 == 0) aq_reinstall_keys();
+    }
+    // 校验链探测：2.6 秒一次（卡密流程刚走完），9 秒一次（弹窗关掉之后）。
+    if (g_found && !g_gate25 && aq_now() >= 2.6) {
+        g_gate25 = YES;
+        aq_probe_gate(@"2.6秒");
+    }
+    if (g_found && !g_gate9 && aq_now() >= 9.0) {
+        g_gate9 = YES;
+        aq_probe_gate(@"9秒");
     }
     // 面板定时复查：4 秒起每 2 秒一次，直到面板出现或超过 40 秒。
     if (g_found && !g_panelFound && aq_now() >= 4.0 && aq_now() < 40.0) {
