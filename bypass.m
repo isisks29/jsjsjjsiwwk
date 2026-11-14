@@ -18,8 +18,8 @@
 //   5. 卡密弹窗出现后约 1.5 秒，自动往输入框填一个测试卡密并触发「验证」按钮，
 //      让原版走完它自己的流程；本地存储会在开局和 30 秒各看一次，用来判断
 //      原版把激活结果存在哪里；
-//   6. 记录 App 发出的每一条网络请求和服务器返回的内容（只记录，不改请求和
-//      返回），用来判断卡密校验连的是哪个地址、返回是什么格式；
+//   6. 记录原版卡密通道的连接地址和收发内容（原版用自带套接字，不走系统网络
+//      组件；只记录，不改请求也不改返回），用来判断校验连的是谁、返回的格式；
 //   7. 看到校验结果后约 2.5 秒，用原版自己的激活状态写入方法写入一份测试状态，
 //      看面板会不会因此放行；结果弹窗 4 秒后自动收起，避免挡住面板；
 //   8. 卡密弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
@@ -66,6 +66,9 @@
 #import <unistd.h>
 #import <fcntl.h>
 #import <sys/ucontext.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
 
 typedef struct {
     uint64_t k48;
@@ -123,6 +126,8 @@ static double g_resultFirstSeen = 0;
 static BOOL g_resultClosed = NO;
 static BOOL g_fakeTried = NO;
 static BOOL g_fakeScheduled = NO;
+static int g_sockSendLogs = 0;
+static int g_sockRecvLogs = 0;
 static int g_mainBeats = 0;
 static int g_mainSeen = 0;
 static double g_lastMainMove = 0;
@@ -676,6 +681,98 @@ static long aq_my_syscall(long n, ...) {
     return aq_real_syscall ? aq_real_syscall(n, a, b, c, d, e, f) : -1;
 }
 
+// ---- 卡密通道观察：目标库自带的网络部分用原始套接字，直接看收发内容 ----------
+// 这些函数只在目标库自己的调用入口上生效，游戏本体的网络不会经过这里。
+static NSString *aq_bytes_desc(const void *buf, size_t n) {
+    if (!buf || n == 0) return @"(空)";
+    size_t cap = n > 700 ? 700 : n;
+    NSString *s = [[NSString alloc] initWithBytes:buf length:cap encoding:NSUTF8StringEncoding];
+    if (s) {
+        s = [s stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+        s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        return aq_trunc(s, 700);
+    }
+    NSMutableString *h = [NSMutableString string];
+    const unsigned char *p = (const unsigned char *)buf;
+    for (size_t i = 0; i < cap && i < 160; i++) [h appendFormat:@"%02X", p[i]];
+    return [NSString stringWithFormat:@"(二进制 %lu 字节) %@", (unsigned long)n, h];
+}
+
+typedef ssize_t (*aq_send_fn)(int, const void *, size_t, int);
+typedef ssize_t (*aq_sendto_fn)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+typedef ssize_t (*aq_recv_fn)(int, void *, size_t, int);
+typedef ssize_t (*aq_recvfrom_fn)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
+typedef int (*aq_connect_fn)(int, const struct sockaddr *, socklen_t);
+static aq_send_fn aq_real_send = NULL;
+static aq_sendto_fn aq_real_sendto = NULL;
+static aq_recv_fn aq_real_recv = NULL;
+static aq_recvfrom_fn aq_real_recvfrom = NULL;
+static aq_connect_fn aq_real_connect = NULL;
+
+static NSString *aq_sock_addr(const struct sockaddr *addr) {
+    if (!addr) return @"(无地址)";
+    char ip[64] = {0};
+    if (addr->sa_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+        inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+        return [NSString stringWithFormat:@"%s:%d", ip, (int)ntohs(in->sin_port)];
+    }
+    if (addr->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)addr;
+        inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof(ip));
+        return [NSString stringWithFormat:@"[%s]:%d", ip, (int)ntohs(in6->sin6_port)];
+    }
+    return [NSString stringWithFormat:@"(类型%d)", (int)addr->sa_family];
+}
+
+static ssize_t aq_my_send(int fd, const void *buf, size_t n, int flags) {
+    if (buf && n > 0 && g_sockSendLogs < 30) {
+        g_sockSendLogs += 1;
+        aq_add(@"卡密通道发出 %lu 字节: %@", (unsigned long)n, aq_bytes_desc(buf, n));
+        aq_copy();
+    }
+    return aq_real_send ? aq_real_send(fd, buf, n, flags) : -1;
+}
+
+static ssize_t aq_my_sendto(int fd, const void *buf, size_t n, int flags,
+                            const struct sockaddr *addr, socklen_t len) {
+    if (buf && n > 0 && g_sockSendLogs < 30) {
+        g_sockSendLogs += 1;
+        aq_add(@"卡密通道发出 %lu 字节 → %@: %@", (unsigned long)n,
+               aq_sock_addr(addr), aq_bytes_desc(buf, n));
+        aq_copy();
+    }
+    return aq_real_sendto ? aq_real_sendto(fd, buf, n, flags, addr, len) : -1;
+}
+
+static ssize_t aq_my_recv(int fd, void *buf, size_t n, int flags) {
+    ssize_t r = aq_real_recv ? aq_real_recv(fd, buf, n, flags) : -1;
+    if (r > 0 && g_sockRecvLogs < 30) {
+        g_sockRecvLogs += 1;
+        aq_add(@"卡密通道收到 %ld 字节: %@", (long)r, aq_bytes_desc(buf, (size_t)r));
+        aq_copy();
+    }
+    return r;
+}
+
+static ssize_t aq_my_recvfrom(int fd, void *buf, size_t n, int flags,
+                              struct sockaddr *addr, socklen_t *len) {
+    ssize_t r = aq_real_recvfrom ? aq_real_recvfrom(fd, buf, n, flags, addr, len) : -1;
+    if (r > 0 && g_sockRecvLogs < 30) {
+        g_sockRecvLogs += 1;
+        aq_add(@"卡密通道收到 %ld 字节: %@", (long)r, aq_bytes_desc(buf, (size_t)r));
+        aq_copy();
+    }
+    return r;
+}
+
+static int aq_my_connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    if (g_sockSendLogs < 30) {
+        aq_add(@"卡密通道连接 %@", aq_sock_addr(addr));
+    }
+    return aq_real_connect ? aq_real_connect(fd, addr, len) : -1;
+}
+
 static BOOL aq_install_hooks(void) {
     if (!g_found) return NO;
     g_hookTries += 1;
@@ -689,7 +786,12 @@ static BOOL aq_install_hooks(void) {
     aq_real_syscall = (aq_syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
     aq_real_kill = (aq_kill_fn)dlsym(RTLD_DEFAULT, "kill");
     aq_real_pthread_kill = (aq_pthread_kill_fn)dlsym(RTLD_DEFAULT, "pthread_kill");
-    struct { uintptr_t slot; void *fn; } hook[7] = {
+    aq_real_send = (aq_send_fn)dlsym(RTLD_DEFAULT, "send");
+    aq_real_sendto = (aq_sendto_fn)dlsym(RTLD_DEFAULT, "sendto");
+    aq_real_recv = (aq_recv_fn)dlsym(RTLD_DEFAULT, "recv");
+    aq_real_recvfrom = (aq_recvfrom_fn)dlsym(RTLD_DEFAULT, "recvfrom");
+    aq_real_connect = (aq_connect_fn)dlsym(RTLD_DEFAULT, "connect");
+    struct { uintptr_t slot; void *fn; } hook[12] = {
         { 0x13E0628, (void *)&aq_my_async },
         { 0x13E0620, (void *)&aq_my_after },
         { 0x13E0570, (void *)&aq_my__exit },
@@ -697,8 +799,13 @@ static BOOL aq_install_hooks(void) {
         { 0x13E09C0, (void *)&aq_my_pthread_kill },
         { 0x13E04C8, (void *)&aq_my_terminate },
         { 0x13E0B00, (void *)&aq_my_syscall },
+        { 0x13E0A48, (void *)&aq_my_send },
+        { 0x13E0A50, (void *)&aq_my_sendto },
+        { 0x13E0A10, (void *)&aq_my_recv },
+        { 0x13E0A18, (void *)&aq_my_recvfrom },
+        { 0x13E05F0, (void *)&aq_my_connect },
     };
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 12; i++) {
         uintptr_t slot = (uintptr_t)(g_slide + hook[i].slot);
         uintptr_t page = slot & ~(uintptr_t)0x3FFF;
         kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
@@ -716,7 +823,7 @@ static BOOL aq_install_hooks(void) {
                    VM_PROT_READ | VM_PROT_WRITE);
     }
     g_hookInstalled = YES;
-    aq_add(@"调度与退出观察已安装（只记录，退出类调用会被拦下）");
+    aq_add(@"调度、退出与卡密通道观察已安装（只记录，退出类调用会被拦下）");
     aq_copy();
     return YES;
 }
@@ -865,7 +972,9 @@ static void aq_try_fake_activation(NSString *reason) {
             aq_copy();
             return;
         }
-        id end = [NSDate dateWithTimeIntervalSince1970:4102444800.0];   // 2100 年
+        // 上一轮发现这个方法的第二个参数会被取 length，说明它要的是数据而不是日期；
+        // 这一轮改传一段空数据，先看它下一步做什么。
+        id end = [NSData data];
         // ARC 下不能直接调 objc_msgSend，先落到同类型函数指针再调用。
         void (*fn)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
         fn(inst, sel, @"AQ88888888", end);
