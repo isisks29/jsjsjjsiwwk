@@ -425,10 +425,19 @@ static void aq_probe_gate(NSString *tag) {
             aq_copy();
             return;
         }
+        aq_add(@"%@ 调用门前 8E=%08X 92=%08X", tag,
+               aq_rd32(o1, 0x8E), aq_rd32(o1, 0x92));
+        aq_copy();
         int (*f_gate)(void) = (int (*)(void))(g_slide + 0xA112C8);
         int gate = -100;
         @try { gate = f_gate(); } @catch (NSException *e) { }
         aq_add(@"%@ 面板总门=%d", tag, gate);
+        aq_copy();
+        int v3 = -100;
+        int (*f_val2)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
+        @try { v3 = f_val2(o1); } @catch (NSException *e) { }
+        aq_add(@"%@ 调用门后 8E=%08X 92=%08X 校验=%d", tag,
+               aq_rd32(o1, 0x8E), aq_rd32(o1, 0x92), v3);
         aq_copy();
     });
 }
@@ -648,11 +657,11 @@ static void aq_tick(void) {
         KeyState cur = aq_read_keys();
         if (cur.k50 == 0) aq_reinstall_keys();
     }
-    // 2 秒后每秒确认一次"已激活"标记，发现被失败流程清零就补回来。
-    if (g_found && !g_panelFound && aq_now() >= 2.0 && aq_now() < 120.0) {
-        int sec = (int)aq_now();
-        if (sec != g_activeTick) {
-            g_activeTick = sec;
+    // 只在门口检查前后补有限几次标记，避免高频写入干扰原版自身的校验。
+    if (g_found && !g_panelFound && aq_now() >= 2.0 && aq_now() < 10.0 && g_flagFixCount < 6) {
+        int slot = (int)(aq_now() * 10);
+        if (slot != g_activeTick) {
+            g_activeTick = slot;
             dispatch_async(dispatch_get_main_queue(), ^{ aq_keep_active(); });
         }
     }
