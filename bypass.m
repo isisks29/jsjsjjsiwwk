@@ -1,18 +1,25 @@
-// aqaw_probe.m —— aqaw 免改代码处理版（注入用）
+// aqaw_probe.m —— aqaw 运行时处理版（注入用）
 //
-// 与上一版（纯诊断）的区别：
-//   1. 不替换任何方法实现（上一版替换后 App 会闪退，说明这套卡密会检测自己的
-//      方法有没有被改过）；
-//   2. 改为“界面层自动处理”：发现带输入框的卡密弹窗就自动关闭它；
-//   3. 看住解密密钥：等 App 自己把密钥装好后记下来，一旦被卡密失败流程清零/
-//      改乱，就按记下的原值写回（只写数据，不改代码、不改方法）。
+// 为什么走运行时：
+//   实测原样副本能进、等价改写（行为完全一致，只换一种机器码写法）也闪退，
+//   说明这个库会校验自己的机器码，任何静态改字节的版本都不可能跑起来。
+//   因此这里一个字节都不改 aqaw，只在运行时替它把「设备密钥」装好。
+//
+// 这一版做什么：
+//   1. 不修改任何代码页，不替换任何方法；
+//   2. 每秒检查一次那组解密密钥；发现被卡密失败流程清空（k50 == 0）时，
+//      就调用原版自己的「安装设备密钥」函数（0x814F44）把它装回来。
+//      这两个动作都是原版自带函数，调用前后 App 流程一步都不跳；
+//   3. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
+//      一旦出现就把隐藏状态改回显示，确保能看见；
+//   4. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
+//      用来告诉你走到了哪一步、面板有没有出现。
 //
 // 仍然不做的事：
 //   * 不修改任何代码页；
 //   * 不替换任何方法；
-//   * 只调用原文件里的「安装启动密钥」这一个函数（它只做计算和写数据，
-//     和授权成功后走的是同一个函数），用来把激活状态补上；
-//   * 不碰卡密以外的界面（只处理带输入框的弹窗）。
+//   * 不主动调用面板初始化 / 挂载函数（它们依赖启动时的现场，空手调用会崩）；
+//   * 不碰卡密以外的界面。
 //
 // 编译（Theos）：
 //       TARGET = iphone:clang:latest:14.0
@@ -20,9 +27,7 @@
 //       aqaw_probe_FILES = aqaw_probe.m
 //       aqaw_probe_FRAMEWORKS = UIKit Foundation
 //
-// 使用：保持原版 aqaw.dylib 不动，注入后打开 App。
-//   约 6 秒后会弹一次「aqaw 处理信息」窗口，内容同时复制到剪贴板；
-//   关掉它以后，后台仍会继续自动关闭卡密弹窗、维护密钥。
+// 使用：保持原版 aqaw.dylib 不动，把本代码编译成 dylib 注入 App。
 //   如果中途闪退，剪贴板里仍然保留闪退前最后的记录。
 
 #import <Foundation/Foundation.h>
@@ -52,22 +57,15 @@ static dispatch_source_t g_timer = nil;
 static NSString *g_lastAlertSig = nil;
 static NSMutableSet *g_seenVCs = nil;
 static int g_tick = 0;
-static BOOL g_installTried = NO;
-static BOOL g_installDone = NO;
 static BOOL g_uiDumped = NO;
-static BOOL g_menuTried = NO;
-static BOOL g_attachTried = NO;
-static BOOL g_check12 = NO;
-static BOOL g_check20 = NO;
 
-static KeyState g_good = {0, 0, 0, 0};
-static KeyState g_cand = {0, 0, 0, 0};
-static int g_candCount = 0;
-static BOOL g_armed = NO;
-static int g_restores = 0;
 static int g_dismissed = 0;
 static BOOL g_haveKeys = NO;
 static KeyState g_lastKeys = {0, 0, 0, 0};
+static int g_keyLogCount = 0;
+static BOOL g_panelFound = NO;
+static int g_lastPanelCount = -1;
+static int g_panelChecks = 0;
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -105,18 +103,34 @@ static void aq_copy(void) {
 
 static BOOL aq_locate(void) {
     uint32_t n = _dyld_image_count();
+    int best = -1;
+    int fallback = -1;
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
-        if (strstr(name, "aqaw") || strstr(name, "AQaw") ||
-            strstr(name, "Aqaw") || strstr(name, "AQAR")) {
-            g_slide = _dyld_get_image_vmaddr_slide(i);
-            g_found = YES;
-            aq_add(@"找到 aqaw 镜像");
-            return YES;
-        }
+        if (!strstr(name, "aqaw") && !strstr(name, "AQaw") &&
+            !strstr(name, "Aqaw") && !strstr(name, "AQAR")) continue;
+        const char *base = strrchr(name, '/');
+        base = base ? base + 1 : name;
+        aq_add(@"镜像候选: %s", name);
+        if (fallback < 0) fallback = (int)i;
+        if (strcmp(base, "aqaw.dylib") == 0) best = (int)i;
     }
-    return NO;
+    int pick = best >= 0 ? best : fallback;
+    if (pick < 0) return NO;
+    g_slide = _dyld_get_image_vmaddr_slide(pick);
+    uint32_t magic = 0;
+    memcpy(&magic, (const void *)g_slide, 4);
+    if (magic != 0xFEEDFACF && magic != 0xCFFAEDFE &&
+        magic != 0xCAFEBABE && magic != 0xBEBAFECA) {
+        aq_add(@"镜像头校验失败: 0x%08X，暂不动手", magic);
+        g_slide = 0;
+        return NO;
+    }
+    aq_add(@"找到 aqaw 镜像（第 %d 个，头 0x%08X）", pick, magic);
+    g_slide = (intptr_t)_dyld_get_image_vmaddr_slide(pick);
+    g_found = YES;
+    return YES;
 }
 
 // 读写一个 4 字节状态位（只碰数据，不动代码）
@@ -140,14 +154,6 @@ static KeyState aq_read_keys(void) {
     memcpy(&s.k54, (const void *)(g_slide + 0x1644054), 4);
     memcpy(&s.k58, (const void *)(g_slide + 0x1644058), 4);
     return s;
-}
-
-static void aq_write_keys(KeyState s) {
-    if (!g_found) return;
-    memcpy((void *)(g_slide + 0x1644048), &s.k48, 8);
-    memcpy((void *)(g_slide + 0x1644050), &s.k50, 4);
-    memcpy((void *)(g_slide + 0x1644054), &s.k54, 4);
-    memcpy((void *)(g_slide + 0x1644058), &s.k58, 4);
 }
 
 static BOOL aq_key_equal(KeyState a, KeyState b) {
@@ -241,28 +247,33 @@ static void aq_handle_license_alert(void) {
     }
 }
 
-// 调用原版“安装启动密钥”函数：只做计算 + 写数据，不改任何代码
-static void aq_install_keys(void) {
-    if (g_installTried || !g_found) return;
-    g_installTried = YES;
+// 运行中调用原版“安装设备密钥”：不改任何代码，只让它自己写数据。
+// 只在密钥被清空（k50 == 0）时补装，避免频繁改写让下游解密对不上。
+static int g_reinstallCount = 0;
+static double g_lastInstallAt = -1;
+
+static void aq_reinstall_keys(void) {
+    if (!g_found || g_reinstallCount >= 400) return;
+    double now = aq_now();
+    if (g_lastInstallAt >= 0 && now - g_lastInstallAt < 0.15) return;
+    g_lastInstallAt = now;
+    g_reinstallCount += 1;
     dispatch_async(dispatch_get_main_queue(), ^{
         KeyState before = aq_read_keys();
-        aq_add(@"准备安装启动密钥（调用原版安装函数）");
-        // 先把日志放进剪贴板，万一调用失败也能看到走到了哪一步
-        @try {
-            [UIPasteboard generalPasteboard].string = aq_snapshot();
-        } @catch (NSException *e) {
-        }
         @try {
             void (*fn)(void) = (void (*)(void))(g_slide + 0x814F44);
             fn();
-            g_installDone = YES;
-            KeyState after = aq_read_keys();
-            aq_add(@"安装函数已返回: %@ -> %@", aq_key_desc(before), aq_key_desc(after));
         } @catch (NSException *e) {
-            aq_add(@"安装函数异常: %@", e.reason ?: @"未知");
+            aq_add(@"补装密钥异常: %@", e.reason ?: @"未知");
+            aq_copy();
+            return;
         }
-        aq_copy();
+        KeyState after = aq_read_keys();
+        if (g_reinstallCount <= 10 || (g_reinstallCount % 25) == 0) {
+            aq_add(@"补装密钥 #%d: %@ -> %@", g_reinstallCount,
+                   aq_key_desc(before), aq_key_desc(after));
+            aq_copy();
+        }
     });
 }
 
@@ -402,6 +413,7 @@ static void aq_dump_ui(void) {
             g_viewCount = 0;
             if (aq_walk_view(w, 0)) panelHits += 1;
         }
+        if (panelHits > 0) g_panelFound = YES;
         aq_add(@"面板检测结论: %@",
                panelHits > 0 ? @"面板组件已存在" : @"面板组件完全不存在");
     } @catch (NSException *e) {
@@ -431,7 +443,13 @@ static void aq_check_panel(NSString *tag) {
         if (g_win && w == g_win) continue;
         n += aq_find_panel(w, 0);
     }
-    aq_add(@"%@面板复查: %d 个组件", tag, n);
+    if (n > 0 && !g_panelFound) {
+        g_panelFound = YES;
+        aq_add(@"%@面板已出现: %d 个组件", tag, n);
+    } else if (n != g_lastPanelCount) {
+        aq_add(@"%@面板复查: %d 个组件", tag, n);
+    }
+    g_lastPanelCount = n;
     aq_copy();
 }
 
@@ -541,62 +559,31 @@ static void aq_tick(void) {
     g_tick += 1;
     if (!g_found) aq_locate();
     if (g_found && !g_impsLogged) aq_log_imps();
-    if (g_found && !g_installTried && aq_now() >= 1.0) aq_install_keys();
-    if (g_found && g_installDone && !g_menuTried && aq_now() >= 4.0) aq_try_menu();
-    if (g_found && g_installDone && !g_attachTried && aq_now() >= 5.0) aq_try_attach();
-    if (g_found && !g_check12 && aq_now() >= 12.0) {
-        g_check12 = YES;
-        dispatch_async(dispatch_get_main_queue(), ^{ aq_check_panel(@"12秒"); });
+    // 纯数据模式：不碰代码、不碰方法，只在密钥被清空时让原版自己补装。
+    // 卡密失败流程会把 k50 清零，这里检测到就补装一次，使面板自检能通过。
+    if (g_found && !g_panelFound && aq_now() >= 0.5 && aq_now() < 120.0) {
+        KeyState cur = aq_read_keys();
+        if (cur.k50 == 0) aq_reinstall_keys();
     }
-    if (g_found && !g_check20 && aq_now() >= 20.0) {
-        g_check20 = YES;
-        dispatch_async(dispatch_get_main_queue(), ^{ aq_check_panel(@"20秒"); });
+    // 面板定时复查：4 秒起每 2 秒一次，直到面板出现或超过 40 秒。
+    if (g_found && !g_panelFound && aq_now() >= 4.0 && aq_now() < 40.0) {
+        int n = (int)(aq_now() / 2.0);
+        if (n != g_panelChecks) {
+            g_panelChecks = n;
+            dispatch_async(dispatch_get_main_queue(), ^{ aq_check_panel(@"定时"); });
+        }
     }
 
     if (g_found) {
         KeyState cur = aq_read_keys();
         if (!g_haveKeys || !aq_key_equal(cur, g_lastKeys)) {
-            aq_add(@"解密密钥 %@", aq_key_desc(cur));
-            g_lastKeys = cur;
-            g_haveKeys = YES;
-            aq_copy();
-        }
-
-        if (!g_armed) {
-            if (cur.k50 != 0) {
-                // 连续 6 次读到完全相同的一组非零值，才认为安装完成
-                if (g_candCount > 0 && aq_key_equal(cur, g_cand)) {
-                    g_candCount += 1;
-                } else {
-                    g_cand = cur;
-                    g_candCount = 1;
-                }
-                if (g_candCount >= 6) {
-                    g_good = cur;
-                    g_armed = YES;
-                    aq_add(@"已锁定正确密钥: %@", aq_key_desc(g_good));
-                    aq_copy();
-                }
-            } else {
-                g_candCount = 0;
-                if ((g_tick % 50) == 0) {
-                    aq_add(@"密钥仍为 0，等待 App 自己安装");
-                    aq_copy();
-                }
-            }
-        } else if (!aq_key_equal(cur, g_good)) {
-            if (cur.k50 == 0) {
-                aq_write_keys(g_good);
-                g_restores += 1;
-                if (g_restores <= 10 || (g_restores % 20) == 0) {
-                    aq_add(@"密钥被清零，已恢复（第 %d 次）", g_restores);
-                    aq_copy();
-                }
-            } else {
-                g_good = cur;
-                aq_add(@"App 重新安装了密钥，已跟随: %@", aq_key_desc(g_good));
+            g_keyLogCount += 1;
+            if (g_keyLogCount <= 15 || (g_keyLogCount % 50) == 0) {
+                aq_add(@"解密密钥 %@", aq_key_desc(cur));
                 aq_copy();
             }
+            g_lastKeys = cur;
+            g_haveKeys = YES;
         }
     }
 
