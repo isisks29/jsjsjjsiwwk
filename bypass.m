@@ -133,19 +133,7 @@ static BOOL aq_locate(void) {
     return YES;
 }
 
-// 读写一个 4 字节状态位（只碰数据，不动代码）
-static uint32_t aq_read_u32(uint64_t off) {
-    uint32_t v = 0;
-    if (!g_found) return 0;
-    memcpy(&v, (const void *)(g_slide + off), 4);
-    return v;
-}
-
-static void aq_write_u32(uint64_t off, uint32_t v) {
-    if (!g_found) return;
-    memcpy((void *)(g_slide + off), &v, 4);
-}
-
+// 只读地取当前这组解密密钥（只碰数据，不动代码）
 static KeyState aq_read_keys(void) {
     KeyState s = {0, 0, 0, 0};
     if (!g_found) return s;
@@ -274,66 +262,6 @@ static void aq_reinstall_keys(void) {
                    aq_key_desc(before), aq_key_desc(after));
             aq_copy();
         }
-    });
-}
-
-// 密钥装好后，主动执行一次原版面板初始化（无参数，原版启动时自己也会调它）
-static void aq_try_menu(void) {
-    if (g_menuTried || !g_found) return;
-    g_menuTried = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        aq_add(@"准备初始化面板（调用原版面板函数）");
-        @try {
-            [UIPasteboard generalPasteboard].string = aq_snapshot();
-        } @catch (NSException *e) {
-        }
-        void (*fn)(void) = (void (*)(void))(g_slide + 0xA118FC);
-        uint32_t before = aq_read_u32(0x16413E4);
-        aq_add(@"面板完成标记(调用前)=%u", before);
-        @try {
-            fn();
-            aq_add(@"面板函数已返回");
-        } @catch (NSException *e) {
-            aq_add(@"面板函数异常: %@", e.reason ?: @"未知");
-        }
-        uint32_t after = aq_read_u32(0x16413E4);
-        aq_add(@"面板完成标记(调用后)=%u", after);
-
-        // 若启动时已经把标记写成 1，说明面板流程启动时走过一遍但没挂上屏幕；
-        // 清掉标记再走一次，看这次能否真正建立。
-        if (before != 0) {
-            aq_add(@"标记已存在，清零后重试一次");
-            aq_write_u32(0x16413E4, 0);
-            @try {
-                fn();
-                aq_add(@"重试调用已返回");
-            } @catch (NSException *e) {
-                aq_add(@"重试调用异常: %@", e.reason ?: @"未知");
-            }
-            aq_add(@"面板完成标记(重试后)=%u", aq_read_u32(0x16413E4));
-        }
-        aq_copy();
-    });
-}
-
-// 窗口就绪后，执行原版的「把悬浮球挂到窗口」动作
-static void aq_try_attach(void) {
-    if (g_attachTried || !g_found) return;
-    g_attachTried = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        aq_add(@"准备把面板挂到窗口（调用原版挂载函数）");
-        @try {
-            [UIPasteboard generalPasteboard].string = aq_snapshot();
-        } @catch (NSException *e) {
-        }
-        @try {
-            void (*fn)(void) = (void (*)(void))(g_slide + 0x976DF0);
-            fn();
-            aq_add(@"挂载函数已返回");
-        } @catch (NSException *e) {
-            aq_add(@"挂载函数异常: %@", e.reason ?: @"未知");
-        }
-        aq_copy();
     });
 }
 
