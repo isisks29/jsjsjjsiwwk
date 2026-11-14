@@ -9,15 +9,16 @@
 // 这一版做什么（沿用同类靶场验证过的思路：零 .text 修改）：
 //   1. 只把目标库调用 dispatch_async / dispatch_after 用的两个指针槽
 //      换成观察函数，记录它丢出去的每个 block 的位置、来源和携带的数据，
-//      并在 block 真正执行时再记一笔 —— 只记录、不改任何结果；
+//      然后原样交给系统调度 —— 只记录、不改任何结果；
 //   2. 把未激活时用于跳过面板的那个状态字改回 0（只改数据，不动代码），
 //      并监视这一组四个字的变化，原版每次改写都留痕；
 //   3. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7）和
 //      界面上新出现的混淆类名；1.2 秒时确认这三个类有没有被注册，并把目标库
 //      里所有混淆类名列出来；面板一旦出现就取消隐藏；
 //   4. 只读地记录密钥、许可证对象、结构校验结果和窗口构成变化；
-//   5. 卡密弹窗出现时只关一次（同一个弹窗不重复关），并记录按钮和输入框，
-//      让原版按「未激活」的正常分支继续；
+//   5. 卡密弹窗出现时只记录按钮和输入框，不关闭它（实测关掉之后马上闪退），
+//      先看面板能不能在弹窗还在时自己出现；同时每秒打一行心跳，
+//      万一闪退能看出最后停在哪一步；
 //   6. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
 //      用来告诉你走到了哪一步、面板有没有出现。
 //
@@ -74,7 +75,6 @@ static NSMutableSet *g_seenVCs = nil;
 static int g_tick = 0;
 static BOOL g_uiDumped = NO;
 
-static int g_dismissed = 0;
 static BOOL g_gate25 = NO;
 static BOOL g_gate9 = NO;
 static BOOL g_haveKeys = NO;
@@ -93,8 +93,6 @@ static int g_flagWrites = 0;
 static int g_flagChangeLogs = 0;
 static uint32_t g_lastFlagArr[4] = {0xFFFFFFFFu, 0, 0, 0};
 static void *g_lastLicenseObj = (void *)0x1;
-static NSMutableDictionary *g_siteRuns = nil;
-static int g_dispatchRunLogs = 0;
 static NSString *g_lastWinSig = nil;
 static BOOL g_baseLogged = NO;
 static BOOL g_panelClassChecked = NO;
@@ -273,7 +271,7 @@ static void aq_handle_license_alert(void) {
                              (unsigned long)a.textFields.count];
             if (![sig isEqualToString:g_lastAlertSig]) {
                 g_lastAlertSig = [sig copy];
-                aq_add(@"发现卡密弹窗，自动关闭：标题=%@ 正文=%@",
+                aq_add(@"发现卡密弹窗（本轮不关闭，保持原样）：标题=%@ 正文=%@",
                        a.title ?: @"(无)", a.message ?: @"(无)");
                 NSMutableString *acts = [NSMutableString string];
                 for (UIAlertAction *ac in a.actions) {
@@ -287,15 +285,8 @@ static void aq_handle_license_alert(void) {
                        acts, (unsigned long)a.textFields.count, ph);
                 aq_copy();
             }
-            // 只关第一次出现的弹窗：反复关同一类弹窗容易把界面弄崩。
-            if (g_dismissed >= 1) return;
-            // 只关闭弹窗，不写任何状态：让原版按「未激活」的正常分支继续。
-            [a dismissViewControllerAnimated:NO completion:nil];
-            g_dismissed += 1;
-            if (g_dismissed <= 5 || (g_dismissed % 20) == 0) {
-                aq_add(@"已自动关闭卡密弹窗 %d 次", g_dismissed);
-                aq_copy();
-            }
+            // 之前实测：关闭弹窗之后紧接着就会闪退（无论关几次）。
+            // 本轮先不关，看面板能不能在弹窗还在的时候自己出现。
             return;
         }
     } @catch (NSException *e) {
@@ -408,47 +399,17 @@ static BOOL aq_note_block(const char *kind, dispatch_block_t b, uintptr_t ra,
     return YES;
 }
 
-// 真正执行时也记一笔（每个位置最多记 3 次），确认这个块有没有跑到、什么时候跑。
-static void aq_run_block(const char *kind, long invOff, long raOff, dispatch_block_t b) {
-    NSString *key = [NSString stringWithFormat:@"%s:%ld", kind, invOff];
-    int n = 0;
-    @synchronized (g_siteRuns) {
-        if (!g_siteRuns) g_siteRuns = [NSMutableDictionary dictionary];
-        n = [[g_siteRuns objectForKey:key] intValue];
-        if (n < 3) [g_siteRuns setObject:@(n + 1) forKey:key];
-        g_dispatchRunLogs += 1;
-    }
-    if (n < 3 && g_dispatchRunLogs <= 80) {
-        aq_add(@"执行处理块 %s 位置 +0x%lX 来自 +0x%lX", kind, invOff, raOff);
-        aq_copy();
-    }
-    if (b) b();
-}
-
+// 只观察，不包裹、不改写原 block：原样交给系统调度。
 static void aq_my_async(dispatch_queue_t q, dispatch_block_t b) {
-    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
     long io = 0, ro = 0;
-    BOOL mine = aq_note_block("async", b, ra, &io, &ro);
-    if (!aq_real_async) return;
-    if (mine) {
-        long si = io, sr = ro;
-        aq_real_async(q, ^{ aq_run_block("async", si, sr, b); });
-    } else {
-        aq_real_async(q, b);
-    }
+    aq_note_block("async", b, (uintptr_t)__builtin_return_address(0), &io, &ro);
+    if (aq_real_async) aq_real_async(q, b);
 }
 
 static void aq_my_after(dispatch_time_t t, dispatch_queue_t q, dispatch_block_t b) {
-    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
     long io = 0, ro = 0;
-    BOOL mine = aq_note_block("after", b, ra, &io, &ro);
-    if (!aq_real_after) return;
-    if (mine) {
-        long si = io, sr = ro;
-        aq_real_after(t, q, ^{ aq_run_block("after", si, sr, b); });
-    } else {
-        aq_real_after(t, q, b);
-    }
+    aq_note_block("after", b, (uintptr_t)__builtin_return_address(0), &io, &ro);
+    if (aq_real_after) aq_real_after(t, q, b);
 }
 
 static BOOL aq_install_hooks(void) {
@@ -742,6 +703,32 @@ static void aq_check_panel(NSString *tag) {
     aq_copy();
 }
 
+// 每秒一行心跳：闪退时能据此判断最后停在什么状态。
+static void aq_heartbeat(void) {
+    @try {
+        int wins = 0, panel = 0;
+        BOOL alert = NO;
+        for (UIWindow *w in aq_all_windows()) {
+            if (g_win && w == g_win) continue;
+            wins += 1;
+            panel += aq_find_panel(w, 0);
+            UIViewController *vc = w.rootViewController;
+            int d = 0;
+            while (vc.presentedViewController && d < 6) {
+                vc = vc.presentedViewController;
+                d += 1;
+            }
+            if ([vc isKindOfClass:[UIAlertController class]]) alert = YES;
+        }
+        uint32_t f = 0;
+        memcpy(&f, (const void *)(g_slide + 0x16392A0), 4);
+        aq_add(@"心跳: 状态字=%08X 窗口=%d 面板组件=%d 卡密弹窗=%@",
+               f, wins, panel, alert ? @"在" : @"无");
+        aq_copy();
+    } @catch (NSException *e) {
+    }
+}
+
 // 展示处理信息（独立置顶窗口）
 static void aq_show(void) {
     if (g_shown || g_presenting) return;
@@ -902,13 +889,17 @@ static void aq_tick(void) {
         g_gate9 = YES;
         aq_probe_gate(@"9秒");
     }
-    // 面板定时复查：4 秒起每 2 秒一次，直到面板出现或超过 180 秒。
-    if (g_found && !g_panelFound && aq_now() >= 4.0 && aq_now() < 180.0) {
-        int n = (int)(aq_now() / 2.0);
+    // 面板定时复查：2 秒起每 0.5 秒一次，直到面板出现或超过 180 秒。
+    if (g_found && !g_panelFound && aq_now() >= 2.0 && aq_now() < 180.0) {
+        int n = (int)(aq_now() * 2.0);
         if (n != g_panelChecks) {
             g_panelChecks = n;
             dispatch_async(dispatch_get_main_queue(), ^{ aq_check_panel(@"定时"); });
         }
+    }
+    // 2.5~12 秒每秒一行心跳，记录状态字、窗口数、面板组件数和弹窗是否还在。
+    if (g_found && aq_now() >= 2.5 && aq_now() <= 12.0 && (g_tick % 10) == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{ aq_heartbeat(); });
     }
 
     if (g_found) {
