@@ -6,19 +6,21 @@
 //   因此这里一个字节都不改 aqaw，只在运行时替它把「设备密钥」装好。
 //
 // 这一版做什么：
-//   1. 不修改任何代码页，不替换任何方法；
-//   2. 每秒检查一次那组解密密钥；发现被卡密失败流程清空（k50 == 0）时，
-//      就调用原版自己的「安装设备密钥」函数（0x814F44）把它装回来；
-//   3. 检查面板要求的那份「激活状态」结构：先读出来记进日志，再用原版自己的
-//      校验规则把缺失的部分补齐成自洽状态（只写这份状态自己的字段，
-//      不碰对象开头的指针）；
-//   4. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
+//   1. 只在内存里把「面板总门」（0xA112C8，返回 1 表示放行）改成直接返回 1，
+//      不修改磁盘文件，也不改任何激活状态；
+//   2. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
 //      一旦出现就取消隐藏、并把信息窗收起，确保能看见；
+//   3. 只读地记录密钥、许可证对象和结构校验结果；
+//   4. 卡密弹窗出现时自动关闭，让原版按「未激活」的正常分支继续；
 //   5. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
 //      用来告诉你走到了哪一步、面板有没有出现。
 //
+// 为什么不再伪造激活状态：
+//   实测只要把状态改成「已激活」，原版就会带着这份状态进入自身的加密校验，
+//   校验不通过就执行终止指令（闪退）。所以这里只改判定结果，状态保持原样。
+//
 // 仍然不做的事：
-//   * 不修改任何代码页；
+//   * 不修改磁盘文件；
 //   * 不替换任何方法；
 //   * 不主动调用面板初始化 / 挂载函数（它们依赖启动时的现场，空手调用会崩）；
 //   * 不碰卡密以外的界面。
@@ -36,6 +38,9 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
+#import <libkern/OSCacheControl.h>
 #import <stdint.h>
 #import <string.h>
 
@@ -70,14 +75,13 @@ static int g_keyLogCount = 0;
 static BOOL g_panelFound = NO;
 static int g_lastPanelCount = -1;
 static int g_panelChecks = 0;
-static int g_genuineRuns = 0;
-static BOOL g_genuineDone = NO;
-static BOOL g_genuineQueued = NO;
-static double g_lastGenuineAt = -1;
+static BOOL g_gatePatched = NO;
+static int g_gatePatchTries = 0;
+static BOOL g_flagLogged = NO;
 
 static NSString *aq_snapshot(void);
 static void aq_copy(void);
-static void aq_genuine_activate(NSString *tag);
+static BOOL aq_patch_gate(void);
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -251,10 +255,7 @@ static void aq_handle_license_alert(void) {
                 aq_add(@"发现卡密弹窗，自动关闭：标题=%@ 正文=%@",
                        a.title ?: @"(无)", a.message ?: @"(无)");
             }
-            // 弹窗出现说明失败流程刚把"已激活"标记清过：按原版成功顺序
-            // 再完整走一遍（封存/安装密钥/收尾），让紧接着的检查通过。
-            aq_genuine_activate(@"弹窗时");
-
+            // 只关闭弹窗，不写任何状态：让原版按「未激活」的正常分支继续。
             [a dismissViewControllerAnimated:NO completion:nil];
             g_dismissed += 1;
             if (g_dismissed <= 5 || (g_dismissed % 20) == 0) {
@@ -308,61 +309,46 @@ static uint32_t aq_rd32(void *p, size_t off) {
 }
 
 
-// 原版真正激活成功的收尾在 0x80DD54，顺序是：
-//   封存(0x814DF4) -> 安装设备密钥(0x814F44) -> 收尾初始化(0x814FEC)
-// 三步必须按原版顺序完整走一遍；缺了最后一步，后续校验仍按"未激活"处理，
-// 弹窗会照旧出现，游戏开始渲染后也会闪退。这里按原版顺序完整补上。
-static void aq_genuine_activate(NSString *tag) {
-    if (!g_found) return;
-    if (g_genuineRuns >= 3) return;
-    double now = aq_now();
-    if (g_lastGenuineAt >= 0 && now - g_lastGenuineAt < 0.6) return;
-    g_lastGenuineAt = now;
-    g_genuineRuns += 1;
-
-    void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
-    void *o = NULL;
-    @try { o = f_obj(); } @catch (NSException *e) { }
-    if (!o) {
-        aq_add(@"%@ 激活序列: 许可证对象为空，稍后重试", tag);
+// 把面板总门（0xA112C8，返回值 1=放行）在内存里改成「直接返回 1」。
+// 为什么不再伪造激活状态：实测原版会带着这份状态进入自身的加密校验，
+// 校验不通过就直接执行终止指令（闪退）。只在内存里改这一处判定，
+// 状态本身保持原样（未激活），后续校验仍走正常分支，就不会再被终止。
+static BOOL aq_patch_gate(void) {
+    if (!g_found) return NO;
+    g_gatePatchTries += 1;
+    uintptr_t addr = (uintptr_t)(g_slide + 0xA112C8);
+    uintptr_t page = addr & ~(uintptr_t)0x3FFF;
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        aq_add(@"门函数改写失败: 内存不可写 (%d)", (int)kr);
         aq_copy();
-        return;
+        return NO;
     }
-
-    uint32_t one = 1;
-    memcpy((char *)o + 0x8E, &one, 4);
-    memcpy((char *)o + 0x92, &one, 4);
-
-    void (*f_seal)(void *) = (void (*)(void *))(g_slide + 0x814DF4);
-    void (*f_install)(void) = (void (*)(void))(g_slide + 0x814F44);
-    void (*f_finish)(void) = (void (*)(void))(g_slide + 0x814FEC);
-
-    @try { f_seal(o); } @catch (NSException *e) { }
-    aq_add(@"%@ 激活序列 1/3 封存完成", tag);
+    uint32_t code[2] = { 0x52800020u, 0xD65F03C0u };   // mov w0,#1 ; ret
+    memcpy((void *)addr, code, sizeof(code));
+    sys_icache_invalidate((void *)addr, sizeof(code));
+    vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+               VM_PROT_READ | VM_PROT_EXECUTE);
+    g_gatePatched = YES;
+    aq_add(@"门函数已在内存中改为直接通过");
     aq_copy();
-
-    @try { f_install(); } @catch (NSException *e) { }
-    aq_add(@"%@ 激活序列 2/3 设备密钥已安装 %@", tag, aq_key_desc(aq_read_keys()));
-    aq_copy();
-
-    @try { f_finish(); } @catch (NSException *e) { }
-    aq_add(@"%@ 激活序列 3/3 收尾完成", tag);
-    aq_copy();
-
-    int (*f_val)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
-    int v = -100;
-    @try { v = f_val(o); } @catch (NSException *e) { }
-    aq_add(@"%@ 激活后 8E=%u 92=%u 校验=%d", tag,
-           aq_rd32(o, 0x8E), aq_rd32(o, 0x92), v);
-    aq_copy();
-    g_genuineDone = YES;
+    return YES;
 }
 
 static void aq_probe_gate(NSString *tag) {
     if (!g_found) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        aq_add(@"%@ 校验链开始", tag);
+        aq_add(@"%@ 状态检查开始", tag);
         aq_copy();
+
+        // 只观察 App 自己已经创建好的许可证对象；没有就不强行创建，
+        // 避免在它初始化之前打乱现场。
+        void *o1 = NULL;
+        memcpy(&o1, (const void *)(g_slide + 0x1644040), sizeof(o1));
+        aq_add(@"%@ 许可证对象=%p", tag, o1);
+        aq_copy();
+        if (!o1) return;
 
         int (*f_key)(void) = (int (*)(void))(g_slide + 0xA19EE0);
         int keyRc = -100;
@@ -370,39 +356,39 @@ static void aq_probe_gate(NSString *tag) {
         aq_add(@"%@ 密钥自检=%d", tag, keyRc);
         aq_copy();
 
-        void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
-        void *o1 = NULL;
         void *o2 = NULL;
-        @try { o1 = f_obj(); } @catch (NSException *e) { }
-        aq_add(@"%@ 许可证对象1=%p", tag, o1);
-        aq_copy();
+        void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
         @try { o2 = f_obj(); } @catch (NSException *e) { }
-        aq_add(@"%@ 许可证对象2=%p（%@）", tag, o2,
-               (o1 && o1 == o2) ? @"同一对象" : @"不同对象");
+        aq_add(@"%@ 许可证对象复查=%p（%@）", tag, o2,
+               (o1 == o2) ? @"同一对象" : @"不同对象");
         aq_copy();
 
-        if (o1) {
-            aq_add(@"%@ 字段 00=%08X 78=%016llX 8E=%08X 92=%08X", tag,
-                   aq_rd32(o1, 0x00), (unsigned long long)aq_rd64(o1, 0x78),
-                   aq_rd32(o1, 0x8E), aq_rd32(o1, 0x92));
-            aq_copy();
-            aq_add(@"%@ 结构 %016llX %016llX %016llX %016llX %08X %08X", tag,
-                   (unsigned long long)aq_rd64(o1, 0x219A),
-                   (unsigned long long)aq_rd64(o1, 0x21A2),
-                   (unsigned long long)aq_rd64(o1, 0x21AA),
-                   (unsigned long long)aq_rd64(o1, 0x21B2),
-                   aq_rd32(o1, 0x21BA), aq_rd32(o1, 0x21C2));
-            aq_copy();
+        aq_add(@"%@ 字段 00=%08X 78=%016llX 8E=%08X 92=%08X", tag,
+               aq_rd32(o1, 0x00), (unsigned long long)aq_rd64(o1, 0x78),
+               aq_rd32(o1, 0x8E), aq_rd32(o1, 0x92));
+        aq_copy();
+        aq_add(@"%@ 结构 %016llX %016llX %016llX %016llX %08X %08X", tag,
+               (unsigned long long)aq_rd64(o1, 0x219A),
+               (unsigned long long)aq_rd64(o1, 0x21A2),
+               (unsigned long long)aq_rd64(o1, 0x21AA),
+               (unsigned long long)aq_rd64(o1, 0x21B2),
+               aq_rd32(o1, 0x21BA), aq_rd32(o1, 0x21C2));
+        aq_copy();
 
-            int (*f_val)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
-            int v0 = -100;
-            @try { v0 = f_val(o1); } @catch (NSException *e) { }
-            aq_add(@"%@ 结构校验=%d（只读，不主动改写）", tag, v0);
-            aq_copy();
-        } else {
-            aq_add(@"%@ 许可证对象为空", tag);
-            aq_copy();
-        }
+        int (*f_val)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
+        int v0 = -100;
+        @try { v0 = f_val(o1); } @catch (NSException *e) { }
+        aq_add(@"%@ 结构校验=%d（只读，不主动改写）", tag, v0);
+        aq_copy();
+
+        // 只读记录与面板出现直接相关的那组标志，方便对照「面板为什么没出来」。
+        uint32_t f0 = 0, f4 = 0, f8 = 0, fc = 0;
+        memcpy(&f0, (const void *)(g_slide + 0x1639298), 4);
+        memcpy(&f4, (const void *)(g_slide + 0x163929C), 4);
+        memcpy(&f8, (const void *)(g_slide + 0x16392A0), 4);
+        memcpy(&fc, (const void *)(g_slide + 0x16392A4), 4);
+        aq_add(@"%@ 面板标志 %08X %08X %08X %08X", tag, f0, f4, f8, fc);
+        aq_copy();
     });
 }
 
@@ -615,17 +601,21 @@ static void aq_tick(void) {
     g_tick += 1;
     if (!g_found) aq_locate();
     if (g_found && !g_impsLogged) aq_log_imps();
-    // 按原版真正的成功顺序完整激活一次（封存/安装密钥/收尾）。
-    // 只做一次，之后不再反复改写，避免打乱原版自己的后续校验。
-    // 用 queued 标记保证主线程被卡住时也只排一个任务进去。
-    if (g_found && !g_genuineDone && !g_genuineQueued && aq_now() >= 1.0) {
-        if (g_genuineRuns == 0 || aq_now() - g_lastGenuineAt >= 1.5) {
-            g_genuineQueued = YES;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                g_genuineQueued = NO;
-                aq_genuine_activate(g_genuineRuns == 0 ? @"启动时" : @"重试");
-            });
-        }
+    // 在 App 自己做面板判定之前，把总门在内存里改成「直接通过」。
+    // 只改这一处判定，改动前后的激活状态都保持原样。
+    if (g_found && !g_gatePatched && g_gatePatchTries < 3 && aq_now() >= 0.15) {
+        aq_patch_gate();
+    }
+    // 1 秒时先把面板相关标志记一笔（只读），用来判断面板该不该出现。
+    if (g_found && !g_flagLogged && aq_now() >= 1.0) {
+        g_flagLogged = YES;
+        uint32_t a = 0, b = 0, c = 0, d = 0;
+        memcpy(&a, (const void *)(g_slide + 0x1639298), 4);
+        memcpy(&b, (const void *)(g_slide + 0x163929C), 4);
+        memcpy(&c, (const void *)(g_slide + 0x16392A0), 4);
+        memcpy(&d, (const void *)(g_slide + 0x16392A4), 4);
+        aq_add(@"面板标志(1秒) %08X %08X %08X %08X", a, b, c, d);
+        aq_copy();
     }
     // 校验链探测：2.6 秒一次（卡密流程刚走完），9 秒一次（弹窗关掉之后）。
     if (g_found && !g_gate25 && aq_now() >= 2.6) {
