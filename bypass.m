@@ -18,9 +18,13 @@
 //   5. 卡密弹窗出现后约 1.5 秒，自动往输入框填一个测试卡密并触发「验证」按钮，
 //      让原版走完它自己的流程；本地存储会在开局和 30 秒各看一次，用来判断
 //      原版把激活结果存在哪里；
-//   6. 弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
-//   7. 大约 30 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板；
-//   8. 异常现场自救：捕获崩溃信号和未捕获异常，把出错指令、来源地址和访问
+//   6. 记录 App 发出的每一条网络请求和服务器返回的内容（只记录，不改请求和
+//      返回），用来判断卡密校验连的是哪个地址、返回是什么格式；
+//   7. 看到校验结果后约 2.5 秒，用原版自己的激活状态写入方法写入一份测试状态，
+//      看面板会不会因此放行；结果弹窗 4 秒后自动收起，避免挡住面板；
+//   8. 卡密弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
+//   9. 大约 30 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板；
+//  10. 异常现场自救：捕获崩溃信号和未捕获异常，把出错指令、来源地址和访问
 //      地址写进沙盒文件；再检测主线程是否被卡死（被系统看门狗杀掉时不会
 //      有任何信号，只能靠这条路记下来）。每次启动还会把上一次运行的日志
 //      尾巴读回来 —— 万一进程是被原版悄悄结束的，也能看到最后一步。
@@ -48,6 +52,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
@@ -111,6 +116,13 @@ static BOOL g_autoTried = NO;
 static NSMutableSet *g_seenAlertMsgs = nil;
 static BOOL g_defsLogged1 = NO;
 static BOOL g_defsLogged2 = NO;
+static BOOL g_netInstalled = NO;
+static int g_netTries = 0;
+static UIAlertController *g_resultAlert = nil;
+static double g_resultFirstSeen = 0;
+static BOOL g_resultClosed = NO;
+static BOOL g_fakeTried = NO;
+static BOOL g_fakeScheduled = NO;
 static int g_mainBeats = 0;
 static int g_mainSeen = 0;
 static double g_lastMainMove = 0;
@@ -412,6 +424,18 @@ static void aq_handle_license_alert(void) {
                            a.title ?: @"(无)", a.message ?: @"(无)", acts2);
                     aq_copy();
                 }
+                // 新的结果弹窗：记下出现时间，稍后自动收起，免得挡住面板。
+                if (a != g_resultAlert) {
+                    g_resultAlert = a;
+                    g_resultFirstSeen = aq_now();
+                    g_resultClosed = NO;
+                }
+                if (!g_resultClosed && aq_now() - g_resultFirstSeen >= 4.0) {
+                    g_resultClosed = YES;
+                    [a dismissViewControllerAnimated:NO completion:nil];
+                    aq_add(@"结果弹窗已自动收起，继续观察面板");
+                    aq_copy();
+                }
                 continue;
             }
 
@@ -703,6 +727,154 @@ static NSString *aq_trunc(NSString *s, NSUInteger cap) {
     if (!s) return @"(空)";
     if (s.length <= cap) return s;
     return [[s substringToIndex:cap] stringByAppendingString:@"…"];
+}
+
+// ---- 网络观察（只记录请求与返回，不改动请求内容和返回内容） -----------------
+// 卡密校验要联网，这里把 App 发出的每个请求和收到的每个返回都记下来，
+// 用来判断校验走的是哪个地址、服务器返回的格式是什么。
+static void aq_log_request(NSURLRequest *req, NSString *tag) {
+    @try {
+        if (!req) {
+            aq_add(@"%@ 请求: (无内容)", tag);
+            return;
+        }
+        NSString *u = req.URL.absoluteString ?: @"(无地址)";
+        NSString *m = req.HTTPMethod ?: @"GET";
+        NSData *b = req.HTTPBody;
+        NSString *bs = @"无";
+        if (b.length) {
+            NSString *s = [[NSString alloc] initWithData:b encoding:NSUTF8StringEncoding];
+            bs = s ? aq_trunc(s, 400)
+                   : [NSString stringWithFormat:@"%lu 字节二进制", (unsigned long)b.length];
+        }
+        NSDictionary *h = req.allHTTPHeaderFields;
+        aq_add(@"%@ 请求: %@ %@ 头=%lu项 体=%@",
+               tag, m, aq_trunc(u, 300), (unsigned long)h.count, bs);
+    } @catch (NSException *e) {
+    }
+}
+
+typedef NSURLSessionDataTask *(*aq_task_fn)(id, SEL, NSURLRequest *);
+static aq_task_fn aq_orig_dataTask = NULL;
+typedef NSURLSessionDataTask *(*aq_task_cb_fn)(id, SEL, NSURLRequest *,
+                                               void (^)(NSData *, NSURLResponse *, NSError *));
+static aq_task_cb_fn aq_orig_dataTaskCB = NULL;
+
+static NSURLSessionDataTask *aq_my_dataTask(id self, SEL _cmd, NSURLRequest *req) {
+    aq_log_request(req, @"发出");
+    return aq_orig_dataTask ? aq_orig_dataTask(self, _cmd, req) : nil;
+}
+
+static NSURLSessionDataTask *aq_my_dataTaskCB(id self, SEL _cmd, NSURLRequest *req,
+                                              void (^cb)(NSData *, NSURLResponse *, NSError *)) {
+    aq_log_request(req, @"发出");
+    if (!cb || !aq_orig_dataTaskCB) {
+        return aq_orig_dataTaskCB ? aq_orig_dataTaskCB(self, _cmd, req, cb) : nil;
+    }
+    void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
+        ^(NSData *data, NSURLResponse *resp, NSError *err) {
+            @try {
+                NSString *u = resp.URL.absoluteString ?: req.URL.absoluteString ?: @"(未知)";
+                long code = -1;
+                NSString *hs = @"";
+                if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+                    NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
+                    code = (long)hr.statusCode;
+                    hs = [NSString stringWithFormat:@" 头=%lu项", (unsigned long)hr.allHeaderFields.count];
+                }
+                NSString *body = @"(空)";
+                if (data.length) {
+                    NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                    body = s ? aq_trunc(s, 800)
+                             : [NSString stringWithFormat:@"%lu 字节二进制", (unsigned long)data.length];
+                }
+                aq_add(@"网络返回: 状态=%ld%@ 地址=%@ 出错=%@ 体=%@",
+                       code, hs, aq_trunc(u, 240),
+                       err ? (err.localizedDescription ?: @"未知") : @"无", body);
+                aq_copy();
+            } @catch (NSException *e) {
+            }
+            cb(data, resp, err);
+        };
+    return aq_orig_dataTaskCB(self, _cmd, req, wrapped);
+}
+
+static BOOL aq_install_net(void) {
+    g_netTries += 1;
+    Class s = NSClassFromString(@"NSURLSession");
+    if (!s) {
+        aq_add(@"网络观察未安装: 系统类缺失");
+        return NO;
+    }
+    int n = 0;
+    Method m1 = class_getInstanceMethod(s, @selector(dataTaskWithRequest:));
+    if (m1) {
+        aq_orig_dataTask = (aq_task_fn)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)&aq_my_dataTask);
+        n += 1;
+    }
+    Method m2 = class_getInstanceMethod(s, @selector(dataTaskWithRequest:completionHandler:));
+    if (m2) {
+        aq_orig_dataTaskCB = (aq_task_cb_fn)method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)&aq_my_dataTaskCB);
+        n += 1;
+    }
+    if (n == 0) {
+        aq_add(@"网络观察未安装: 找不到请求方法");
+        return NO;
+    }
+    g_netInstalled = YES;
+    aq_add(@"网络观察已安装（%d 个入口，只记录不修改）", n);
+    aq_copy();
+    return YES;
+}
+
+// 只读检查：卡密类有没有现成的单例入口（方便后面复用原版对象）。
+static void aq_probe_license_class(void) {
+    Class cls = NSClassFromString(@"_0x2F9C7E14");
+    if (!cls) {
+        aq_add(@"伪造激活: 卡密类不存在");
+        return;
+    }
+    const char *names[6] = { "sharedInstance", "shared", "defaultManager",
+                             "manager", "instance", "defaultInstance" };
+    NSMutableString *hit = [NSMutableString string];
+    for (int i = 0; i < 6; i++) {
+        SEL sel = NSSelectorFromString([NSString stringWithUTF8String:names[i]]);
+        if ([cls respondsToSelector:sel]) [hit appendFormat:@"%s ", names[i]];
+    }
+    aq_add(@"伪造激活: 卡密类的现成入口=%@", hit.length ? hit : @"没有");
+}
+
+// 尝试写入一份「已激活」状态（只在本地内存里调用原版写入方法，不改任何文件）。
+// 目的：让原版以为自己已经被激活，从而放行面板。失败会被捕获并记录。
+static void aq_try_fake_activation(NSString *reason) {
+    if (g_fakeTried) return;
+    g_fakeTried = YES;
+    Class cls = NSClassFromString(@"_0x2F9C7E14");
+    if (!cls) {
+        aq_add(@"伪造激活: 卡密类不存在");
+        aq_copy();
+        return;
+    }
+    @try {
+        id inst = [[cls alloc] init];
+        SEL sel = NSSelectorFromString(@"v470d683f8c0e8f:endTime:");
+        if (!inst || ![inst respondsToSelector:sel]) {
+            aq_add(@"伪造激活: 写入方法不存在");
+            aq_copy();
+            return;
+        }
+        id end = [NSDate dateWithTimeIntervalSince1970:4102444800.0];   // 2100 年
+        // ARC 下不能直接调 objc_msgSend，先落到同类型函数指针再调用。
+        void (*fn)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
+        fn(inst, sel, @"AQ88888888", end);
+        aq_add(@"伪造激活: 已尝试写入测试状态（%@）", reason ?: @"阶段");
+        aq_copy();
+    } @catch (NSException *e) {
+        aq_add(@"伪造激活失败: %@", e.reason ?: @"未知异常");
+        aq_copy();
+    }
 }
 
 static void aq_dump_defaults(NSString *tag) {
@@ -1106,6 +1278,10 @@ static void aq_tick(void) {
     if (g_found && !g_hookInstalled && g_hookTries < 3 && aq_now() >= 0.5) {
         aq_install_hooks();
     }
+    // 0.6 秒起装上网络观察：校验请求一发出就能把地址和返回内容记下来。
+    if (!g_netInstalled && g_netTries < 2 && aq_now() >= 0.6) {
+        aq_install_net();
+    }
     // 这一版不替换原版任何方法（上一版替换后弹窗刚出现就无声退出）。
     // 只读盯着数据段那组常量：原版若自己改了它，这里会留痕。
     if (g_found && aq_now() >= 1.5) {
@@ -1237,6 +1413,17 @@ static void aq_tick(void) {
                 aq_copy();
             }
             aq_show();
+        });
+    }
+    // 校验结果出现 2.5 秒后，尝试写一份「已激活」状态，看原版会不会因此放行面板。
+    // 放到主线程执行；即使这一下出错，前面看到的记录也已经落盘。
+    BOOL fakeDue = (g_resultAlert && aq_now() - g_resultFirstSeen >= 2.5);
+    if (!fakeDue && !g_resultAlert && aq_now() >= 18.0) fakeDue = YES;   // 兜底
+    if (fakeDue && !g_fakeScheduled) {
+        g_fakeScheduled = YES;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            aq_probe_license_class();
+            aq_try_fake_activation(g_resultAlert ? @"校验结果之后" : @"18秒兜底");
         });
     }
     if ((g_tick % 20) == 0) aq_copy();
