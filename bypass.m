@@ -64,17 +64,20 @@ static BOOL g_uiDumped = NO;
 static int g_dismissed = 0;
 static BOOL g_gate25 = NO;
 static BOOL g_gate9 = NO;
-static int g_activeTick = -1;
 static BOOL g_haveKeys = NO;
 static KeyState g_lastKeys = {0, 0, 0, 0};
 static int g_keyLogCount = 0;
 static BOOL g_panelFound = NO;
 static int g_lastPanelCount = -1;
 static int g_panelChecks = 0;
+static int g_genuineRuns = 0;
+static BOOL g_genuineDone = NO;
+static BOOL g_genuineQueued = NO;
+static double g_lastGenuineAt = -1;
 
-static BOOL aq_set_active_flags(void *o);
 static NSString *aq_snapshot(void);
 static void aq_copy(void);
+static void aq_genuine_activate(NSString *tag);
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -248,14 +251,9 @@ static void aq_handle_license_alert(void) {
                 aq_add(@"发现卡密弹窗，自动关闭：标题=%@ 正文=%@",
                        a.title ?: @"(无)", a.message ?: @"(无)");
             }
-            // 弹窗出现说明失败流程刚把"已激活"标记清过，立刻补回来，
-            // 让紧接着的那次总门检查直接通过。
-            @try {
-                void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
-                void *lo = f_obj();
-                if (lo) aq_set_active_flags(lo);
-            } @catch (NSException *e) {
-            }
+            // 弹窗出现说明失败流程刚把"已激活"标记清过：按原版成功顺序
+            // 再完整走一遍（封存/安装密钥/收尾），让紧接着的检查通过。
+            aq_genuine_activate(@"弹窗时");
 
             [a dismissViewControllerAnimated:NO completion:nil];
             g_dismissed += 1;
@@ -267,36 +265,6 @@ static void aq_handle_license_alert(void) {
         }
     } @catch (NSException *e) {
     }
-}
-
-// 运行中调用原版“安装设备密钥”：不改任何代码，只让它自己写数据。
-// 只在密钥被清空（k50 == 0）时补装，避免频繁改写让下游解密对不上。
-static int g_reinstallCount = 0;
-static double g_lastInstallAt = -1;
-
-static void aq_reinstall_keys(void) {
-    if (!g_found || g_reinstallCount >= 400) return;
-    double now = aq_now();
-    if (g_lastInstallAt >= 0 && now - g_lastInstallAt < 0.15) return;
-    g_lastInstallAt = now;
-    g_reinstallCount += 1;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        KeyState before = aq_read_keys();
-        @try {
-            void (*fn)(void) = (void (*)(void))(g_slide + 0x814F44);
-            fn();
-        } @catch (NSException *e) {
-            aq_add(@"补装密钥异常: %@", e.reason ?: @"未知");
-            aq_copy();
-            return;
-        }
-        KeyState after = aq_read_keys();
-        if (g_reinstallCount <= 10 || (g_reinstallCount % 25) == 0) {
-            aq_add(@"补装密钥 #%d: %@ -> %@", g_reinstallCount,
-                   aq_key_desc(before), aq_key_desc(after));
-            aq_copy();
-        }
-    });
 }
 
 // 取所有窗口：场景里的窗口 + 应用自己的窗口列表，两路合并去重。
@@ -339,65 +307,55 @@ static uint32_t aq_rd32(void *p, size_t off) {
     return v;
 }
 
-// 成功路径（0x80CC9C）把 +0x8E、+0x92 置 1；失败流程（0x7F892C）把它们清零。
-// 面板总门正是读这两个位置来选分支。
-// 这里按成功路径的取值补齐，再调用原版封存函数让结构重新自洽
-// （封存只读这两个字段并重写结构区，不会把字段改回去）。
-static int g_flagFixCount = 0;
 
-static BOOL aq_set_active_flags(void *o) {
-    if (!o) return NO;
-    uint32_t v8e = aq_rd32(o, 0x8E);
-    uint32_t v92 = aq_rd32(o, 0x92);
-    if (v8e == 1 && v92 == 1) return NO;
+// 原版真正激活成功的收尾在 0x80DD54，顺序是：
+//   封存(0x814DF4) -> 安装设备密钥(0x814F44) -> 收尾初始化(0x814FEC)
+// 三步必须按原版顺序完整走一遍；缺了最后一步，后续校验仍按"未激活"处理，
+// 弹窗会照旧出现，游戏开始渲染后也会闪退。这里按原版顺序完整补上。
+static void aq_genuine_activate(NSString *tag) {
+    if (!g_found) return;
+    if (g_genuineRuns >= 3) return;
+    double now = aq_now();
+    if (g_lastGenuineAt >= 0 && now - g_lastGenuineAt < 0.6) return;
+    g_lastGenuineAt = now;
+    g_genuineRuns += 1;
+
+    void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
+    void *o = NULL;
+    @try { o = f_obj(); } @catch (NSException *e) { }
+    if (!o) {
+        aq_add(@"%@ 激活序列: 许可证对象为空，稍后重试", tag);
+        aq_copy();
+        return;
+    }
+
     uint32_t one = 1;
     memcpy((char *)o + 0x8E, &one, 4);
     memcpy((char *)o + 0x92, &one, 4);
-    void (*f_seal)(void *) = (void (*)(void *))(g_slide + 0x814DF4);
-    @try { f_seal(o); } @catch (NSException *e) { }
-    g_flagFixCount += 1;
-    if (g_flagFixCount <= 10 || (g_flagFixCount % 30) == 0) {
-        aq_add(@"激活标记补齐 #%d: 8E %u->1, 92 %u->1",
-               g_flagFixCount, v8e, v92);
-        aq_copy();
-    }
-    return YES;
-}
 
-static int g_restoreDone = 0;
-
-// 恢复原始状态：把两个标记写回 0 并重新封存。
-// 游戏画面开始渲染时原版会走一条更严格的校验，带着"已激活"标记容易被它判断异常；
-// 所以面板该出的时候出完，就尽快恢复成原样，避免后续闪退。
-static void aq_restore_flags(void) {
-    if (!g_found) return;
-    void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
-    void *o = NULL;
-    @try { o = f_obj(); } @catch (NSException *e) { }
-    if (!o) return;
-    uint32_t v8e = aq_rd32(o, 0x8E);
-    uint32_t v92 = aq_rd32(o, 0x92);
-    if (v8e == 0 && v92 == 0) return;
-    uint32_t zero = 0;
-    memcpy((char *)o + 0x8E, &zero, 4);
-    memcpy((char *)o + 0x92, &zero, 4);
     void (*f_seal)(void *) = (void (*)(void *))(g_slide + 0x814DF4);
+    void (*f_install)(void) = (void (*)(void))(g_slide + 0x814F44);
+    void (*f_finish)(void) = (void (*)(void))(g_slide + 0x814FEC);
+
     @try { f_seal(o); } @catch (NSException *e) { }
-    int v = -100;
-    int (*f_val)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
-    @try { v = f_val(o); } @catch (NSException *e) { }
-    aq_add(@"已恢复原始状态: 8E %u->0, 92 %u->0, 校验=%d", v8e, v92, v);
+    aq_add(@"%@ 激活序列 1/3 封存完成", tag);
     aq_copy();
-}
 
-// 每秒确认一次：失败流程可能会再把标记清零，发现就补回来。
-static void aq_keep_active(void) {
-    if (!g_found || g_panelFound) return;
-    void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
-    void *o = NULL;
-    @try { o = f_obj(); } @catch (NSException *e) { }
-    if (!o) return;
-    aq_set_active_flags(o);
+    @try { f_install(); } @catch (NSException *e) { }
+    aq_add(@"%@ 激活序列 2/3 设备密钥已安装 %@", tag, aq_key_desc(aq_read_keys()));
+    aq_copy();
+
+    @try { f_finish(); } @catch (NSException *e) { }
+    aq_add(@"%@ 激活序列 3/3 收尾完成", tag);
+    aq_copy();
+
+    int (*f_val)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
+    int v = -100;
+    @try { v = f_val(o); } @catch (NSException *e) { }
+    aq_add(@"%@ 激活后 8E=%u 92=%u 校验=%d", tag,
+           aq_rd32(o, 0x8E), aq_rd32(o, 0x92), v);
+    aq_copy();
+    g_genuineDone = YES;
 }
 
 static void aq_probe_gate(NSString *tag) {
@@ -439,50 +397,12 @@ static void aq_probe_gate(NSString *tag) {
             int (*f_val)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
             int v0 = -100;
             @try { v0 = f_val(o1); } @catch (NSException *e) { }
-            aq_add(@"%@ 封存前校验=%d", tag, v0);
+            aq_add(@"%@ 结构校验=%d（只读，不主动改写）", tag, v0);
             aq_copy();
-
-            // 用原版自己的"封存"函数把结构补齐（0x814DF4 只写这 39 字节的结构，
-            // 不改对象里的其它字段），然后再校验一次。
-            void (*f_seal)(void *) = (void (*)(void *))(g_slide + 0x814DF4);
-            @try { f_seal(o1); } @catch (NSException *e) { }
+        } else {
+            aq_add(@"%@ 许可证对象为空", tag);
             aq_copy();
-            int v1 = -100;
-            @try { v1 = f_val(o1); } @catch (NSException *e) { }
-            aq_add(@"%@ 封存后校验=%d", tag, v1);
-            aq_copy();
-
-            // 关键一步：把失败流程清零的两个"已激活"标记改回成功路径的取值，
-            // 再重新封存，让结构校验保持通过。
-            if (aq_set_active_flags(o1)) {
-                aq_copy();
-                int v2 = -100;
-                @try { v2 = f_val(o1); } @catch (NSException *e) { }
-                aq_add(@"%@ 补齐激活后校验=%d", tag, v2);
-                aq_copy();
-            }
         }
-
-        // 对象为空时总门内部会解引用空指针，直接跳过，避免白闪退。
-        if (!o1) {
-            aq_add(@"%@ 许可证对象为空，面板总门跳过", tag);
-            aq_copy();
-            return;
-        }
-        aq_add(@"%@ 调用门前 8E=%08X 92=%08X", tag,
-               aq_rd32(o1, 0x8E), aq_rd32(o1, 0x92));
-        aq_copy();
-        int (*f_gate)(void) = (int (*)(void))(g_slide + 0xA112C8);
-        int gate = -100;
-        @try { gate = f_gate(); } @catch (NSException *e) { }
-        aq_add(@"%@ 面板总门=%d", tag, gate);
-        aq_copy();
-        int v3 = -100;
-        int (*f_val2)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
-        @try { v3 = f_val2(o1); } @catch (NSException *e) { }
-        aq_add(@"%@ 调用门后 8E=%08X 92=%08X 校验=%d", tag,
-               aq_rd32(o1, 0x8E), aq_rd32(o1, 0x92), v3);
-        aq_copy();
     });
 }
 
@@ -695,25 +615,17 @@ static void aq_tick(void) {
     g_tick += 1;
     if (!g_found) aq_locate();
     if (g_found && !g_impsLogged) aq_log_imps();
-    // 纯数据模式：不碰代码、不碰方法，只在密钥被清空时让原版自己补装。
-    // 卡密失败流程会把 k50 清零，这里检测到就补装一次，使面板自检能通过。
-    if (g_found && !g_panelFound && aq_now() >= 0.5 && aq_now() < 120.0) {
-        KeyState cur = aq_read_keys();
-        if (cur.k50 == 0) aq_reinstall_keys();
-    }
-    // 尽量早地把"已激活"标记补上（原版可能在弹窗关闭后马上做判断），
-    // 但只补有限几次，避免高频写入干扰原版自身的校验。
-    if (g_found && !g_panelFound && aq_now() >= 0.5 && aq_now() < 11.5 && g_flagFixCount < 6) {
-        int slot = (int)(aq_now() * 10);
-        if (slot != g_activeTick) {
-            g_activeTick = slot;
-            dispatch_async(dispatch_get_main_queue(), ^{ aq_keep_active(); });
+    // 按原版真正的成功顺序完整激活一次（封存/安装密钥/收尾）。
+    // 只做一次，之后不再反复改写，避免打乱原版自己的后续校验。
+    // 用 queued 标记保证主线程被卡住时也只排一个任务进去。
+    if (g_found && !g_genuineDone && !g_genuineQueued && aq_now() >= 1.0) {
+        if (g_genuineRuns == 0 || aq_now() - g_lastGenuineAt >= 1.5) {
+            g_genuineQueued = YES;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                g_genuineQueued = NO;
+                aq_genuine_activate(g_genuineRuns == 0 ? @"启动时" : @"重试");
+            });
         }
-    }
-    // 面板该出的时候已经出完：14 秒时恢复原样，规避游戏开始渲染后的严格校验。
-    if (g_found && !g_panelFound && !g_restoreDone && aq_now() >= 14.0) {
-        g_restoreDone = 1;
-        dispatch_async(dispatch_get_main_queue(), ^{ aq_restore_flags(); });
     }
     // 校验链探测：2.6 秒一次（卡密流程刚走完），9 秒一次（弹窗关掉之后）。
     if (g_found && !g_gate25 && aq_now() >= 2.6) {
