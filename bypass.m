@@ -6,29 +6,29 @@
 //   因此这里一个字节都不改 aqaw 的机器码，只在运行时观察它、并替换它
 //   调用系统函数时用的指针槽。
 //
-// 这一版做什么（零 .text 修改，只用系统运行时换方法实现）：
-//   1. 把目标库调用 dispatch_async / dispatch_after 用的两个指针槽换成观察函数，
-//      记录它丢出去的每个 block 的位置、来源和携带的数据，然后原样交给系统调度；
+// 这一版做什么（零 .text 修改，也不替换原版任何方法）：
+//   1. 把目标库调用系统函数时用的几个指针槽换成观察函数：dispatch_async /
+//      dispatch_after 只记录它的调度块；exit / _exit / kill / pthread_kill /
+//      terminate / syscall 则记录并拦下，避免进程被无声结束；
 //   2. 只读监视数据段里那组四个字（原版自带的常量表）。实测强行改写会让原版
 //      走到不存在的分支、主线程卡死并被系统杀掉，所以这里只看不写；
 //   3. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7）和界面上
 //      新出现的混淆类名；面板一旦出现就取消隐藏；
-//   4. 只读地记录密钥、许可证对象、结构校验结果和窗口构成变化；
+//   4. 只读地记录密钥、许可证状态指针（并打出它前 32 字节的内容）、窗口构成变化；
 //   5. 卡密弹窗出现后约 1.5 秒，自动往输入框填一个测试卡密并触发「验证」按钮，
-//      目的只是让原版自己发出网络请求：所有请求地址、请求头和返回内容都会被
-//      记下来，据此判断"激活成功"到底需要什么返回格式；
-//   6. 同时观察钥匙串读写（服务名 / 账号 / 内容）和本地存储，卡密处理方法的
-//      入参和结果也会被记录 —— 这些都是只读记录，原版逻辑照常执行；
-//   7. 弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
-//   8. 大约 30 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板；
-//   9. 异常现场自救：捕获崩溃信号和未捕获异常，把出错指令、来源地址和访问
+//      让原版走完它自己的流程；本地存储会在开局和 30 秒各看一次，用来判断
+//      原版把激活结果存在哪里；
+//   6. 弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
+//   7. 大约 30 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板；
+//   8. 异常现场自救：捕获崩溃信号和未捕获异常，把出错指令、来源地址和访问
 //      地址写进沙盒文件；再检测主线程是否被卡死（被系统看门狗杀掉时不会
-//      有任何信号，只能靠这条路记下来）。下次启动时读出来放在记录最前面。
+//      有任何信号，只能靠这条路记下来）。每次启动还会把上一次运行的日志
+//      尾巴读回来 —— 万一进程是被原版悄悄结束的，也能看到最后一步。
 //
-// 为什么不再伪造激活状态：
-//   实测只要把状态改成「已激活」，原版就会带着这份状态进入自身的加密校验，
-//   校验不通过就执行终止指令（闪退）。所以不再直接改状态，改为观察原版
-//   自己的卡密流程，再从它信任的那一步入手。
+// 为什么不再替换原版方法：
+//   上一版替换了原版的卡密处理方法和钥匙串方法，结果弹窗刚出现进程就无声
+//   结束、还没留下崩溃信号 —— 原版很可能在校验自己的方法实现。所以这一版
+//   只换系统函数的指针槽，原版自己的方法一条都不碰。
 //
 // 仍然不做的事：
 //   * 不修改磁盘上的任何文件；
@@ -56,6 +56,7 @@
 #import <stdint.h>
 #import <string.h>
 #import <stdlib.h>
+#import <stdarg.h>
 #import <signal.h>
 #import <unistd.h>
 #import <fcntl.h>
@@ -110,12 +111,6 @@ static BOOL g_autoTried = NO;
 static NSMutableSet *g_seenAlertMsgs = nil;
 static BOOL g_defsLogged1 = NO;
 static BOOL g_defsLogged2 = NO;
-static BOOL g_obsInstalled = NO;
-static int g_obsTries = 0;
-static IMP g_origResp = NULL, g_origData = NULL, g_origDone = NULL, g_origRedir = NULL;
-static IMP g_origKcSave = NULL, g_origKcFetch = NULL;
-static IMP g_origLicA = NULL, g_origLicB = NULL, g_origLicC = NULL;
-static int g_netLogs = 0;
 static int g_mainBeats = 0;
 static int g_mainSeen = 0;
 static double g_lastMainMove = 0;
@@ -605,6 +600,58 @@ static void aq_my_after(dispatch_time_t t, dispatch_queue_t q, dispatch_block_t 
     if (aq_real_after) aq_real_after(t, q, b);
 }
 
+// 原版若自己调用退出 / 终止函数，这里先记一笔再拦下，避免进程无声消失。
+typedef int (*aq_kill_fn)(int, int);
+typedef int (*aq_pthread_kill_fn)(void *, int);
+static aq_kill_fn aq_real_kill = NULL;
+static aq_pthread_kill_fn aq_real_pthread_kill = NULL;
+
+static BOOL aq_fatal_sig(int sig) {
+    return sig == SIGKILL || sig == SIGABRT || sig == SIGSEGV ||
+           sig == SIGBUS || sig == SIGILL || sig == SIGTRAP;
+}
+
+static void aq_my__exit(int code) {
+    aq_add(@"原版调用了退出函数(%d)，已拦下", code);
+}
+static void aq_my_terminate(void) {
+    aq_add(@"原版调用了终止函数，已拦下");
+}
+static int aq_my_kill(int pid, int sig) {
+    if (pid == getpid() || pid == 0 || pid == -1) {
+        aq_add(@"原版向自己发送信号 sig=%d，已拦下", sig);
+        return 0;
+    }
+    return aq_real_kill ? aq_real_kill(pid, sig) : 0;
+}
+static int aq_my_pthread_kill(void *th, int sig) {
+    if (aq_fatal_sig(sig)) {
+        aq_add(@"原版向线程发送致命信号 sig=%d，已拦下", sig);
+        return 0;
+    }
+    return aq_real_pthread_kill ? aq_real_pthread_kill(th, sig) : 0;
+}
+
+// 有些保护会绕过 exit/_exit，直接用 syscall(1, ...) 结束进程，这里一并拦。
+typedef long (*aq_syscall_fn)(long, long, long, long, long, long, long);
+static aq_syscall_fn aq_real_syscall = NULL;
+static long aq_my_syscall(long n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    long a = va_arg(ap, long), b = va_arg(ap, long), c = va_arg(ap, long);
+    long d = va_arg(ap, long), e = va_arg(ap, long), f = va_arg(ap, long);
+    va_end(ap);
+    if (n == 1) {   // 1 = exit
+        aq_add(@"原版调用了间接退出调用(exit, 参数=%ld)，已拦下", a);
+        return -1;
+    }
+    if (n == 37 && (a == getpid() || a == 0 || a == -1)) {   // 37 = kill
+        aq_add(@"原版通过间接调用向自己发信号 sig=%ld，已拦下", b);
+        return -1;
+    }
+    return aq_real_syscall ? aq_real_syscall(n, a, b, c, d, e, f) : -1;
+}
+
 static BOOL aq_install_hooks(void) {
     if (!g_found) return NO;
     g_hookTries += 1;
@@ -615,11 +662,19 @@ static BOOL aq_install_hooks(void) {
         aq_copy();
         return NO;
     }
-    struct { uintptr_t slot; void *fn; } hook[2] = {
+    aq_real_syscall = (aq_syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
+    aq_real_kill = (aq_kill_fn)dlsym(RTLD_DEFAULT, "kill");
+    aq_real_pthread_kill = (aq_pthread_kill_fn)dlsym(RTLD_DEFAULT, "pthread_kill");
+    struct { uintptr_t slot; void *fn; } hook[7] = {
         { 0x13E0628, (void *)&aq_my_async },
         { 0x13E0620, (void *)&aq_my_after },
+        { 0x13E0570, (void *)&aq_my__exit },
+        { 0x13E07C0, (void *)&aq_my_kill },
+        { 0x13E09C0, (void *)&aq_my_pthread_kill },
+        { 0x13E04C8, (void *)&aq_my_terminate },
+        { 0x13E0B00, (void *)&aq_my_syscall },
     };
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 7; i++) {
         uintptr_t slot = (uintptr_t)(g_slide + hook[i].slot);
         uintptr_t page = slot & ~(uintptr_t)0x3FFF;
         kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
@@ -637,7 +692,7 @@ static BOOL aq_install_hooks(void) {
                    VM_PROT_READ | VM_PROT_WRITE);
     }
     g_hookInstalled = YES;
-    aq_add(@"调度观察已安装（只记录，不改任何结果）");
+    aq_add(@"调度与退出观察已安装（只记录，退出类调用会被拦下）");
     aq_copy();
     return YES;
 }
@@ -648,194 +703,6 @@ static NSString *aq_trunc(NSString *s, NSUInteger cap) {
     if (!s) return @"(空)";
     if (s.length <= cap) return s;
     return [[s substringToIndex:cap] stringByAppendingString:@"…"];
-}
-
-static NSString *aq_desc(id o) {
-    if (!o) return @"(空)";
-    @try {
-        if ([o isKindOfClass:[NSString class]]) return aq_trunc(o, 220);
-        if ([o isKindOfClass:[NSData class]]) {
-            NSData *d = (NSData *)o;
-            NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-            if (s) return aq_trunc(s, 300);
-            return [NSString stringWithFormat:@"数据 %lu 字节（非文本）", (unsigned long)d.length];
-        }
-        return aq_trunc([o description], 220);
-    } @catch (NSException *e) {
-        return @"(无法显示)";
-    }
-}
-
-static void aq_log_request(NSURLSessionTask *t) {
-    @try {
-        NSURLRequest *req = t.originalRequest ?: t.currentRequest;
-        if (!req) return;
-        aq_add(@"网络请求: %@ %@", req.HTTPMethod ?: @"?", req.URL.absoluteString ?: @"?");
-        if (req.HTTPBody.length) {
-            NSString *b = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
-            if (b) aq_add(@"请求内容: %@", aq_trunc(b, 320));
-            else aq_add(@"请求内容: %lu 字节（非文本）", (unsigned long)req.HTTPBody.length);
-        }
-        NSDictionary *h = req.allHTTPHeaderFields;
-        if (h.count) aq_add(@"请求头: %@", aq_trunc([h description], 320));
-    } @catch (NSException *e) {
-    }
-}
-
-static void aq_obs_resp(id self, SEL _cmd, NSURLSession *s, NSURLSessionDataTask *t,
-                        NSURLResponse *r, void (^h)(NSURLSessionResponseDisposition)) {
-    @try {
-        if (g_netLogs < 40) {
-            g_netLogs += 1;
-            aq_log_request(t);
-            if ([r isKindOfClass:[NSHTTPURLResponse class]]) {
-                NSHTTPURLResponse *hr = (NSHTTPURLResponse *)r;
-                aq_add(@"网络响应: 状态码 %ld", (long)hr.statusCode);
-            } else {
-                aq_add(@"网络响应: %@", NSStringFromClass([r class]));
-            }
-            aq_copy();
-        }
-    } @catch (NSException *e) {
-    }
-    if (g_origResp) {
-        ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *,
-                   void (^)(NSURLSessionResponseDisposition)))g_origResp)(self, _cmd, s, t, r, h);
-    }
-}
-
-static void aq_obs_data(id self, SEL _cmd, NSURLSession *s, NSURLSessionDataTask *t, NSData *data) {
-    @try {
-        if (g_netLogs < 40) {
-            g_netLogs += 1;
-            aq_add(@"网络数据: %@", aq_desc(data));
-            aq_copy();
-        }
-    } @catch (NSException *e) {
-    }
-    if (g_origData) {
-        ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))g_origData)(self, _cmd, s, t, data);
-    }
-}
-
-static void aq_obs_done(id self, SEL _cmd, NSURLSession *s, NSURLSessionTask *t, NSError *e) {
-    @try {
-        if (g_netLogs < 40) {
-            g_netLogs += 1;
-            NSString *u = t.originalRequest.URL.absoluteString ?: t.currentRequest.URL.absoluteString;
-            aq_add(@"网络结束: %@ %@", aq_trunc(u, 200),
-                   e ? [NSString stringWithFormat:@"失败=%@", aq_trunc(e.localizedDescription, 160)]
-                     : @"成功");
-            aq_copy();
-        }
-    } @catch (NSException *x) {
-    }
-    if (g_origDone) {
-        ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))g_origDone)(self, _cmd, s, t, e);
-    }
-}
-
-static void aq_obs_redir(id self, SEL _cmd, NSURLSession *s, NSURLSessionTask *t,
-                         NSURLResponse *r, NSURLRequest *req, void (^h)(NSURLRequest *)) {
-    @try {
-        if (g_netLogs < 40) {
-            g_netLogs += 1;
-            aq_add(@"网络跳转: %@", aq_trunc(req.URL.absoluteString, 220));
-            aq_copy();
-        }
-    } @catch (NSException *e) {
-    }
-    if (g_origRedir) {
-        ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSURLResponse *, NSURLRequest *,
-                   void (^)(NSURLRequest *)))g_origRedir)(self, _cmd, s, t, r, req, h);
-    }
-}
-
-static void aq_log_keychain(NSString *tag, id self, BOOL result) {
-    @try {
-        id svc = nil, acc = nil, pwd = nil, pd = nil;
-        @try { svc = [self valueForKey:@"service"]; } @catch (NSException *e) {}
-        @try { acc = [self valueForKey:@"account"]; } @catch (NSException *e) {}
-        @try { pwd = [self valueForKey:@"password"]; } @catch (NSException *e) {}
-        @try { pd = [self valueForKey:@"passwordData"]; } @catch (NSException *e) {}
-        aq_add(@"钥匙串%@: 结果=%d 服务=%@ 账号=%@ 内容=%@ 数据=%lu字节",
-               tag, (int)result, aq_desc(svc), aq_desc(acc), aq_desc(pwd),
-               (unsigned long)([pd isKindOfClass:[NSData class]] ? [(NSData *)pd length] : 0));
-        aq_copy();
-    } @catch (NSException *e) {
-    }
-}
-
-static BOOL aq_obs_kc_save(id self, SEL _cmd, NSError **err) {
-    BOOL r = NO;
-    if (g_origKcSave) r = ((BOOL (*)(id, SEL, NSError **))g_origKcSave)(self, _cmd, err);
-    aq_log_keychain(@"保存", self, r);
-    return r;
-}
-
-static BOOL aq_obs_kc_fetch(id self, SEL _cmd, NSError **err) {
-    BOOL r = NO;
-    if (g_origKcFetch) r = ((BOOL (*)(id, SEL, NSError **))g_origKcFetch)(self, _cmd, err);
-    aq_log_keychain(@"读取", self, r);
-    return r;
-}
-
-static void aq_obs_lic_a(id self, SEL _cmd, id a) {
-    aq_add(@"卡密处理: 收到参数 %@", aq_desc(a));
-    aq_copy();
-    if (g_origLicA) ((void (*)(id, SEL, id))g_origLicA)(self, _cmd, a);
-    aq_add(@"卡密处理: 这一轮结束");
-}
-
-static void aq_obs_lic_b(id self, SEL _cmd, id a, id b) {
-    aq_add(@"卡密结果: 参数1=%@ 参数2=%@", aq_desc(a), aq_desc(b));
-    aq_copy();
-    if (g_origLicB) ((void (*)(id, SEL, id, id))g_origLicB)(self, _cmd, a, b);
-}
-
-static void aq_obs_lic_c(id self, SEL _cmd) {
-    aq_add(@"卡密执行: 即将弹出验证框");
-    if (g_origLicC) ((void (*)(id, SEL))g_origLicC)(self, _cmd);
-}
-
-static void aq_install_observers(void) {
-    Class net = objc_getClass("QXRChannel");
-    if (net) {
-        Method m;
-        m = class_getInstanceMethod(net, NSSelectorFromString(@"URLSession:dataTask:didReceiveResponse:completionHandler:"));
-        if (m) g_origResp = method_setImplementation(m, (IMP)aq_obs_resp);
-        m = class_getInstanceMethod(net, NSSelectorFromString(@"URLSession:dataTask:didReceiveData:"));
-        if (m) g_origData = method_setImplementation(m, (IMP)aq_obs_data);
-        m = class_getInstanceMethod(net, NSSelectorFromString(@"URLSession:task:didCompleteWithError:"));
-        if (m) g_origDone = method_setImplementation(m, (IMP)aq_obs_done);
-        m = class_getInstanceMethod(net, NSSelectorFromString(@"URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:"));
-        if (m) g_origRedir = method_setImplementation(m, (IMP)aq_obs_redir);
-        int n = (g_origResp ? 1 : 0) + (g_origData ? 1 : 0) + (g_origDone ? 1 : 0);
-        if (n > 0) aq_add(@"网络观察已安装（%d 项）", n);
-    } else {
-        aq_add(@"网络观察未安装: 网络类还没出现");
-    }
-    Class kc = objc_getClass("_0x8B4F26C1");
-    if (kc) {
-        Method m = class_getInstanceMethod(kc, NSSelectorFromString(@"save:"));
-        if (m) g_origKcSave = method_setImplementation(m, (IMP)aq_obs_kc_save);
-        m = class_getInstanceMethod(kc, NSSelectorFromString(@"fetch:"));
-        if (m) g_origKcFetch = method_setImplementation(m, (IMP)aq_obs_kc_fetch);
-        if (g_origKcSave || g_origKcFetch) aq_add(@"钥匙串观察已安装");
-    }
-    Class lic = objc_getClass("_0x2F9C7E14");
-    if (lic) {
-        Method m;
-        m = class_getInstanceMethod(lic, NSSelectorFromString(@"v59341b48b7a63c:"));
-        if (m) g_origLicA = method_setImplementation(m, (IMP)aq_obs_lic_a);
-        m = class_getInstanceMethod(lic, NSSelectorFromString(@"v470d683f8c0e8f:endTime:"));
-        if (m) g_origLicB = method_setImplementation(m, (IMP)aq_obs_lic_b);
-        m = class_getInstanceMethod(lic, NSSelectorFromString(@"va2429730c25654"));
-        if (m) g_origLicC = method_setImplementation(m, (IMP)aq_obs_lic_c);
-        if (g_origLicA || g_origLicB || g_origLicC) aq_add(@"卡密处理观察已安装");
-    }
-    g_obsInstalled = YES;
-    aq_copy();
 }
 
 static void aq_dump_defaults(NSString *tag) {
@@ -1239,11 +1106,7 @@ static void aq_tick(void) {
     if (g_found && !g_hookInstalled && g_hookTries < 3 && aq_now() >= 0.5) {
         aq_install_hooks();
     }
-    // 网络、钥匙串、卡密处理三处只读观察，尽量在弹窗出现前装好。
-    if (g_found && !g_obsInstalled && g_obsTries < 6 && aq_now() >= 0.6) {
-        g_obsTries += 1;
-        aq_install_observers();
-    }
+    // 这一版不替换原版任何方法（上一版替换后弹窗刚出现就无声退出）。
     // 只读盯着数据段那组常量：原版若自己改了它，这里会留痕。
     if (g_found && aq_now() >= 1.5) {
         aq_watch_flag();
@@ -1297,7 +1160,13 @@ static void aq_tick(void) {
         void *lo = NULL;
         memcpy(&lo, (const void *)(g_slide + 0x1644040), sizeof(lo));
         if (lo != g_lastLicenseObj) {
-            aq_add(@"许可证对象变化 %p → %p", g_lastLicenseObj, lo);
+            aq_add(@"许可证状态指针变化 %p → %p", g_lastLicenseObj, lo);
+            if (lo) {
+                uint32_t w[8] = {0};
+                memcpy(w, lo, sizeof(w));
+                aq_add(@"许可证状态前 32 字节: %08X %08X %08X %08X %08X %08X %08X %08X",
+                       w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            }
             g_lastLicenseObj = lo;
             aq_copy();
         }
@@ -1378,6 +1247,24 @@ static void aqaw_fix_start(void) {
     g_start = [NSProcessInfo processInfo].systemUptime;
     g_text = [NSMutableString string];
     [g_text appendString:@"===== aqaw 处理记录 =====\n"];
+    // 先把上一次运行留下的日志读进来。如果上次是被原版无声结束的，
+    // 这就是唯一能看到"最后走到哪一步"的现场。
+    @try {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(
+                             NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (dir.length) {
+            NSString *lp = [dir stringByAppendingPathComponent:@"aqaw_fix_log.txt"];
+            NSString *prev = [NSString stringWithContentsOfFile:lp
+                                                       encoding:NSUTF8StringEncoding
+                                                          error:nil];
+            if (prev.length > 40) {
+                NSString *tail = prev.length > 2000
+                               ? [prev substringFromIndex:prev.length - 2000] : prev;
+                [g_text appendFormat:@"=== 上次运行最后记录 ===\n%@\n", tail];
+            }
+        }
+    } @catch (NSException *e) {
+    }
     aq_add(@"处理代码已加载");
     aq_install_crash_capture();
 
