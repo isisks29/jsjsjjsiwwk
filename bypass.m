@@ -329,8 +329,10 @@ static aq_after_fn aq_real_after = NULL;
 
 static void aq_note_block(const char *kind, dispatch_block_t b) {
     if (!b || !g_found) return;
+    // ARC 下不能把 block 指针直接当 char* 用，先转成整数地址再读。
+    uintptr_t bb = (uintptr_t)(__bridge void *)b;
     uintptr_t inv = 0;
-    memcpy(&inv, (const char *)b + 0x10, 8);
+    memcpy(&inv, (const void *)(bb + 0x10), 8);
     long off = (long)(inv - (uintptr_t)g_slide);
     if (off <= 0 || off >= 0x1400000) return;   // 不是目标库里的 block
     @synchronized (g_blockSites) {
@@ -344,7 +346,7 @@ static void aq_note_block(const char *kind, dispatch_block_t b) {
     // 按 block 自身登记的大小决定最多读几个字，避免越界。
     uintptr_t desc = 0;
     uint64_t bsize = 0;
-    memcpy(&desc, (const char *)b + 0x18, sizeof(desc));
+    memcpy(&desc, (const void *)(bb + 0x18), sizeof(desc));
     if (desc) memcpy(&bsize, (const void *)(desc + 8), sizeof(bsize));
     int words = 8;
     if (bsize >= 0x20 && bsize < 0x1000) {
@@ -354,7 +356,7 @@ static void aq_note_block(const char *kind, dispatch_block_t b) {
     NSMutableString *dump = [NSMutableString string];
     for (int i = 0; i < words; i++) {      // 覆盖 block+0x20 起的捕获数据
         uint32_t w = 0;
-        memcpy(&w, (const char *)b + 0x20 + i * 4, 4);
+        memcpy(&w, (const void *)(bb + 0x20 + i * 4), 4);
         [dump appendFormat:@"%08X ", w];
     }
     aq_add(@"捕捉到调度 block: %s 位置 +0x%lX 内容 %@", kind, off, dump);
