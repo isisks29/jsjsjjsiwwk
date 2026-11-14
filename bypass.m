@@ -271,40 +271,60 @@ static void aq_try_menu(void) {
     });
 }
 
+// 取所有窗口：场景里的窗口 + 应用自己的窗口列表，两路合并去重。
+// 有些独立创建的窗口不进场景列表，只看场景会漏掉。
 static NSArray<UIWindow *> *aq_all_windows(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return @[];
     NSMutableArray<UIWindow *> *wins = [NSMutableArray array];
     for (UIScene *s in app.connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]]) {
-            [wins addObjectsFromArray:((UIWindowScene *)s).windows];
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (![wins containsObject:w]) [wins addObject:w];
+            }
         }
     }
-    if (wins.count == 0) {
-        NSArray *legacy = [app windows];
-        if (legacy.count) [wins addObjectsFromArray:legacy];
+    @try {
+        for (UIWindow *w in [app windows]) {
+            if (![wins containsObject:w]) [wins addObject:w];
+        }
+    } @catch (NSException *e) {
     }
     return wins;
 }
 
-// 在视图树里找菜单面板相关组件；找到就记录，隐藏的取消隐藏
-static BOOL aq_scan_view(UIView *v, int depth) {
-    if (!v || depth > 5) return NO;
+static int g_viewCount = 0;
+
+// 走一遍视图树：记录每一层（只记前几层，避免内容过长），
+// 同时专门找出面板相关组件；找到时把隐藏状态改回显示。
+static BOOL aq_walk_view(UIView *v, int depth) {
+    if (!v || depth > 8 || g_viewCount >= 40) return NO;
     BOOL hit = NO;
     NSString *cn = NSStringFromClass([v class]);
-    if (cn && ([cn isEqualToString:@"_0x8C2F4D71"] ||
-               [cn isEqualToString:@"_0x1E6B7A93"] ||
-               [cn isEqualToString:@"_0xD4E9A3C7"])) {
+    BOOL panel = cn && ([cn isEqualToString:@"_0x8C2F4D71"] ||
+                        [cn isEqualToString:@"_0x1E6B7A93"] ||
+                        [cn isEqualToString:@"_0xD4E9A3C7"]);
+    if (panel) {
         hit = YES;
-        aq_add(@"发现面板组件 %@ 隐藏=%d 尺寸=%.0fx%.0f",
-               cn, (int)v.hidden, v.frame.size.width, v.frame.size.height);
+        aq_add(@"发现面板组件 %@ 隐藏=%d 透明度=%.2f 尺寸=%.0fx%.0f 位置=%.0f,%.0f",
+               cn, (int)v.hidden, v.alpha, v.frame.size.width, v.frame.size.height,
+               v.frame.origin.x, v.frame.origin.y);
         if (v.hidden) {
             v.hidden = NO;
             aq_add(@"已取消隐藏 %@", cn);
         }
     }
+    if (depth <= 4) {
+        g_viewCount += 1;
+        NSMutableString *pad = [NSMutableString string];
+        for (int i = 0; i < depth; i++) [pad appendString:@"  "];
+        aq_add(@"%@%@ 隐藏=%d 透明=%.2f 尺寸=%.0fx%.0f 子视图=%lu",
+               pad, cn, (int)v.hidden, v.alpha,
+               v.frame.size.width, v.frame.size.height,
+               (unsigned long)v.subviews.count);
+    }
     for (UIView *s in v.subviews) {
-        if (aq_scan_view(s, depth + 1)) hit = YES;
+        if (aq_walk_view(s, depth + 1)) hit = YES;
     }
     return hit;
 }
@@ -313,18 +333,22 @@ static void aq_dump_ui(void) {
     @try {
         NSArray<UIWindow *> *wins = aq_all_windows();
         aq_add(@"界面快照: 共 %lu 个窗口", (unsigned long)wins.count);
+        int panelHits = 0;
         for (UIWindow *w in wins) {
             if (g_win && w == g_win) continue;
             NSString *wcn = NSStringFromClass([w class]);
-            aq_add(@"窗口 %@ 隐藏=%d 层级=%.0f 根=%@",
-                   wcn, (int)w.hidden, w.windowLevel,
+            aq_add(@"窗口 %@ 隐藏=%d 透明度=%.2f 层级=%.0f 根=%@",
+                   wcn, (int)w.hidden, w.alpha, w.windowLevel,
                    NSStringFromClass([w.rootViewController class]));
             if ([wcn isEqualToString:@"_0x8C2F4D71"] && w.hidden) {
                 w.hidden = NO;
                 aq_add(@"已取消隐藏面板窗口 %@", wcn);
             }
-            aq_scan_view(w, 0);
+            g_viewCount = 0;
+            if (aq_walk_view(w, 0)) panelHits += 1;
         }
+        aq_add(@"面板检测结论: %@",
+               panelHits > 0 ? @"面板组件已存在" : @"面板组件完全不存在");
     } @catch (NSException *e) {
         aq_add(@"界面快照失败: %@", e.reason ?: @"未知");
     }
@@ -359,16 +383,21 @@ static void aq_show(void) {
             if (!g_win) {
                 g_prevKey = app.keyWindow;
                 g_win = [[UIWindow alloc] initWithWindowScene:scene];
-                g_win.windowLevel = UIWindowLevelAlert + 10;
+                g_win.windowLevel = UIWindowLevelAlert + 100;
                 UIViewController *root = [[UIViewController alloc] init];
                 root.view.backgroundColor = [UIColor clearColor];
                 g_win.rootViewController = root;
                 [g_win makeKeyAndVisible];
             }
             host = g_win.rootViewController;
+            aq_add(@"信息窗承载: 独立置顶窗口");
         } else {
             UIWindow *w = app.keyWindow;
-            if (!w || !w.rootViewController) return;
+            if (!w || !w.rootViewController) {
+                aq_add(@"信息窗展示失败: 没有可用窗口");
+                return;
+            }
+            aq_add(@"信息窗承载: %@", NSStringFromClass([w class]));
             host = w.rootViewController;
             int depth = 0;
             while (host.presentedViewController && depth < 6) {
@@ -376,7 +405,10 @@ static void aq_show(void) {
                 depth += 1;
             }
         }
-        if (!host) return;
+        if (!host) {
+            aq_add(@"信息窗展示失败: 没有承载界面");
+            return;
+        }
 
         NSString *msg = aq_snapshot();
         if (msg.length > 1100) {
@@ -410,9 +442,11 @@ static void aq_show(void) {
         }]];
 
         g_presenting = YES;
+        aq_add(@"信息窗即将弹出（%lu 字）", (unsigned long)msg.length);
         [host presentViewController:a animated:YES completion:^{
             g_presenting = NO;
             g_shown = YES;
+            aq_add(@"信息窗已弹出");
             g_lastClip = nil;
             aq_copy();
         }];
