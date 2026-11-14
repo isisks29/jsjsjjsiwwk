@@ -6,7 +6,7 @@
 //   因此这里一个字节都不改 aqaw 的机器码，只在运行时观察它、并替换它
 //   调用系统函数时用的指针槽。
 //
-// 这一版做什么（零 .text 修改，也不替换原版任何方法）：
+// 这一版做什么（磁盘文件零修改；只在内存里放行一条卡密检查后的分岔）：
 //   1. 把目标库调用系统函数时用的几个指针槽换成观察函数：dispatch_async /
 //      dispatch_after 只记录它的调度块；exit / _exit / kill / pthread_kill /
 //      terminate / syscall 则记录并拦下，避免进程被无声结束；
@@ -20,14 +20,18 @@
 //      原版把激活结果存在哪里；
 //   6. 记录原版卡密通道的连接地址和收发内容（原版用自带套接字，不走系统网络
 //      组件；只记录，不改请求也不改返回），用来判断校验连的是谁、返回的格式；
-//   7. 看到校验结果后约 2.5 秒，用原版自己的激活状态写入方法写入一份测试状态，
+//   7. 卡密检查走完后，原版会在「要不要创建面板」这个分岔口做一次选择。这里
+//      只在内存里把这一条选择指令固定成「创建面板」一支：磁盘文件一个字节都
+//      不动，卡密检查以外的流程也不碰。6 秒面板仍未出现时，再把原版这条检查
+//      流程唤醒一次。
+//   8. 看到校验结果后约 2.5 秒，用原版自己的激活状态写入方法写入一份测试状态，
 //      看面板会不会因此放行；出现成功提示时自动点「确定」并把卡密输入框收起，
 //      失败提示 4 秒后自动收起，避免挡住面板；
-//   8. 记录原版校验算法实际参与计算的字节和结果（摘要与校验码），用来判断它
+//   9. 记录原版校验算法实际参与计算的字节和结果（摘要与校验码），用来判断它
 //      到底在比对什么；
-//   9. 卡密弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
-//  10. 大约 30 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板；
-//  11. 异常现场自救：捕获崩溃信号和未捕获异常，把出错指令、来源地址和访问
+//  10. 卡密弹窗保留 60 秒供自动验证使用，之后才自动关闭，避免界面卡死；
+//  11. 大约 30 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板；
+//  12. 异常现场自救：捕获崩溃信号和未捕获异常，把出错指令、来源地址和访问
 //      地址写进沙盒文件；再检测主线程是否被卡死（被系统看门狗杀掉时不会
 //      有任何信号，只能靠这条路记下来）。每次启动还会把上一次运行的日志
 //      尾巴读回来 —— 万一进程是被原版悄悄结束的，也能看到最后一步。
@@ -39,7 +43,8 @@
 //
 // 仍然不做的事：
 //   * 不修改磁盘上的任何文件；
-//   * 不修改目标库的任何机器码；
+//   * 只改内存里的一条分岔指令（就是上面第 7 条那个「是否创建面板」的选择），
+//     目标库其它机器码一律不动；
 //   * 不主动调用面板初始化 / 挂载函数（它们依赖启动时的现场，空手调用会崩）；
 //   * 不碰卡密以外的界面。
 //
@@ -112,6 +117,8 @@ static int g_lastPanelCount = -1;
 static int g_panelChecks = 0;
 static BOOL g_hookInstalled = NO;
 static int g_hookTries = 0;
+static BOOL g_panelGatePatched = NO;
+static BOOL g_engineKicked = NO;
 static BOOL g_flagLogged = NO;
 static NSMutableSet *g_blockSites = nil;
 static int g_blockLogs = 0;
@@ -944,6 +951,40 @@ static BOOL aq_install_hooks(void) {
     return YES;
 }
 
+// 卡密检查走完以后，原版在「要不要创建面板」这个分岔口做一次选择。
+// 这里只把这一条选择指令改成固定选择「创建面板」这一支：
+// 改的是内存里的 4 个字节，文件一个字节不动，也不影响卡密检查以外的任何流程。
+static void aq_unlock_panel_gate(void) {
+    if (!g_found || g_panelGatePatched) return;
+    g_panelGatePatched = YES;
+    uintptr_t addr = (uintptr_t)(g_slide + 0xA10D94);
+    uint32_t cur = 0;
+    memcpy(&cur, (const void *)addr, sizeof(cur));
+    if (cur == 0x2A0803FC) {
+        aq_add(@"面板分岔口已经是放行状态");
+        aq_copy();
+        return;
+    }
+    uintptr_t page = addr & ~(uintptr_t)0x3FFF;
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS)
+        kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        aq_add(@"面板分岔口放行失败: 页面不可写 (%d)", (int)kr);
+        aq_copy();
+        return;
+    }
+    uint32_t patch = 0x2A0803FC;   // 固定选择「创建面板」这一支
+    memcpy((void *)addr, &patch, sizeof(patch));
+    __builtin___clear_cache((char *)addr, (char *)(addr + 4));
+    vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    aq_add(@"面板分岔口已放行（原值 %08X，仅内存）", cur);
+    aq_copy();
+}
+
 // ---- 只读观察：网络请求 / 钥匙串 / 卡密处理 -------------------------------
 // 全部用运行时替换方法实现，只记录参数和结果，绝不改文件的任何字节。
 static NSString *aq_trunc(NSString *s, NSUInteger cap) {
@@ -1502,6 +1543,19 @@ static void aq_tick(void) {
     // 尽快装上调度观察（只换两个系统函数指针槽，不改目标库一条指令）。
     if (g_found && !g_hookInstalled && g_hookTries < 3 && aq_now() >= 0.5) {
         aq_install_hooks();
+    }
+    // 0.7 秒时放下面板分岔口：让原版检查完卡密后直接走「创建面板」这一支。
+    if (g_found && !g_panelGatePatched && aq_now() >= 0.7) {
+        aq_unlock_panel_gate();
+    }
+    // 6 秒时面板还没出现，就手动把原版那条检查流程再唤醒一次（不改任何内容）。
+    if (g_found && g_panelGatePatched && !g_engineKicked && !g_panelFound && aq_now() >= 6.0) {
+        g_engineKicked = YES;
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            aq_add(@"面板还没出现，手动唤醒一次原版检查流程");
+            void (*engine)(void) = (void (*)(void))(g_slide + 0xA101F0);
+            engine();
+        });
     }
     // 0.6 秒起装上网络观察：校验请求一发出就能把地址和返回内容记下来。
     if (!g_netInstalled && g_netTries < 2 && aq_now() >= 0.6) {
