@@ -3,15 +3,18 @@
 // 为什么走运行时：
 //   实测原样副本能进、等价改写（行为完全一致，只换一种机器码写法）也闪退，
 //   说明这个库会校验自己的机器码，任何静态改字节的版本都不可能跑起来。
-//   因此这里一个字节都不改 aqaw，只在运行时替它把「设备密钥」装好。
+//   因此这里一个字节都不改 aqaw 的机器码，只在运行时观察它、并替换它
+//   调用系统函数时用的指针槽。
 //
-// 这一版做什么：
-//   1. 只在内存里把未激活时的「面板状态字」改回 0，让原版走它自己的显示分支，
-//      不修改磁盘文件，不改任何机器码，也不改激活状态；
+// 这一版做什么（沿用同类靶场验证过的思路：零 .text 修改）：
+//   1. 只把目标库调用 dispatch_async / dispatch_after 用的两个指针槽
+//      换成观察函数，记录它把哪些 block 丢到主线程、block 里带了什么值
+//      —— 这一步只记录、不改任何结果，用来定位「验卡结果」在哪；
 //   2. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
 //      一旦出现就取消隐藏、并把信息窗收起，确保能看见；
 //   3. 只读地记录密钥、许可证对象和结构校验结果；
-//   4. 卡密弹窗出现时自动关闭，让原版按「未激活」的正常分支继续；
+//   4. 卡密弹窗出现时只关一次（同一个弹窗不重复关），
+//      让原版按「未激活」的正常分支继续；
 //   5. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
 //      用来告诉你走到了哪一步、面板有没有出现。
 //
@@ -41,6 +44,7 @@
 #import <mach/mach.h>
 #import <mach/vm_map.h>
 #import <libkern/OSCacheControl.h>
+#import <dlfcn.h>
 #import <stdint.h>
 #import <string.h>
 
@@ -75,13 +79,15 @@ static int g_keyLogCount = 0;
 static BOOL g_panelFound = NO;
 static int g_lastPanelCount = -1;
 static int g_panelChecks = 0;
-static BOOL g_gatePatched = NO;
-static int g_gatePatchTries = 0;
+static BOOL g_hookInstalled = NO;
+static int g_hookTries = 0;
 static BOOL g_flagLogged = NO;
+static NSMutableSet *g_blockSites = nil;
+static int g_blockLogs = 0;
 
 static NSString *aq_snapshot(void);
 static void aq_copy(void);
-static void aq_clear_panel_flag(void);
+static BOOL aq_install_hooks(void);
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -255,6 +261,8 @@ static void aq_handle_license_alert(void) {
                 aq_add(@"发现卡密弹窗，自动关闭：标题=%@ 正文=%@",
                        a.title ?: @"(无)", a.message ?: @"(无)");
             }
+            // 只关第一次出现的弹窗：反复关同一类弹窗容易把界面弄崩。
+            if (g_dismissed >= 1) return;
             // 只关闭弹窗，不写任何状态：让原版按「未激活」的正常分支继续。
             [a dismissViewControllerAnimated:NO completion:nil];
             g_dismissed += 1;
@@ -309,30 +317,95 @@ static uint32_t aq_rd32(void *p, size_t off) {
 }
 
 
-// 只改一个「面板状态字」，不碰任何机器码：
-// 原版未激活时把这个字置为 1，并据此跳过面板（实测记录也一直是 1）；
-// 这里把它改回 0，让原版走它自己「显示面板」的现成分支。
-// 激活状态、密钥、许可证数据全部保持原样。
-static void aq_clear_panel_flag(void) {
-    if (!g_found) return;
-    g_gatePatchTries += 1;
-    uint32_t v = 0;
-    memcpy(&v, (const void *)(g_slide + 0x16392A0), 4);
-    if (v == 0) {
-        if (!g_gatePatched) {
-            g_gatePatched = YES;
-            aq_add(@"面板状态字已经是 0，无需改写");
-            aq_copy();
-        }
-        return;
+// ---- 调度入口观察（不改目标代码，只换两个系统函数指针槽）------------------
+// 目标库自己也会把「验卡结果」丢到主线程去处理。这里只把它调用
+// dispatch_async / dispatch_after 时用的指针槽换成观察函数，
+// 记下它丢出去的每个 block 在库里的位置和捕获的数据——只记录，不改值。
+typedef void (*aq_async_fn)(dispatch_queue_t, dispatch_block_t);
+typedef void (*aq_after_fn)(dispatch_time_t, dispatch_queue_t, dispatch_block_t);
+
+static aq_async_fn aq_real_async = NULL;
+static aq_after_fn aq_real_after = NULL;
+
+static void aq_note_block(const char *kind, dispatch_block_t b) {
+    if (!b || !g_found) return;
+    uintptr_t inv = 0;
+    memcpy(&inv, (const char *)b + 0x10, 8);
+    long off = (long)(inv - (uintptr_t)g_slide);
+    if (off <= 0 || off >= 0x1400000) return;   // 不是目标库里的 block
+    @synchronized (g_blockSites) {
+        if (!g_blockSites) g_blockSites = [NSMutableSet set];
+        NSString *key = [NSString stringWithFormat:@"%s:%ld", kind, off];
+        if ([g_blockSites containsObject:key]) return;
+        [g_blockSites addObject:key];
+        g_blockLogs += 1;
     }
-    uint32_t z = 0;
-    memcpy((void *)(g_slide + 0x16392A0), &z, 4);
-    g_gatePatched = YES;
-    if (g_gatePatchTries <= 6 || (g_gatePatchTries % 100) == 0) {
-        aq_add(@"面板状态字 %08X → 00000000（只改数据，不改代码）", v);
+    if (g_blockLogs > 24) return;
+    // 按 block 自身登记的大小决定最多读几个字，避免越界。
+    uintptr_t desc = 0;
+    uint64_t bsize = 0;
+    memcpy(&desc, (const char *)b + 0x18, sizeof(desc));
+    if (desc) memcpy(&bsize, (const void *)(desc + 8), sizeof(bsize));
+    int words = 8;
+    if (bsize >= 0x20 && bsize < 0x1000) {
+        words = (int)((bsize - 0x20) / 4);
+        if (words > 8) words = 8;
+    }
+    NSMutableString *dump = [NSMutableString string];
+    for (int i = 0; i < words; i++) {      // 覆盖 block+0x20 起的捕获数据
+        uint32_t w = 0;
+        memcpy(&w, (const char *)b + 0x20 + i * 4, 4);
+        [dump appendFormat:@"%08X ", w];
+    }
+    aq_add(@"捕捉到调度 block: %s 位置 +0x%lX 内容 %@", kind, off, dump);
+    aq_copy();
+}
+
+static void aq_my_async(dispatch_queue_t q, dispatch_block_t b) {
+    aq_note_block("async", b);
+    if (aq_real_async) aq_real_async(q, b);
+}
+
+static void aq_my_after(dispatch_time_t t, dispatch_queue_t q, dispatch_block_t b) {
+    aq_note_block("after", b);
+    if (aq_real_after) aq_real_after(t, q, b);
+}
+
+static BOOL aq_install_hooks(void) {
+    if (!g_found) return NO;
+    g_hookTries += 1;
+    aq_real_async = (aq_async_fn)dlsym(RTLD_DEFAULT, "dispatch_async");
+    aq_real_after = (aq_after_fn)dlsym(RTLD_DEFAULT, "dispatch_after");
+    if (!aq_real_async || !aq_real_after) {
+        aq_add(@"调度观察未安装: 系统函数地址缺失");
         aq_copy();
+        return NO;
     }
+    struct { uintptr_t slot; void *fn; } hook[2] = {
+        { 0x13E0628, (void *)&aq_my_async },
+        { 0x13E0620, (void *)&aq_my_after },
+    };
+    for (int i = 0; i < 2; i++) {
+        uintptr_t slot = (uintptr_t)(g_slide + hook[i].slot);
+        uintptr_t page = slot & ~(uintptr_t)0x3FFF;
+        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr != KERN_SUCCESS)
+            kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                            VM_PROT_READ | VM_PROT_WRITE);
+        if (kr != KERN_SUCCESS) {
+            aq_add(@"调度观察未安装: 指针槽不可写 (%d)", (int)kr);
+            aq_copy();
+            return NO;
+        }
+        memcpy((void *)slot, &hook[i].fn, sizeof(void *));
+        vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                   VM_PROT_READ | VM_PROT_WRITE);
+    }
+    g_hookInstalled = YES;
+    aq_add(@"调度观察已安装（只记录，不改任何结果）");
+    aq_copy();
+    return YES;
 }
 
 static void aq_probe_gate(NSString *tag) {
@@ -600,10 +673,9 @@ static void aq_tick(void) {
     g_tick += 1;
     if (!g_found) aq_locate();
     if (g_found && !g_impsLogged) aq_log_imps();
-    // 3 秒起，在 App 自己做面板判定之前，把未激活时的那个状态字改回 0。
-    // 只改数据，不动任何机器码，也不动激活状态。
-    if (g_found && aq_now() >= 3.0) {
-        aq_clear_panel_flag();
+    // 尽快装上调度观察（只换两个系统函数指针槽，不改目标库一条指令）。
+    if (g_found && !g_hookInstalled && g_hookTries < 3 && aq_now() >= 0.5) {
+        aq_install_hooks();
     }
     // 1 秒时先把面板相关标志记一笔（只读），用来判断面板该不该出现。
     if (g_found && !g_flagLogged && aq_now() >= 1.0) {
@@ -647,7 +719,7 @@ static void aq_tick(void) {
         }
     }
 
-    if ((g_tick % 3) == 0) {
+    if ((g_tick % 10) == 0) {
         dispatch_async(dispatch_get_main_queue(), ^{ aq_handle_license_alert(); });
     }
     if ((g_tick % 10) == 0 && !g_shown && !g_presenting && aq_now() >= 6.0) {
