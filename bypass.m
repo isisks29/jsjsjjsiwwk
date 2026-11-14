@@ -6,8 +6,8 @@
 //   因此这里一个字节都不改 aqaw，只在运行时替它把「设备密钥」装好。
 //
 // 这一版做什么：
-//   1. 只在内存里改「要不要显示面板」那两个判断点，固定选择「显示」，
-//      不修改磁盘文件，也不改任何激活状态；
+//   1. 只在内存里把未激活时的「面板状态字」改回 0，让原版走它自己的显示分支，
+//      不修改磁盘文件，不改任何机器码，也不改激活状态；
 //   2. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
 //      一旦出现就取消隐藏、并把信息窗收起，确保能看见；
 //   3. 只读地记录密钥、许可证对象和结构校验结果；
@@ -81,7 +81,7 @@ static BOOL g_flagLogged = NO;
 
 static NSString *aq_snapshot(void);
 static void aq_copy(void);
-static BOOL aq_patch_gate(void);
+static void aq_clear_panel_flag(void);
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -309,46 +309,30 @@ static uint32_t aq_rd32(void *p, size_t off) {
 }
 
 
-// 只改「要不要把面板显示出来」这两个判断点，别的一概不动：
-//   点一：选了「显示面板」之后，原版还会再问一次状态，这里固定选「继续构建」；
-//   点二：原版会看一个状态字（未激活时是 1）决定跳过面板，这里固定选「构建面板」。
-// 改动只发生在内存里的这两条指令，激活状态、许可证数据、密钥全部保持原样。
-static BOOL aq_patch_gate(void) {
-    if (!g_found) return NO;
+// 只改一个「面板状态字」，不碰任何机器码：
+// 原版未激活时把这个字置为 1，并据此跳过面板（实测记录也一直是 1）；
+// 这里把它改回 0，让原版走它自己「显示面板」的现成分支。
+// 激活状态、密钥、许可证数据全部保持原样。
+static void aq_clear_panel_flag(void) {
+    if (!g_found) return;
     g_gatePatchTries += 1;
-    struct { uintptr_t off; uint32_t from; uint32_t to; } fix[2] = {
-        { 0xA107D4, 0x1A97014Au, 0xD503201Fu },   // 固定选择「准备显示面板」
-        { 0xA10BD8, 0x1A89011Cu, 0x2A0903FCu },   // 固定选择「构建面板」
-    };
-    uintptr_t page = (uintptr_t)(g_slide + fix[0].off) & ~(uintptr_t)0x3FFF;
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        aq_add(@"面板判定改写失败: 内存不可写 (%d)", (int)kr);
-        aq_copy();
-        return NO;
-    }
-    BOOL ok = YES;
-    for (int i = 0; i < 2; i++) {
-        uintptr_t a = (uintptr_t)(g_slide + fix[i].off);
-        uint32_t cur = 0;
-        memcpy(&cur, (const void *)a, 4);
-        if (cur != fix[i].from) {
-            aq_add(@"面板判定改写跳过: 位置%c 原指令不匹配 (%08X)", 'A' + i, cur);
-            ok = NO;
-            continue;
+    uint32_t v = 0;
+    memcpy(&v, (const void *)(g_slide + 0x16392A0), 4);
+    if (v == 0) {
+        if (!g_gatePatched) {
+            g_gatePatched = YES;
+            aq_add(@"面板状态字已经是 0，无需改写");
+            aq_copy();
         }
-        memcpy((void *)a, &fix[i].to, 4);
-        sys_icache_invalidate((void *)a, 4);
+        return;
     }
-    vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
-               VM_PROT_READ | VM_PROT_EXECUTE);
-    if (ok) {
-        g_gatePatched = YES;
-        aq_add(@"面板判定已在内存中改为「显示面板」");
+    uint32_t z = 0;
+    memcpy((void *)(g_slide + 0x16392A0), &z, 4);
+    g_gatePatched = YES;
+    if (g_gatePatchTries <= 6 || (g_gatePatchTries % 100) == 0) {
+        aq_add(@"面板状态字 %08X → 00000000（只改数据，不改代码）", v);
+        aq_copy();
     }
-    aq_copy();
-    return ok;
 }
 
 static void aq_probe_gate(NSString *tag) {
@@ -616,10 +600,10 @@ static void aq_tick(void) {
     g_tick += 1;
     if (!g_found) aq_locate();
     if (g_found && !g_impsLogged) aq_log_imps();
-    // 在 App 自己做面板判定之前，把「要不要显示面板」的两个判断点固定成「显示」。
-    // 激活状态、密钥、许可证数据都不动。
-    if (g_found && !g_gatePatched && g_gatePatchTries < 3 && aq_now() >= 0.15) {
-        aq_patch_gate();
+    // 3 秒起，在 App 自己做面板判定之前，把未激活时的那个状态字改回 0。
+    // 只改数据，不动任何机器码，也不动激活状态。
+    if (g_found && aq_now() >= 3.0) {
+        aq_clear_panel_flag();
     }
     // 1 秒时先把面板相关标志记一笔（只读），用来判断面板该不该出现。
     if (g_found && !g_flagLogged && aq_now() >= 1.0) {
