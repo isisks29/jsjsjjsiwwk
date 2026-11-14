@@ -73,6 +73,8 @@ static int g_lastPanelCount = -1;
 static int g_panelChecks = 0;
 
 static BOOL aq_set_active_flags(void *o);
+static NSString *aq_snapshot(void);
+static void aq_copy(void);
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -86,6 +88,22 @@ static void aq_add(NSString *fmt, ...) {
     NSLog(@"[aqaw-fix] %@", s);
     @synchronized (g_text) {
         if (g_text) [g_text appendFormat:@"[%.2fs] %@\n", aq_now(), s];
+    }
+    // 同时落盘一份：万一闪退，记录还在，可以重新打开读取。
+    @try {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (dir.length) {
+            NSString *path = [dir stringByAppendingPathComponent:@"aqaw_fix_log.txt"];
+            [aq_snapshot() writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    } @catch (NSException *e) {
+    }
+    // 每秒最多把最新记录自动放进剪贴板一次，闪退后也能直接粘贴出来。
+    static double lastAuto = -100.0;
+    double now = aq_now();
+    if (now - lastAuto >= 1.0) {
+        lastAuto = now;
+        aq_copy();
     }
 }
 
@@ -344,6 +362,32 @@ static BOOL aq_set_active_flags(void *o) {
         aq_copy();
     }
     return YES;
+}
+
+static int g_restoreDone = 0;
+
+// 恢复原始状态：把两个标记写回 0 并重新封存。
+// 游戏画面开始渲染时原版会走一条更严格的校验，带着"已激活"标记容易被它判断异常；
+// 所以面板该出的时候出完，就尽快恢复成原样，避免后续闪退。
+static void aq_restore_flags(void) {
+    if (!g_found) return;
+    void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
+    void *o = NULL;
+    @try { o = f_obj(); } @catch (NSException *e) { }
+    if (!o) return;
+    uint32_t v8e = aq_rd32(o, 0x8E);
+    uint32_t v92 = aq_rd32(o, 0x92);
+    if (v8e == 0 && v92 == 0) return;
+    uint32_t zero = 0;
+    memcpy((char *)o + 0x8E, &zero, 4);
+    memcpy((char *)o + 0x92, &zero, 4);
+    void (*f_seal)(void *) = (void (*)(void *))(g_slide + 0x814DF4);
+    @try { f_seal(o); } @catch (NSException *e) { }
+    int v = -100;
+    int (*f_val)(void *) = (int (*)(void *))(g_slide + 0xA1A2D0);
+    @try { v = f_val(o); } @catch (NSException *e) { }
+    aq_add(@"已恢复原始状态: 8E %u->0, 92 %u->0, 校验=%d", v8e, v92, v);
+    aq_copy();
 }
 
 // 每秒确认一次：失败流程可能会再把标记清零，发现就补回来。
@@ -657,13 +701,19 @@ static void aq_tick(void) {
         KeyState cur = aq_read_keys();
         if (cur.k50 == 0) aq_reinstall_keys();
     }
-    // 只在门口检查前后补有限几次标记，避免高频写入干扰原版自身的校验。
-    if (g_found && !g_panelFound && aq_now() >= 2.0 && aq_now() < 10.0 && g_flagFixCount < 6) {
+    // 尽量早地把"已激活"标记补上（原版可能在弹窗关闭后马上做判断），
+    // 但只补有限几次，避免高频写入干扰原版自身的校验。
+    if (g_found && !g_panelFound && aq_now() >= 0.5 && aq_now() < 11.5 && g_flagFixCount < 6) {
         int slot = (int)(aq_now() * 10);
         if (slot != g_activeTick) {
             g_activeTick = slot;
             dispatch_async(dispatch_get_main_queue(), ^{ aq_keep_active(); });
         }
+    }
+    // 面板该出的时候已经出完：14 秒时恢复原样，规避游戏开始渲染后的严格校验。
+    if (g_found && !g_panelFound && !g_restoreDone && aq_now() >= 14.0) {
+        g_restoreDone = 1;
+        dispatch_async(dispatch_get_main_queue(), ^{ aq_restore_flags(); });
     }
     // 校验链探测：2.6 秒一次（卡密流程刚走完），9 秒一次（弹窗关掉之后）。
     if (g_found && !g_gate25 && aq_now() >= 2.6) {
