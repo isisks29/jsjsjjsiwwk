@@ -64,12 +64,15 @@ static BOOL g_uiDumped = NO;
 static int g_dismissed = 0;
 static BOOL g_gate25 = NO;
 static BOOL g_gate9 = NO;
+static int g_activeTick = -1;
 static BOOL g_haveKeys = NO;
 static KeyState g_lastKeys = {0, 0, 0, 0};
 static int g_keyLogCount = 0;
 static BOOL g_panelFound = NO;
 static int g_lastPanelCount = -1;
 static int g_panelChecks = 0;
+
+static BOOL aq_set_active_flags(void *o);
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -227,6 +230,15 @@ static void aq_handle_license_alert(void) {
                 aq_add(@"发现卡密弹窗，自动关闭：标题=%@ 正文=%@",
                        a.title ?: @"(无)", a.message ?: @"(无)");
             }
+            // 弹窗出现说明失败流程刚把"已激活"标记清过，立刻补回来，
+            // 让紧接着的那次总门检查直接通过。
+            @try {
+                void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
+                void *lo = f_obj();
+                if (lo) aq_set_active_flags(lo);
+            } @catch (NSException *e) {
+            }
+
             [a dismissViewControllerAnimated:NO completion:nil];
             g_dismissed += 1;
             if (g_dismissed <= 5 || (g_dismissed % 20) == 0) {
@@ -309,48 +321,39 @@ static uint32_t aq_rd32(void *p, size_t off) {
     return v;
 }
 
-// 按校验函数要求的等式，把"激活结构"补齐成自洽状态。
-// 只写它自己用到的 39 字节结构区和 3 个深偏移字段；
-// 对象偏移 0 可能是虚表/类指针，绝对不碰（改用结构里的输入字让等式成立）。
-static void aq_forge_license(void *o) {
+// 成功路径（0x80CC9C）把 +0x8E、+0x92 置 1；失败流程（0x7F892C）把它们清零。
+// 面板总门正是读这两个位置来选分支。
+// 这里按成功路径的取值补齐，再调用原版封存函数让结构重新自洽
+// （封存只读这两个字段并重写结构区，不会把字段改回去）。
+static int g_flagFixCount = 0;
+
+static BOOL aq_set_active_flags(void *o) {
+    if (!o) return NO;
+    uint32_t v8e = aq_rd32(o, 0x8E);
+    uint32_t v92 = aq_rd32(o, 0x92);
+    if (v8e == 1 && v92 == 1) return NO;
+    uint32_t one = 1;
+    memcpy((char *)o + 0x8E, &one, 4);
+    memcpy((char *)o + 0x92, &one, 4);
+    void (*f_seal)(void *) = (void (*)(void *))(g_slide + 0x814DF4);
+    @try { f_seal(o); } @catch (NSException *e) { }
+    g_flagFixCount += 1;
+    if (g_flagFixCount <= 10 || (g_flagFixCount % 30) == 0) {
+        aq_add(@"激活标记补齐 #%d: 8E %u->1, 92 %u->1",
+               g_flagFixCount, v8e, v92);
+        aq_copy();
+    }
+    return YES;
+}
+
+// 每秒确认一次：失败流程可能会再把标记清零，发现就补回来。
+static void aq_keep_active(void) {
+    if (!g_found || g_panelFound) return;
+    void *(*f_obj)(void) = (void *(*)(void))(g_slide + 0xA1A064);
+    void *o = NULL;
+    @try { o = f_obj(); } @catch (NSException *e) { }
     if (!o) return;
-    uint64_t w0 = aq_rd64(o, 0x219A);
-    uint64_t orig = w0;
-    if (w0 == 0) w0 = 0x9E3779B97F4A7C15ULL;   // 首字为零会直接被判失败
-
-    uint64_t f78 = aq_rd64(o, 0x78);
-    uint64_t d = w0 ^ f78 ^ 0xA5C3E1F7B6D2489AULL;
-    uint32_t hi = (uint32_t)d;                  // 结构里 x4 的高 32 位
-    uint32_t lo = (uint32_t)(d >> 32);          // 结构里 x5 的低 32 位
-    uint64_t x = ((uint64_t)hi << 32) | lo;
-
-    uint32_t f8e = hi ^ (uint32_t)(w0 >> 7) ^ 0x4A9B5206u;
-    uint32_t f92 = hi ^ (uint32_t)(w0 >> 13) ^ 0x8C1A73E5u;
-
-    uint32_t f0 = aq_rd32(o, 0x00);
-    uint32_t w20 = f0 ^ (uint32_t)(w0 >> 19) ^ 0x5F8A16E3u;
-
-    uint32_t t = (hi ^ lo) * 0x45D9F3B7u;
-    t ^= hi;
-    t *= 0x8E4B1395u;
-    t ^= hi;
-    t *= 0x1F3D6A71u;
-    t ^= w20;
-    t ^= t >> 16;
-
-    memcpy((char *)o + 0x219A, &w0, 8);
-    memcpy((char *)o + 0x219E, &x, 8);
-    memcpy((char *)o + 0x21A6, &x, 8);
-    memcpy((char *)o + 0x21AE, &x, 8);
-    memcpy((char *)o + 0x21BA, &w20, 4);
-    memcpy((char *)o + 0x21C2, &t, 4);
-    memcpy((char *)o + 0x78, &d, 8);
-    memcpy((char *)o + 0x8E, &f8e, 4);
-    memcpy((char *)o + 0x92, &f92, 4);
-
-    aq_add(@"伪造激活: 首字 %016llX -> %016llX, 结构字=%016llX, 校验和=%08X",
-           (unsigned long long)orig, (unsigned long long)w0,
-           (unsigned long long)x, t);
+    aq_set_active_flags(o);
 }
 
 static void aq_probe_gate(NSString *tag) {
@@ -405,12 +408,13 @@ static void aq_probe_gate(NSString *tag) {
             aq_add(@"%@ 封存后校验=%d", tag, v1);
             aq_copy();
 
-            if (v1 != 1) {
-                @try { aq_forge_license(o1); } @catch (NSException *e) { }
+            // 关键一步：把失败流程清零的两个"已激活"标记改回成功路径的取值，
+            // 再重新封存，让结构校验保持通过。
+            if (aq_set_active_flags(o1)) {
                 aq_copy();
                 int v2 = -100;
                 @try { v2 = f_val(o1); } @catch (NSException *e) { }
-                aq_add(@"%@ 补齐后校验=%d", tag, v2);
+                aq_add(@"%@ 补齐激活后校验=%d", tag, v2);
                 aq_copy();
             }
         }
@@ -643,6 +647,14 @@ static void aq_tick(void) {
     if (g_found && !g_panelFound && aq_now() >= 0.5 && aq_now() < 120.0) {
         KeyState cur = aq_read_keys();
         if (cur.k50 == 0) aq_reinstall_keys();
+    }
+    // 2 秒后每秒确认一次"已激活"标记，发现被失败流程清零就补回来。
+    if (g_found && !g_panelFound && aq_now() >= 2.0 && aq_now() < 120.0) {
+        int sec = (int)aq_now();
+        if (sec != g_activeTick) {
+            g_activeTick = sec;
+            dispatch_async(dispatch_get_main_queue(), ^{ aq_keep_active(); });
+        }
     }
     // 校验链探测：2.6 秒一次（卡密流程刚走完），9 秒一次（弹窗关掉之后）。
     if (g_found && !g_gate25 && aq_now() >= 2.6) {
