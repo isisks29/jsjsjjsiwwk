@@ -8,14 +8,17 @@
 //
 // 这一版做什么（沿用同类靶场验证过的思路：零 .text 修改）：
 //   1. 只把目标库调用 dispatch_async / dispatch_after 用的两个指针槽
-//      换成观察函数，记录它把哪些 block 丢到主线程、block 里带了什么值
-//      —— 这一步只记录、不改任何结果，用来定位「验卡结果」在哪；
-//   2. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7），
-//      一旦出现就取消隐藏、并把信息窗收起，确保能看见；
-//   3. 只读地记录密钥、许可证对象和结构校验结果；
-//   4. 卡密弹窗出现时只关一次（同一个弹窗不重复关），
+//      换成观察函数，记录它丢出去的每个 block 的位置、来源和携带的数据，
+//      并在 block 真正执行时再记一笔 —— 只记录、不改任何结果；
+//   2. 把未激活时用于跳过面板的那个状态字改回 0（只改数据，不动代码），
+//      并监视这一组四个字的变化，原版每次改写都留痕；
+//   3. 持续观察面板组件（_0x8C2F4D71 / _0x1E6B7A93 / _0xD4E9A3C7）和
+//      界面上新出现的混淆类名；1.2 秒时确认这三个类有没有被注册，并把目标库
+//      里所有混淆类名列出来；面板一旦出现就取消隐藏；
+//   4. 只读地记录密钥、许可证对象、结构校验结果和窗口构成变化；
+//   5. 卡密弹窗出现时只关一次（同一个弹窗不重复关），并记录按钮和输入框，
 //      让原版按「未激活」的正常分支继续；
-//   5. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
+//   6. 约 6 秒弹一次「aqaw 处理信息」窗口，内容同步复制到剪贴板，
 //      用来告诉你走到了哪一步、面板有没有出现。
 //
 // 为什么不再伪造激活状态：
@@ -47,6 +50,7 @@
 #import <dlfcn.h>
 #import <stdint.h>
 #import <string.h>
+#import <stdlib.h>
 
 typedef struct {
     uint64_t k48;
@@ -84,10 +88,21 @@ static int g_hookTries = 0;
 static BOOL g_flagLogged = NO;
 static NSMutableSet *g_blockSites = nil;
 static int g_blockLogs = 0;
+static NSMutableSet *g_seenViewClasses = nil;
+static int g_flagWrites = 0;
+static int g_flagChangeLogs = 0;
+static uint32_t g_lastFlagArr[4] = {0xFFFFFFFFu, 0, 0, 0};
+static void *g_lastLicenseObj = (void *)0x1;
+static NSMutableDictionary *g_siteRuns = nil;
+static int g_dispatchRunLogs = 0;
+static NSString *g_lastWinSig = nil;
+static BOOL g_baseLogged = NO;
+static BOOL g_panelClassChecked = NO;
 
 static NSString *aq_snapshot(void);
 static void aq_copy(void);
 static BOOL aq_install_hooks(void);
+static void aq_clear_panel_flag(void);
 
 static double aq_now(void) {
     return [NSProcessInfo processInfo].systemUptime - g_start;
@@ -260,6 +275,17 @@ static void aq_handle_license_alert(void) {
                 g_lastAlertSig = [sig copy];
                 aq_add(@"发现卡密弹窗，自动关闭：标题=%@ 正文=%@",
                        a.title ?: @"(无)", a.message ?: @"(无)");
+                NSMutableString *acts = [NSMutableString string];
+                for (UIAlertAction *ac in a.actions) {
+                    [acts appendFormat:@"%@|", ac.title ?: @"(无标题)"];
+                }
+                NSString *ph = @"(无)";
+                if (a.textFields.count > 0) {
+                    ph = a.textFields[0].placeholder ?: @"(无占位文本)";
+                }
+                aq_add(@"弹窗详情: 按钮=%@ 输入框=%lu 占位=%@",
+                       acts, (unsigned long)a.textFields.count, ph);
+                aq_copy();
             }
             // 只关第一次出现的弹窗：反复关同一类弹窗容易把界面弄崩。
             if (g_dismissed >= 1) return;
@@ -327,50 +353,102 @@ typedef void (*aq_after_fn)(dispatch_time_t, dispatch_queue_t, dispatch_block_t)
 static aq_async_fn aq_real_async = NULL;
 static aq_after_fn aq_real_after = NULL;
 
-static void aq_note_block(const char *kind, dispatch_block_t b) {
-    if (!b || !g_found) return;
+// 返回 YES 表示这是目标库里的 block；*invOut / *raOut 给出位置偏移。
+// 首次遇到某个(位置,来源)组合时，把块里携带的数据整段打出来。
+static BOOL aq_note_block(const char *kind, dispatch_block_t b, uintptr_t ra,
+                          long *invOut, long *raOut) {
+    if (!b || !g_found) return NO;
     // ARC 下不能把 block 指针直接当 char* 用，先转成整数地址再读。
     uintptr_t bb = (uintptr_t)(__bridge void *)b;
     uintptr_t inv = 0;
     memcpy(&inv, (const void *)(bb + 0x10), 8);
     long off = (long)(inv - (uintptr_t)g_slide);
-    if (off <= 0 || off >= 0x1400000) return;   // 不是目标库里的 block
+    long raOff = (long)(ra - (uintptr_t)g_slide);
+    if (off <= 0 || off >= 0x1400000) return NO;   // 不是目标库里的 block
+    *invOut = off;
+    *raOut = raOff;
+    BOOL first = NO;
     @synchronized (g_blockSites) {
         if (!g_blockSites) g_blockSites = [NSMutableSet set];
-        NSString *key = [NSString stringWithFormat:@"%s:%ld", kind, off];
-        if ([g_blockSites containsObject:key]) return;
-        [g_blockSites addObject:key];
-        g_blockLogs += 1;
+        NSString *key = [NSString stringWithFormat:@"%s:%ld:%ld", kind, off, raOff];
+        if (![g_blockSites containsObject:key]) {
+            [g_blockSites addObject:key];
+            g_blockLogs += 1;
+            first = YES;
+        }
     }
-    if (g_blockLogs > 24) return;
+    if (!first || g_blockLogs > 30) return YES;
     // 按 block 自身登记的大小决定最多读几个字，避免越界。
     uintptr_t desc = 0;
     uint64_t bsize = 0;
     memcpy(&desc, (const void *)(bb + 0x18), sizeof(desc));
     if (desc) memcpy(&bsize, (const void *)(desc + 8), sizeof(bsize));
-    int words = 8;
+    int words = 16;
     if (bsize >= 0x20 && bsize < 0x1000) {
         words = (int)((bsize - 0x20) / 4);
-        if (words > 8) words = 8;
+        if (words > 16) words = 16;
     }
+    uint32_t arr[16] = {0};
     NSMutableString *dump = [NSMutableString string];
     for (int i = 0; i < words; i++) {      // 覆盖 block+0x20 起的捕获数据
-        uint32_t w = 0;
-        memcpy(&w, (const void *)(bb + 0x20 + i * 4), 4);
-        [dump appendFormat:@"%08X ", w];
+        memcpy(&arr[i], (const void *)(bb + 0x20 + i * 4), 4);
+        [dump appendFormat:@"%08X ", arr[i]];
     }
-    aq_add(@"捕捉到调度 block: %s 位置 +0x%lX 内容 %@", kind, off, dump);
+    // 把成对的字拼回 64 位，若是本库内地址就标出偏移，便于直接定位。
+    NSMutableString *ptrs = [NSMutableString string];
+    uintptr_t base = (uintptr_t)g_slide;
+    for (int i = 0; i + 1 < words; i += 2) {
+        uint64_t q = ((uint64_t)arr[i + 1] << 32) | arr[i];
+        if (q > base && q < base + 0x13E0000)
+            [ptrs appendFormat:@"[+0x%llX] ", (unsigned long long)(q - base)];
+    }
+    aq_add(@"调度块 %s 位置 +0x%lX 来自 +0x%lX 大小 0x%llX 内容 %@%@",
+           kind, off, raOff, (unsigned long long)bsize, dump, ptrs);
     aq_copy();
+    return YES;
+}
+
+// 真正执行时也记一笔（每个位置最多记 3 次），确认这个块有没有跑到、什么时候跑。
+static void aq_run_block(const char *kind, long invOff, long raOff, dispatch_block_t b) {
+    NSString *key = [NSString stringWithFormat:@"%s:%ld", kind, invOff];
+    int n = 0;
+    @synchronized (g_siteRuns) {
+        if (!g_siteRuns) g_siteRuns = [NSMutableDictionary dictionary];
+        n = [[g_siteRuns objectForKey:key] intValue];
+        if (n < 3) [g_siteRuns setObject:@(n + 1) forKey:key];
+        g_dispatchRunLogs += 1;
+    }
+    if (n < 3 && g_dispatchRunLogs <= 80) {
+        aq_add(@"执行处理块 %s 位置 +0x%lX 来自 +0x%lX", kind, invOff, raOff);
+        aq_copy();
+    }
+    if (b) b();
 }
 
 static void aq_my_async(dispatch_queue_t q, dispatch_block_t b) {
-    aq_note_block("async", b);
-    if (aq_real_async) aq_real_async(q, b);
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    long io = 0, ro = 0;
+    BOOL mine = aq_note_block("async", b, ra, &io, &ro);
+    if (!aq_real_async) return;
+    if (mine) {
+        long si = io, sr = ro;
+        aq_real_async(q, ^{ aq_run_block("async", si, sr, b); });
+    } else {
+        aq_real_async(q, b);
+    }
 }
 
 static void aq_my_after(dispatch_time_t t, dispatch_queue_t q, dispatch_block_t b) {
-    aq_note_block("after", b);
-    if (aq_real_after) aq_real_after(t, q, b);
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    long io = 0, ro = 0;
+    BOOL mine = aq_note_block("after", b, ra, &io, &ro);
+    if (!aq_real_after) return;
+    if (mine) {
+        long si = io, sr = ro;
+        aq_real_after(t, q, ^{ aq_run_block("after", si, sr, b); });
+    } else {
+        aq_real_after(t, q, b);
+    }
 }
 
 static BOOL aq_install_hooks(void) {
@@ -408,6 +486,37 @@ static BOOL aq_install_hooks(void) {
     aq_add(@"调度观察已安装（只记录，不改任何结果）");
     aq_copy();
     return YES;
+}
+
+// 只改一个数据字：未激活时原版把它置为 1，并据此跳过面板。
+// 这里把它改回 0；若之后又被写回 1，就再改一次（最多记 6 次日志）。
+// 同时盯着这一组四个字，凡是它们变化就记一笔，能看出原版什么时候改了状态。
+static void aq_clear_panel_flag(void) {
+    if (!g_found) return;
+    uint32_t a[4] = {0, 0, 0, 0};
+    memcpy(a, (const void *)(g_slide + 0x1639298), sizeof(a));
+    if (memcmp(a, g_lastFlagArr, sizeof(a)) != 0) {
+        uint32_t prevA0 = g_lastFlagArr[0];
+        memcpy(g_lastFlagArr, a, sizeof(a));
+        if (g_flagChangeLogs < 20) {
+            g_flagChangeLogs += 1;
+            if (prevA0 == 0xFFFFFFFFu)
+                aq_add(@"面板标志组 %08X %08X %08X %08X", a[0], a[1], a[2], a[3]);
+            else
+                aq_add(@"面板标志组变化 %08X %08X %08X %08X（原首字 %08X）",
+                       a[0], a[1], a[2], a[3], prevA0);
+            aq_copy();
+        }
+    }
+    if (a[2] == 0) return;
+    uint32_t z = 0;
+    memcpy((void *)(g_slide + 0x16392A0), &z, 4);
+    if (g_flagWrites < 6) {
+        aq_add(@"面板状态字 %08X → 00000000（只改数据，第 %d 次）", a[2], g_flagWrites + 1);
+        aq_copy();
+    }
+    g_flagWrites += 1;
+    g_lastFlagArr[2] = 0;
 }
 
 static void aq_probe_gate(NSString *tag) {
@@ -544,11 +653,75 @@ static int aq_find_panel(UIView *v, int depth) {
     return n;
 }
 
+// 收集界面里带混淆前缀的组件类名，看看原版这次到底建了哪些界面。
+static void aq_note_classes(UIView *v, int depth, NSMutableSet *found) {
+    if (!v || depth > 10) return;
+    NSString *cn = NSStringFromClass([v class]);
+    if (cn && [cn hasPrefix:@"_0x"] && ![found containsObject:cn]) [found addObject:cn];
+    for (UIView *s in v.subviews) aq_note_classes(s, depth + 1, found);
+}
+
+// 面板类有没有被注册：类不存在，说明原版根本没执行到「建面板」那一步。
+// 顺便列出目标库里所有混淆类名，万一面板类名记错了也能当场看到真名。
+static void aq_check_panel_classes(void) {
+    const char *names[3] = { "_0x8C2F4D71", "_0x1E6B7A93", "_0xD4E9A3C7" };
+    for (int i = 0; i < 3; i++) {
+        Class c = objc_getClass(names[i]);
+        aq_add(@"面板类 %s %@", names[i], c ? @"已注册" : @"不存在");
+    }
+    const char *img = NULL;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        if ((intptr_t)_dyld_get_image_header(i) == g_slide) {
+            img = _dyld_get_image_name(i);
+            break;
+        }
+    }
+    if (img) {
+        unsigned int cnt = 0;
+        const char **cs = objc_copyClassNamesForImage(img, &cnt);
+        NSMutableString *ml = [NSMutableString string];
+        int shown = 0;
+        for (unsigned int i = 0; cs && i < cnt && shown < 40; i++) {
+            if (cs[i] && strncmp(cs[i], "_0x", 3) == 0) {
+                [ml appendFormat:@"%s ", cs[i]];
+                shown += 1;
+            }
+        }
+        if (cs) free(cs);
+        aq_add(@"目标库混淆类共 %u 个，列前 %d: %@", cnt, shown,
+               ml.length ? ml : @"(无)");
+    }
+    aq_copy();
+}
+
 static void aq_check_panel(NSString *tag) {
     int n = 0;
-    for (UIWindow *w in aq_all_windows()) {
+    NSMutableSet *found = [NSMutableSet set];
+    NSArray<UIWindow *> *wins = aq_all_windows();
+    // 窗口构成一旦变化就记一笔：能看出原版什么时候新建/拆掉了窗口。
+    NSMutableString *wsig = [NSMutableString string];
+    for (UIWindow *w in wins) {
+        if (g_win && w == g_win) continue;
+        [wsig appendFormat:@"%@/%@,", NSStringFromClass([w class]),
+                           NSStringFromClass([w.rootViewController class])];
+    }
+    if (![wsig isEqualToString:g_lastWinSig]) {
+        g_lastWinSig = [wsig copy];
+        aq_add(@"%@窗口构成: %@", tag, wsig);
+    }
+    for (UIWindow *w in wins) {
         if (g_win && w == g_win) continue;
         n += aq_find_panel(w, 0);
+        aq_note_classes(w, 0, found);
+    }
+    @synchronized (g_seenViewClasses) {
+        if (!g_seenViewClasses) g_seenViewClasses = [NSMutableSet set];
+        for (NSString *cn in found) {
+            if ([g_seenViewClasses containsObject:cn]) continue;
+            [g_seenViewClasses addObject:cn];
+            aq_add(@"%@新出现的界面组件: %@", tag, cn);
+        }
     }
     if (n > 0 && !g_panelFound) {
         g_panelFound = YES;
@@ -626,9 +799,11 @@ static void aq_show(void) {
         }
 
         NSString *msg = aq_snapshot();
-        if (msg.length > 1100) {
-            msg = [[msg substringToIndex:1100] stringByAppendingString:
-                   @"\n…（内容太长已截断，完整版已复制到剪贴板）"];
+        if (msg.length > 1200) {
+            // 头和尾都保留：开头是安装/状态，结尾是最后发生的事，中间省略。
+            msg = [NSString stringWithFormat:@"%@\n…（中间省略，完整版已复制到剪贴板）…\n%@",
+                   [msg substringToIndex:520],
+                   [msg substringFromIndex:msg.length - 620]];
         }
 
         UIAlertController *a =
@@ -679,6 +854,34 @@ static void aq_tick(void) {
     if (g_found && !g_hookInstalled && g_hookTries < 3 && aq_now() >= 0.5) {
         aq_install_hooks();
     }
+    // 1.5 秒起，把未激活时用于跳过面板的那个状态字改回 0（只改数据）。
+    if (g_found && aq_now() >= 1.5) {
+        aq_clear_panel_flag();
+    }
+    // 定位成功后先记下基址和版本，方便把记录和具体安装包对上。
+    if (g_found && !g_baseLogged) {
+        g_baseLogged = YES;
+        NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
+        aq_add(@"镜像基址 %p 版本 %@ (build %@)", (void *)g_slide,
+               info[@"CFBundleShortVersionString"] ?: @"?",
+               info[@"CFBundleVersion"] ?: @"?");
+        aq_copy();
+    }
+    // 1.2 秒时确认三个面板类到底有没有被注册（只读）。
+    if (g_found && !g_panelClassChecked && aq_now() >= 1.2) {
+        g_panelClassChecked = YES;
+        aq_check_panel_classes();
+    }
+    // 许可证对象一旦变化就记一笔（只读）。
+    if (g_found) {
+        void *lo = NULL;
+        memcpy(&lo, (const void *)(g_slide + 0x1644040), sizeof(lo));
+        if (lo != g_lastLicenseObj) {
+            aq_add(@"许可证对象变化 %p → %p", g_lastLicenseObj, lo);
+            g_lastLicenseObj = lo;
+            aq_copy();
+        }
+    }
     // 1 秒时先把面板相关标志记一笔（只读），用来判断面板该不该出现。
     if (g_found && !g_flagLogged && aq_now() >= 1.0) {
         g_flagLogged = YES;
@@ -699,8 +902,8 @@ static void aq_tick(void) {
         g_gate9 = YES;
         aq_probe_gate(@"9秒");
     }
-    // 面板定时复查：4 秒起每 2 秒一次，直到面板出现或超过 40 秒。
-    if (g_found && !g_panelFound && aq_now() >= 4.0 && aq_now() < 40.0) {
+    // 面板定时复查：4 秒起每 2 秒一次，直到面板出现或超过 180 秒。
+    if (g_found && !g_panelFound && aq_now() >= 4.0 && aq_now() < 180.0) {
         int n = (int)(aq_now() / 2.0);
         if (n != g_panelChecks) {
             g_panelChecks = n;
