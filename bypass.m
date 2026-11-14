@@ -20,11 +20,11 @@
 //      原版把激活结果存在哪里；
 //   6. 记录原版卡密通道的连接地址和收发内容（原版用自带套接字，不走系统网络
 //      组件；只记录，不改请求也不改返回），用来判断校验连的是谁、返回的格式；
-//   7. 激活状态存在系统钥匙串里：原版开局会先读它，读到有效记录才创建面板，
-//      读不到就弹卡密框。上一版在内存里硬改了一条「是否创建面板」的机器码，
-//      那一页代码随即失去执行权限，进程当场闪退 —— 那是一次真实的写保护事故，
-//      不是原版在查自己。本版已彻底移除那处改动，也不主动调用原版的面板流程，
-//      只读记录它从钥匙串读了什么（服务名、账号、数据），用来确认激活记录的样子。
+//   7. 原版检查完后，在「要不要创建面板」这一处做一次二选一。本版把这一条
+//      选择指令在内存里固定成「创建面板」这一支（4 个字节，磁盘文件一个字节
+//      不动）。上一版也改了这里，但写完把代码页恢复成「可读+可写+可执行」——
+//      arm64 不允许这样做，恢复失败后那一页失去执行权限，进程当场闪退。
+//      这一次改为写完立即恢复「可读+可执行」，并检查每一步结果。
 //   8. 看到校验结果后约 2.5 秒，用原版自己的激活状态写入方法写入一份测试状态，
 //      看面板会不会因此放行；出现成功提示时自动点「确定」并把卡密输入框收起，
 //      失败提示 4 秒后自动收起，避免挡住面板；
@@ -44,7 +44,7 @@
 //
 // 仍然不做的事：
 //   * 不修改磁盘上的任何文件；
-//   * 内存里的目标库机器码一个字节都不改（上一版改了一处，导致闪退，已移除）；
+//   * 只改内存里的一条分支选择指令（就是上面第 7 条那处），其它机器码不动；
 //   * 不主动调用面板初始化 / 挂载函数（它们依赖启动时的现场，空手调用会崩）；
 //   * 不替换原版自己的任何方法；
 //   * 不碰卡密以外的界面。
@@ -1038,6 +1038,50 @@ static BOOL aq_install_hooks(void) {
     return YES;
 }
 
+// ---- 面板放行：只改一条分支选择指令（内存里，谨慎恢复执行权限） -------------
+// 原版检查完后，在「要不要创建面板」这一处做一次二选一。
+// 这里把它固定成「创建面板」这一支。
+// 关键：arm64 不允许代码页同时可写可执行，所以写完后必须恢复成「可读+可执行」，
+// 绝不能留在可写状态，否则那一页的下一条指令就会把进程打崩（上一版就栽在这）。
+static BOOL g_panelBranchForced = NO;
+
+static BOOL aq_patch_word(uintptr_t off, uint32_t want, const char *tag) {
+    if (!g_found) return NO;
+    uintptr_t addr = (uintptr_t)(g_slide + off);
+    uint32_t cur = 0;
+    memcpy(&cur, (const void *)addr, sizeof(cur));
+    if (cur == want) {
+        aq_add(@"%s 已经是放行状态", tag);
+        return YES;
+    }
+    uintptr_t page = addr & ~(uintptr_t)0x3FFF;
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        aq_add(@"%s 放行失败: 页面不可写 (%d)，保持原样", tag, (int)kr);
+        return NO;
+    }
+    memcpy((void *)addr, &want, sizeof(want));
+    sys_icache_invalidate((void *)addr, sizeof(want));
+    kern_return_t kr2 = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                                   VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr2 != KERN_SUCCESS) {
+        kern_return_t kr3 = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
+                                       VM_PROT_READ | VM_PROT_EXECUTE);
+        aq_add(@"%s 放行后恢复执行权限失败 (%d/%d)，原值 %08X", tag, (int)kr2, (int)kr3, cur);
+        return NO;
+    }
+    aq_add(@"%s 已放行（原值 %08X，仅内存）", tag, cur);
+    return YES;
+}
+
+static void aq_force_panel_branch(void) {
+    if (!g_found || g_panelBranchForced) return;
+    g_panelBranchForced = YES;
+    aq_patch_word(0xA10D94, 0x2A0803FC, "面板创建分支");
+    aq_copy();
+}
+
 // ---- 只读观察：网络请求 / 钥匙串 / 卡密处理 -------------------------------
 // 全部用运行时替换方法实现，只记录参数和结果，绝不改文件的任何字节。
 static NSString *aq_trunc(NSString *s, NSUInteger cap) {
@@ -1596,6 +1640,10 @@ static void aq_tick(void) {
     // 尽快装上调度观察（只换两个系统函数指针槽，不改目标库一条指令）。
     if (g_found && !g_hookInstalled && g_hookTries < 3 && aq_now() >= 0.5) {
         aq_install_hooks();
+    }
+    // 在原版开局检查（约 3.5 秒）之前，把两处二选一固定成「通过 / 创建面板」。
+    if (g_found && !g_panelBranchForced && aq_now() >= 0.3) {
+        aq_force_panel_branch();
     }
     // 0.6 秒起装上网络观察：校验请求一发出就能把地址和返回内容记下来。
     if (!g_netInstalled && g_netTries < 2 && aq_now() >= 0.6) {
