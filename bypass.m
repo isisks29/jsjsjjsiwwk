@@ -978,7 +978,7 @@ static void aq_unlock_panel_gate(void) {
     }
     uint32_t patch = 0x2A0803FC;   // 固定选择「创建面板」这一支
     memcpy((void *)addr, &patch, sizeof(patch));
-    __builtin___clear_cache((char *)addr, (char *)(addr + 4));
+    sys_icache_invalidate((void *)addr, 4);
     vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, FALSE,
                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     aq_add(@"面板分岔口已放行（原值 %08X，仅内存）", cur);
