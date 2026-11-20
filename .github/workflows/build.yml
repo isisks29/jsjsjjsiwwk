@@ -13,16 +13,13 @@ on:
         default: ""
   push:
     branches: [ "main", "master" ]
-    # 只有源文件或本工作流变动才触发，避免无关提交排队
     paths:
       - "bypass.m"
       - ".github/workflows/build.yml"
 
-# 发 Release 需要写权限
 permissions:
   contents: write
 
-# 同一分支只保留最新一次，旧的自动取消
 concurrency:
   group: build-ios-dylib-${{ github.ref }}
   cancel-in-progress: true
@@ -30,7 +27,8 @@ concurrency:
 jobs:
   build-bypass:
     name: Compile bypass.dylib (iphoneos arm64)
-    runs-on: macos-14
+    # 用你账号里可用的标签；不要写具体版本号
+    runs-on: macos-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -74,8 +72,9 @@ jobs:
           path: bypass.dylib
           if-no-files-found: error
 
-      # 正题：挂到 Release 附件，下载即 .dylib
+      # 正题：挂到 Release 附件，下载即 .dylib；没开写权限也不会让构建失败
       - name: Publish direct .dylib asset
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
