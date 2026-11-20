@@ -1,23 +1,6 @@
-# build.yml — 在 GitHub Actions(macOS) 上把 bypass.m 编译成 iOS arm64 动态库
-#
-# 用法：
-#   1. 把这个文件放到仓库 .github/workflows/build.yml
-#   2. 把 bypass.m 一起提交进仓库
-#   3. 仓库 Actions 页面 -> 手动运行 "Build iOS dylib"（或 push 触发）
-#   4. 跑完在运行记录底部 Artifacts 里下载 bypass.dylib
-#
-# 注意：
-#   - 源文件必须用 .m 后缀（不是 .c），并加 -fobjc-arc，
-#     否则 ObjC 头 / objc_msgSend 会报错（你之前编译踩的坑）。
-#   - 产物是 iphoneos arm64 动态库，已做 ad-hoc 签名。
-#   - 若只需编译，用默认 input；若还想对靶场 dylib 打二进制补丁，
-#     可单独跑 build-patched 这个 job（仓库里放 patch_dylib.py 和原 dylib）。
-
 name: Build iOS dylib
 
 on:
-  push:
-    branches: [ "main", "master" ]
   workflow_dispatch:
     inputs:
       source:
@@ -28,13 +11,27 @@ on:
         description: "Xcode 版本(留空用默认, 如 16.4)"
         required: false
         default: ""
+  push:
+    branches: [ "main", "master" ]
+    # 只有源文件或本工作流变动才触发，避免无关提交排队
+    paths:
+      - "bypass.m"
+      - ".github/workflows/build.yml"
+
+# 发 Release 需要写权限
+permissions:
+  contents: write
+
+# 同一分支只保留最新一次，旧的自动取消
+concurrency:
+  group: build-ios-dylib-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # ---------- job 1: 编译 bypass.m -> bypass.dylib ----------
   build-bypass:
     name: Compile bypass.dylib (iphoneos arm64)
-    runs-on: macos-latest
-    timeout-minutes: 15
+    runs-on: macos-14
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,29 +40,23 @@ jobs:
         if: ${{ inputs.xcode != '' }}
         run: sudo xcode-select -s /Applications/Xcode_${{ inputs.xcode }}.app
 
-      - name: Verify iOS SDK / clang
-        run: |
-          xcrun --sdk iphoneos --show-sdk-path
-          xcrun --sdk iphoneos clang --version | head -n1
-
       - name: Compile dynamic library (arm64, ObjC, ARC)
         run: |
           SRC="${{ inputs.source != '' && inputs.source || 'bypass.m' }}"
           test -f "$SRC" || { echo "source not found: $SRC"; exit 1; }
           case "$SRC" in
-            *.m)  EXTRA="-fobjc-arc" ;;
-            *.c)  EXTRA="" ;;
-            *)    EXTRA="" ;;
+            *.m) EXTRA="-fobjc-arc" ;;
+            *)   EXTRA="" ;;
           esac
           xcrun --sdk iphoneos clang \
             -arch arm64 \
             -dynamiclib \
-            -O2 \
+            -O0 -g0 \
             -mios-version-min=13.0 \
             -framework Foundation \
             -framework UIKit \
             -framework Security \
-            -fobjc-arc \
+            -Wno-deprecated-declarations \
             $EXTRA \
             -o bypass.dylib \
             "$SRC"
@@ -75,10 +66,21 @@ jobs:
       - name: Ad-hoc sign
         run: codesign --force --sign - bypass.dylib
 
-      - name: Upload bypass.dylib
+      # 兜底：常规 Artifacts（下载一定是 zip）
+      - name: Upload artifact (zip)
         uses: actions/upload-artifact@v4
         with:
           name: bypass.dylib
           path: bypass.dylib
           if-no-files-found: error
 
+      # 正题：挂到 Release 附件，下载即 .dylib
+      - name: Publish direct .dylib asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" bypass.dylib \
+            --title "$TAG" \
+            --notes "自动构建 · ${GITHUB_SHA:0:7}" \
+            --target "${GITHUB_SHA}"
